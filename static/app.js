@@ -1,4 +1,4 @@
-const UI_VERSION = "20260912.2";
+const UI_VERSION = "20260913.13";
 const EXPORT_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 const TABLE_PAGE_SIZE = 20;
 
@@ -33,7 +33,10 @@ const state = {
     dateTo: "",
   },
   exportPreflight: null,
+  exportPreflightTurnKeys: null,
   exportPreflightBusy: false,
+  exportEvaluationRepairRequest: null,
+  exportEvaluationRepairPoller: null,
   exportDeleteBusy: false,
   hourlyAnalytics: null,
   analyticsDate: "",
@@ -618,7 +621,7 @@ function validationHtml(results, title) {
   if (!results?.length) return "";
   return `<div class="validation"><h3>${escapeHtml(title)}</h3>${results.map((item) => `
     <div class="validation-item">
-      <div><b>${escapeHtml(item.command)}</b><span class="${item.exit_code === 0 ? "pass" : "fail"}">${item.exit_code === 0 ? "PASS" : `EXIT ${item.exit_code}`}</span></div>
+      <div><b>${escapeHtml(item.command)}</b><span class="${item.skipped ? "skip" : (item.exit_code === 0 ? "pass" : "fail")}">${item.skipped ? "SKIPPED" : (item.exit_code === 0 ? "PASS" : `EXIT ${item.exit_code}`)}</span></div>
       ${item.output ? `<pre>${escapeHtml(item.output)}</pre>` : ""}
     </div>`).join("")}</div>`;
 }
@@ -699,7 +702,7 @@ function turnDeliveryRows(run, turn) {
     ["执行能力", score("execution")],
     ["执行能力 - 描述", description("execution")],
     ["其他问题", ""],
-    ["提交人", state.health?.submitter || "张鑫宇"],
+    ["提交人", state.health?.submitter || "牛宇航"],
   ];
 }
 
@@ -773,6 +776,7 @@ function renderDetail() {
     && run.container_cleaned && run.repo_url && run.base_sha && !run.retry_run_id;
   const canRetryGeneration = run.phase === "failed" && run.repo_name === "题目生成中"
     && !run.repo_url && !run.first_prompt_id;
+  const canRetryStartup = Boolean(run.can_retry_startup);
   const canRetryStage = ["failed", "manual_review"].includes(run.phase) && Boolean(run.stage_retry_name);
   const turns = run.turns?.length ? run.turns : [];
   const latestTurn = turns.length ? turns[turns.length - 1] : null;
@@ -814,6 +818,7 @@ function renderDetail() {
         ${run.imported_baseline ? "" : '<button class="secondary-button" id="copy-delivery" type="button">复制交付信息</button>'}
         ${run.repo_url ? `<a class="secondary-button" href="${escapeHtml(run.repo_url)}" target="_blank" rel="noreferrer">打开 GitHub ↗</a>` : ""}
         ${canRetryGeneration ? '<button class="primary-button" id="retry-generation" type="button">沿用原编号重新生成题面</button>' : ""}
+        ${canRetryStartup ? '<button class="primary-button" id="retry-startup" type="button">清理残留并重新启动</button>' : ""}
         ${canRetryStage ? `<button class="primary-button" id="retry-stage" type="button">重试${escapeHtml(run.stage_retry_name)}</button>` : ""}
         ${canRetryFirst ? '<button class="primary-button" id="retry-first" type="button">用新会话重跑</button>' : ""}
         ${canStop ? '<button class="danger-button" id="stop-run" type="button">终止会话</button>' : ""}
@@ -952,6 +957,7 @@ function renderDetail() {
   $("#back-to-list")?.addEventListener("click", () => navigateTo("#runs"));
   $("#stop-run")?.addEventListener("click", stopSelectedRun);
   $("#retry-generation")?.addEventListener("click", retryAutomaticGeneration);
+  $("#retry-startup")?.addEventListener("click", retryFailedStartup);
   $("#retry-stage")?.addEventListener("click", retryControlStage);
   $("#retry-first")?.addEventListener("click", retryFirstTurn);
   $("#auto-iteration-button")?.addEventListener("click", startAutomaticIteration);
@@ -1027,13 +1033,25 @@ function soloQaSubmittable(turn) {
   return Boolean(turn.solo_qa_ready) && ["not_submitted", "failed", "remote_missing"].includes(stateName);
 }
 
+function soloQaRepairable(turn) {
+  const soloQa = turn.solo_qa || {};
+  return Boolean(
+    turn.export_ready
+    && soloQa.remote_id
+    && soloQa.remote_status === "PENDING_FIX"
+    && soloQa.payload_changed
+    && !evaluationRepairIsActive(turn)
+  );
+}
+
 function renderSoloQaControls() {
   const bridgeStatus = $("#solo-qa-bridge-status");
   const detail = $("#solo-qa-status-detail");
   const helperPath = $("#solo-qa-helper-path");
   const syncButton = $("#solo-qa-sync");
+  const repairButton = $("#solo-qa-repair");
   const submitButton = $("#solo-qa-submit");
-  if (!bridgeStatus || !detail || !syncButton || !submitButton) return;
+  if (!bridgeStatus || !detail || !syncButton || !repairButton || !submitButton) return;
   if (helperPath) {
     helperPath.textContent = state.health?.solo_qa?.helper_path || "尚未取得提交助手路径";
   }
@@ -1054,7 +1072,15 @@ function renderSoloQaControls() {
   const selected = state.completedTurns.filter((turn) =>
     state.selectedExportTurns.has(turn.key) && soloQaSubmittable(turn)
   ).length;
+  const selectedRepairs = state.completedTurns.filter((turn) =>
+    state.selectedExportTurns.has(turn.key) && soloQaRepairable(turn)
+  ).length;
   syncButton.disabled = !state.soloQaBridgeReady || state.soloQaBusy;
+  repairButton.disabled = !state.soloQaBridgeReady || state.soloQaBusy
+    || state.exportPreflightBusy || selectedRepairs === 0;
+  repairButton.textContent = selectedRepairs > 0
+    ? `提交所选返修（${selectedRepairs}）`
+    : "提交所选返修";
   submitButton.disabled = !state.soloQaBridgeReady || state.soloQaBusy || state.exportPreflightBusy || selected === 0;
   submitButton.textContent = selected > 0 ? `提交所选轮次（${selected}）` : "提交所选轮次";
 }
@@ -1103,9 +1129,12 @@ async function syncSoloQa({ silent = false } = {}) {
 
 async function submitSelectedToSoloQa() {
   if (state.soloQaBusy) return;
-  const turns = state.completedTurns.filter((turn) =>
-    state.selectedExportTurns.has(turn.key) && soloQaSubmittable(turn)
-  );
+  const turns = state.completedTurns
+    .filter((turn) => state.selectedExportTurns.has(turn.key) && soloQaSubmittable(turn))
+    // SOLO-QA requires an earlier round to exist before a later round from the
+    // same session can be accepted.  Completed turns are displayed newest first,
+    // so submit every selected first round before second rounds, and so on.
+    .sort((left, right) => Number(left.turn_number || 0) - Number(right.turn_number || 0));
   if (!turns.length) {
     showNotice("所选轮次都已提交，或尚未满足 SOLO-QA 提交条件");
     return;
@@ -1131,6 +1160,49 @@ async function submitSelectedToSoloQa() {
     state.soloQaLastMessage = failed
       ? `已提交 ${submitted} 条、找回 ${recovered} 条；在 ${failed.turn_key} 停止：${failed.error}${result.remaining ? `，剩余 ${result.remaining} 条未处理` : ""}`
       : `提交完成：新增 ${submitted} 条${recovered ? `，找回已有 ${recovered} 条` : ""}${skipped ? `，跳过 ${skipped} 条` : ""}`;
+    await loadCompletedTurns();
+    showNotice(state.soloQaLastMessage);
+  } catch (error) {
+    state.soloQaLastMessage = error.message;
+    showNotice(error.message);
+    await loadCompletedTurns();
+  } finally {
+    state.soloQaBusy = false;
+    renderSoloQaControls();
+  }
+}
+
+async function repairSelectedInSoloQa() {
+  if (state.soloQaBusy) return;
+  const turns = state.completedTurns
+    .filter((turn) => state.selectedExportTurns.has(turn.key) && soloQaRepairable(turn))
+    .sort((left, right) => Number(left.turn_number || 0) - Number(right.turn_number || 0));
+  if (!turns.length) {
+    showNotice("所选轮次尚未完成评分修复，或远端已不在待返修状态");
+    return;
+  }
+  if (!await selectedTurnsPassPreflight(turns.map((turn) => turn.key))) return;
+  const preview = turns.slice(0, 6).map((turn) =>
+    `#${turn.solo_qa?.remote_id || "—"} ${turn.project_number || "—"} ${turn.repo_name} · 第 ${turn.turn_number} 轮`
+  ).join("\n");
+  const extra = turns.length > 6 ? `\n另有 ${turns.length - 6} 条` : "";
+  if (!window.confirm(`将更新 SOLO-QA 中以下 ${turns.length} 条待返修记录，并重新上传对应轨迹：\n\n${preview}${extra}\n\n提交后会重新质检。确认继续吗？`)) return;
+  state.soloQaBusy = true;
+  state.soloQaLastMessage = `正在逐条提交 ${turns.length} 条返修…`;
+  renderSoloQaControls();
+  try {
+    const result = await requestSoloQaBridge(
+      "SOLO_QA_REPAIR",
+      { turn_keys: turns.map((turn) => turn.key) },
+    );
+    const resubmitted = (result.results || []).filter(
+      (item) => item.outcome === "resubmitted"
+    ).length;
+    const skipped = (result.results || []).filter((item) => item.outcome === "skipped").length;
+    const failed = (result.results || []).find((item) => item.outcome === "failed");
+    state.soloQaLastMessage = failed
+      ? `已提交返修 ${resubmitted} 条；在 ${failed.turn_key} 停止：${failed.error}${result.remaining ? `，剩余 ${result.remaining} 条未处理` : ""}`
+      : `返修提交完成：${resubmitted} 条已重新质检${skipped ? `，跳过 ${skipped} 条` : ""}`;
     await loadCompletedTurns();
     showNotice(state.soloQaLastMessage);
   } catch (error) {
@@ -1176,7 +1248,107 @@ window.addEventListener("message", (event) => {
   }
 });
 
-async function loadCompletedTurns() {
+function evaluationRepairIsActive(turn) {
+  return ["queued", "running"].includes(turn?.evaluation_repair?.status);
+}
+
+function activeEvaluationRepairTurns() {
+  return state.completedTurns.filter(evaluationRepairIsActive);
+}
+
+async function watchAutomaticEvaluationRepairs(preflightKeys = null) {
+  if (state.exportEvaluationRepairPoller) return state.exportEvaluationRepairPoller;
+  const checkedKeys = preflightKeys?.length
+    ? [...preflightKeys]
+    : (state.exportPreflight?.results || []).map((item) => item.key);
+  const poller = (async () => {
+    let observedActive = false;
+    while (window.location.hash === "#exports") {
+      const active = activeEvaluationRepairTurns();
+      if (!active.length) break;
+      observedActive = true;
+      await new Promise((resolve) => window.setTimeout(resolve, 3000));
+      if (window.location.hash !== "#exports") break;
+      await loadCompletedTurns({ autoRepair: false });
+    }
+    if (!observedActive || window.location.hash !== "#exports") return;
+    const failures = state.completedTurns.filter(
+      (turn) => turn.evaluation_repair?.status === "failed"
+    );
+    state.exportPreflight = null;
+    renderExportPage();
+    if (checkedKeys.length) {
+      await runExportPreflight(checkedKeys, { announce: false });
+    }
+    if (failures.length) {
+      showNotice(`评分文字自动修复完成，但有 ${failures.length} 条仍需人工处理`);
+    } else {
+      showNotice("评分文字已自动修复并重新检查");
+    }
+    await queueAutomaticEvaluationRepairs();
+  })().finally(() => {
+    state.exportEvaluationRepairPoller = null;
+    if (
+      window.location.hash === "#exports"
+      && activeEvaluationRepairTurns().length
+    ) {
+      window.setTimeout(
+        () => watchAutomaticEvaluationRepairs(state.exportPreflightTurnKeys),
+        0,
+      );
+    }
+  });
+  state.exportEvaluationRepairPoller = poller;
+  return poller;
+}
+
+async function queueAutomaticEvaluationRepairs() {
+  if (state.exportEvaluationRepairRequest) return state.exportEvaluationRepairRequest;
+  const candidates = state.completedTurns.filter((turn) =>
+    turn.evaluation_repair?.status === "needed"
+    && turn.evaluation_repair?.can_start
+    && !state.exportEvaluationDrafts.has(turn.key)
+    && !state.exportEvaluationBusy.has(turn.key)
+  );
+  if (!candidates.length) {
+    if (activeEvaluationRepairTurns().length) {
+      watchAutomaticEvaluationRepairs(state.exportPreflightTurnKeys);
+    }
+    return null;
+  }
+  const turnKeys = candidates.map((turn) => turn.key);
+  const checkedKeys = state.exportPreflightTurnKeys
+    || (state.exportPreflight?.results || []).map((item) => item.key);
+  const request = (async () => {
+    try {
+      const result = await api("/api/exports/evaluation-repairs", {
+        method: "POST",
+        body: JSON.stringify({ turn_keys: turnKeys }),
+      });
+      state.exportPreflight = null;
+      await loadCompletedTurns({ autoRepair: false });
+      const activeCount = activeEvaluationRepairTurns().length;
+      if (activeCount) {
+        showNotice(`发现 ${turnKeys.length} 条评分资料问题，已开始自动修复`);
+        watchAutomaticEvaluationRepairs(checkedKeys);
+      } else if (state.completedTurns.some((turn) => turn.evaluation_repair?.status === "failed")) {
+        showNotice("评分文字自动修复未完成，请展开失败项目查看原因或人工修改");
+      } else if (Number(result.queued || 0) > 0) {
+        showNotice("评分文字已自动修复并复检");
+      }
+      return result;
+    } catch (error) {
+      showNotice(error.message);
+      return null;
+    }
+  })().finally(() => {
+    state.exportEvaluationRepairRequest = null;
+  });
+  state.exportEvaluationRepairRequest = request;
+  return request;
+}
+
+async function loadCompletedTurns({ autoRepair = true } = {}) {
   try {
     state.completedTurns = await api("/api/exports/turns");
     state.exportLastLoadedAt = Date.now();
@@ -1188,6 +1360,7 @@ async function loadCompletedTurns() {
       [...state.expandedExportPrompts].filter((key) => validKeys.has(key))
     );
     renderExportPage();
+    if (autoRepair) queueAutomaticEvaluationRepairs();
   } catch (error) {
     showNotice(error.message);
     $("#export-turn-list").innerHTML = '<tr><td colspan="11" class="table-empty">已完成轮次读取失败</td></tr>';
@@ -1204,6 +1377,12 @@ function renderExportPreflightSummary() {
   if (state.exportPreflightBusy) {
     panel.className = "export-preflight-panel checking";
     panel.innerHTML = "<strong>正在核对轨迹与标识…</strong><span>检查过程只读取本地数据库和 JSONL 文件。</span>";
+    return;
+  }
+  const activeRepairs = activeEvaluationRepairTurns();
+  if (activeRepairs.length) {
+    panel.className = "export-preflight-panel repairing";
+    panel.innerHTML = `<strong>正在自动修复 ${escapeHtml(activeRepairs.length)} 条评分文字</strong><span>只依据已保存的题面、验收结果和轨迹重写；缺少真实资料的项目仍会保留阻断。</span>`;
     return;
   }
   const result = state.exportPreflight;
@@ -1262,6 +1441,9 @@ async function runExportPreflight(turnKeys = null, { announce = true } = {}) {
       method: "POST",
       body: JSON.stringify(turnKeys?.length ? { turn_keys: turnKeys } : {}),
     });
+    state.exportPreflightTurnKeys = turnKeys?.length
+      ? [...turnKeys]
+      : (result.results || []).map((item) => item.key);
     state.exportPreflight = result;
     renderExportPage();
     if (announce) {
@@ -1280,6 +1462,13 @@ async function runExportPreflight(turnKeys = null, { announce = true } = {}) {
 }
 
 async function selectedTurnsPassPreflight(turnKeys) {
+  const active = state.completedTurns.find(
+    (turn) => turnKeys.includes(turn.key) && evaluationRepairIsActive(turn)
+  );
+  if (active) {
+    showNotice(`${active.project_number || active.key} 第 ${active.turn_number} 轮评分文字正在自动修复，请等待完成后再提交`);
+    return false;
+  }
   const result = await runExportPreflight(turnKeys, { announce: false });
   if (!result) return false;
   const failed = (result.results || []).find((item) => !item.eligible);
@@ -1337,9 +1526,19 @@ function renderExportPage() {
         : (preflightTone === "failed"
           ? `检查不通过（${preflight.blockers?.length || 0} 项）`
           : ""));
-    const readinessContent = preflight
-      ? `<span class="preflight-result ${escapeHtml(preflightTone)}">${escapeHtml(preflightLabel)}</span>${preflightIssues.length ? `<span class="export-issues-inline">：${escapeHtml(preflightIssues.join("；"))}</span>` : ""}`
-      : `<span class="export-readiness ${turn.export_ready ? "ready" : "blocked"}">${turn.export_ready ? "可导出 · 尚未深度检查" : `待补资料（${escapeHtml(exportIssues.length)}）`}</span>${exportIssueDetails}`;
+    const repair = turn.evaluation_repair || {};
+    const repairActive = ["queued", "running"].includes(repair.status);
+    const repairFailed = repair.status === "failed";
+    const repairRemaining = Array.isArray(repair.unrepairable_issues)
+      ? repair.unrepairable_issues
+      : [];
+    const readinessContent = repairActive
+      ? `<span class="export-readiness repairing">评分文字自动修复中</span><span class="export-issues-inline repair-message">：${escapeHtml(repair.message || "正在依据真实材料重写并复检")}${repairRemaining.length ? `；其余待补：${escapeHtml(repairRemaining.join("；"))}` : ""}</span>`
+      : (repairFailed
+        ? `<span class="export-readiness blocked">自动修复失败</span><span class="export-issues-inline">：${escapeHtml(repair.message || "请展开评分后人工处理")}</span>`
+        : (preflight
+          ? `<span class="preflight-result ${escapeHtml(preflightTone)}">${escapeHtml(preflightLabel)}</span>${preflightIssues.length ? `<span class="export-issues-inline">：${escapeHtml(preflightIssues.join("；"))}</span>` : ""}`
+          : `<span class="export-readiness ${turn.export_ready ? "ready" : "blocked"}">${turn.export_ready ? (repair.status === "succeeded" ? "可导出 · 评分文字已自动修复" : "可导出 · 尚未深度检查") : `待补资料（${escapeHtml(exportIssues.length)}）`}</span>${exportIssueDetails}`));
     const promptExpanded = state.expandedExportPrompts.has(turn.key);
     const promptRowId = `export-prompt-${turn.run_id}-${turn.turn_number}`;
     const evaluationEditor = promptExpanded ? exportEvaluationEditorHtml(turn) : "";
@@ -1388,17 +1587,22 @@ function exportEvaluationEditorHtml(turn) {
     return '<div class="export-evaluation-empty">该轮尚无可编辑评分。</div>';
   }
   const draft = exportEvaluationDraft(turn);
-  const busy = state.exportEvaluationBusy.has(turn.key);
-  const status = turn.evaluation_overridden
+  const repairBusy = evaluationRepairIsActive(turn);
+  const busy = state.exportEvaluationBusy.has(turn.key) || repairBusy;
+  const status = repairBusy
+    ? '<span class="repairing">评分文字自动修复中</span>'
+    : (turn.evaluation_repair?.status === "failed"
+      ? `<span class="repair-failed">自动修复失败 · 可人工修改</span>`
+      : (turn.evaluation_overridden
     ? `<span class="manual">已人工修改${turn.evaluation_override_updated_at ? ` · ${escapeHtml(turn.evaluation_override_updated_at)}` : ""}</span>`
-    : "<span>当前为自动评分</span>";
+    : "<span>当前为自动评分</span>"));
   return `<section class="export-evaluation-editor" data-evaluation-editor="${escapeHtml(turn.key)}">
     <div class="export-evaluation-heading"><div><strong>五维评分与描述</strong>${status}</div><small>保存后，Excel 导出和 SOLO-QA 提交均使用这里的内容。</small></div>
     <div class="export-evaluation-grid">${exportEvaluationDimensions.map(([key, label]) => {
       const item = draft[key] || {};
-      return `<label class="export-evaluation-item"><span>${escapeHtml(label)}</span><select data-evaluation-key="${escapeHtml(turn.key)}" data-evaluation-dimension="${key}" data-evaluation-field="score" aria-label="${escapeHtml(label)}分数">${[1, 2, 3, 4, 5].map((score) => `<option value="${score}" ${Number(item.score) === score ? "selected" : ""}>${score} 分</option>`).join("")}</select><textarea rows="6" maxlength="2000" data-evaluation-key="${escapeHtml(turn.key)}" data-evaluation-dimension="${key}" data-evaluation-field="description" aria-label="${escapeHtml(label)}描述">${escapeHtml(item.description || "")}</textarea></label>`;
+      return `<label class="export-evaluation-item"><span>${escapeHtml(label)}</span><select data-evaluation-key="${escapeHtml(turn.key)}" data-evaluation-dimension="${key}" data-evaluation-field="score" aria-label="${escapeHtml(label)}分数" ${repairBusy ? "disabled" : ""}>${[1, 2, 3, 4, 5].map((score) => `<option value="${score}" ${Number(item.score) === score ? "selected" : ""}>${score} 分</option>`).join("")}</select><textarea rows="6" maxlength="2000" data-evaluation-key="${escapeHtml(turn.key)}" data-evaluation-dimension="${key}" data-evaluation-field="description" aria-label="${escapeHtml(label)}描述" ${repairBusy ? "disabled" : ""}>${escapeHtml(item.description || "")}</textarea></label>`;
     }).join("")}</div>
-    <div class="export-evaluation-actions"><button class="primary-button" type="button" data-save-evaluation="${escapeHtml(turn.key)}" ${busy ? "disabled" : ""}>${busy ? "保存中…" : "保存评分修改"}</button>${turn.evaluation_overridden ? `<button class="secondary-button" type="button" data-reset-evaluation="${escapeHtml(turn.key)}" ${busy ? "disabled" : ""}>恢复自动评分</button>` : ""}<span>原始自动评分不会被覆盖。</span></div>
+    <div class="export-evaluation-actions"><button class="primary-button" type="button" data-save-evaluation="${escapeHtml(turn.key)}" ${busy ? "disabled" : ""}>${repairBusy ? "自动修复中…" : (state.exportEvaluationBusy.has(turn.key) ? "保存中…" : "保存评分修改")}</button>${turn.evaluation_overridden ? `<button class="secondary-button" type="button" data-reset-evaluation="${escapeHtml(turn.key)}" ${busy ? "disabled" : ""}>恢复自动评分</button>` : ""}<span>${repairBusy ? "修复完成前不会覆盖或接受人工评分。" : "原始自动评分不会被覆盖。"}</span></div>
   </section>`;
 }
 
@@ -1420,6 +1624,10 @@ async function saveExportEvaluation(turnKey, reset = false) {
   if (state.exportEvaluationBusy.has(turnKey)) return;
   const turn = state.completedTurns.find((item) => item.key === turnKey);
   if (!turn) return;
+  if (evaluationRepairIsActive(turn)) {
+    showNotice("评分文字正在自动修复，请等待复检完成后再编辑");
+    return;
+  }
   state.exportEvaluationBusy.add(turnKey);
   renderExportPage();
   try {
@@ -1433,6 +1641,7 @@ async function saveExportEvaluation(turnKey, reset = false) {
     });
     state.exportEvaluationDrafts.delete(turnKey);
     state.exportPreflight = null;
+    state.exportPreflightTurnKeys = null;
     await loadCompletedTurns();
     showNotice(reset ? "已恢复自动评分；后续导出和提交将使用自动版本" : "评分修改已保存；后续导出和提交将使用人工版本");
   } catch (error) {
@@ -2125,6 +2334,26 @@ async function retryControlStage() {
   }
 }
 
+async function retryFailedStartup() {
+  const runId = state.selectedId;
+  const button = $("#retry-startup");
+  if (button) {
+    button.disabled = true;
+    button.textContent = "正在清理启动残留…";
+  }
+  try {
+    await api(`/api/runs/${runId}/retry-startup`, { method: "POST", body: "{}" });
+    await Promise.all([loadDetail(), loadRuns()]);
+    showNotice("已沿用原任务重新进入启动队列");
+  } catch (error) {
+    showNotice(error.message);
+    if (button) {
+      button.disabled = false;
+      button.textContent = "清理残留并重新启动";
+    }
+  }
+}
+
 async function retryFirstTurn() {
   const button = $("#retry-first");
   if (button) {
@@ -2276,6 +2505,7 @@ $("#delete-selected-export-turns").addEventListener("click", () => {
   deleteExportTurns([...state.selectedExportTurns]);
 });
 $("#solo-qa-sync").addEventListener("click", () => syncSoloQa());
+$("#solo-qa-repair").addEventListener("click", repairSelectedInSoloQa);
 $("#solo-qa-submit").addEventListener("click", submitSelectedToSoloQa);
 $("#copy-solo-qa-helper-path").addEventListener("click", copySoloQaHelperPath);
 $("#model-form").addEventListener("submit", submitModel);

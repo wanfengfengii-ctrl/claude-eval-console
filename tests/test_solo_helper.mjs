@@ -34,6 +34,7 @@ const trace = new Blob(['{"type":"result","result":"done"}\n'], { type: "applica
 const traceBytes = Buffer.from(await trace.arrayBuffer());
 const traceDigest = createHash("sha256").update(traceBytes).digest("hex");
 const localStates = [];
+const localSyncs = [];
 const requests = [];
 let createdCount = 0;
 
@@ -52,10 +53,10 @@ globalThis.fetch = async (url, options = {}) => {
     credentials: options.credentials || "",
     headers: Object.fromEntries(new Headers(options.headers || {}).entries()),
   });
-  const payloadMatch = href.match(/\/api\/solo-qa\/turns\/(abc123abc123|def456def456)\/1\/payload$/);
+  const payloadMatch = href.match(/\/api\/solo-qa\/turns\/(abc123abc123|def456def456|fed789fed789)\/1\/payload$/);
   if (payloadMatch) {
     const runId = payloadMatch[1];
-    const suffix = runId === "abc123abc123" ? "one" : "two";
+    const suffix = runId === "abc123abc123" ? "one" : (runId === "def456def456" ? "two" : "fix");
     return jsonResponse({
       key: `${runId}:1`,
       values: {
@@ -71,18 +72,79 @@ globalThis.fetch = async (url, options = {}) => {
         sha256: traceDigest,
         url: `http://127.0.0.1:8765/api/solo-qa/turns/${runId}/1/trajectory`,
       },
-      solo_qa: { state: "not_submitted", remote_id: "" },
+      solo_qa: runId === "fed789fed789"
+        ? {
+          state: "local_changed",
+          remote_id: "555",
+          remote_status: "PENDING_FIX",
+          qc_summary: "交付完整性描述与历史记录重复",
+          payload_changed: true,
+        }
+        : { state: "not_submitted", remote_id: "" },
     });
   }
-  if (/\/api\/solo-qa\/turns\/(abc123abc123|def456def456)\/1\/trajectory$/.test(href)) {
+  if (/\/api\/solo-qa\/turns\/(abc123abc123|def456def456|fed789fed789)\/1\/trajectory$/.test(href)) {
     return new Response(trace, { status: 200 });
   }
   if (href.endsWith("/api/solo-qa/state")) {
     localStates.push(JSON.parse(options.body));
     return jsonResponse({ state: localStates.at(-1).state });
   }
+  if (href.endsWith("/api/solo-qa/sync")) {
+    const body = JSON.parse(options.body);
+    localSyncs.push(body);
+    return jsonResponse({ matched: body.items.length, unmatched: 0 });
+  }
   if (href.includes("/api/v1/submissions?page=1&page_size=20&keyword=")) {
     return jsonResponse({ items: [], meta: { total: 0 } });
+  }
+  if (href.endsWith("/api/v1/submissions?page=1&page_size=20")) {
+    return jsonResponse({
+      items: [{ id: 901 }],
+      meta: { total: 1 },
+    });
+  }
+  if (href.endsWith("/api/v1/submissions/901")) {
+    return jsonResponse({
+      id: 901,
+      status: "QC_PASSED",
+      session_id: "session-history",
+      turn_id: "turn-history",
+      round_no: 2,
+      score_delivery: 5,
+      desc_delivery: "  本次交付核对了独有业务对象。  ",
+      instruction_following: {
+        score: 4,
+        description: "第 2 轮逐项对照了题面约束。",
+      },
+      data: {
+        score_planning: 5,
+        desc_planning: "按三个真实阶段推进并记录状态。",
+        score_reasoning: 4,
+        desc_reasoning: "根据具体报错定位了根因。",
+        score_execution: 4,
+        desc_execution: "执行过程中发生一次有证据的返工。",
+      },
+      qc_result: {
+        dedup_hits: [{
+          field: "desc_delivery",
+          submission_id: 812,
+          similarity: 0.22,
+          excerpt: "公共片段",
+          unsafe: { cookie: "must-not-leak" },
+        }],
+      },
+    });
+  }
+  if (href.endsWith("/api/v1/submissions/555") && (options.method || "GET") === "GET") {
+    return jsonResponse({
+      id: 555,
+      status: "PENDING_FIX",
+      session_id: "session-fix",
+      turn_id: "turn-fix",
+      round_no: 1,
+      qc_summary: "交付完整性描述与历史记录重复",
+    });
   }
   if (href.endsWith("/api/v1/submissions/form-schema")) {
     return jsonResponse({
@@ -109,6 +171,14 @@ globalThis.fetch = async (url, options = {}) => {
     assert.equal(body.data.trace_file[0].path, "uploads/trace.jsonl");
     createdCount += 1;
     return jsonResponse({ id: 122 + createdCount, status: "SUBMITTED", message: "提交成功" });
+  }
+  if (href.endsWith("/api/v1/submissions/555") && options.method === "PUT") {
+    const body = JSON.parse(options.body);
+    assert.equal(body.schema_fingerprint, "schema-test");
+    assert.equal(body.data.user_prompt, "完成真实提交链路 fix");
+    assert.equal(body.data.trace_file[0].path, "uploads/trace.jsonl");
+    assert.match(body.comment, /质检结论/);
+    return jsonResponse({ id: 555, status: "SUBMITTED", message: "返修已提交" });
   }
   throw new Error(`unexpected request: ${href}`);
 };
@@ -148,3 +218,57 @@ const remoteWrites = requests.filter((item) => item.href.startsWith("/api/v1/") 
 assert.ok(remoteWrites.length >= 2);
 assert.ok(remoteWrites.every((item) => item.credentials === "include"));
 assert.ok(remoteWrites.every((item) => item.headers["x-csrf-token"] === "csrf-test"));
+
+const repairResponse = await new Promise((resolve) => {
+  const asynchronous = listener(
+    {
+      type: "SOLO_QA_REPAIR",
+      payload: { turn_keys: ["fed789fed789:1"] },
+    },
+    { url: "http://127.0.0.1:8765/#exports" },
+    resolve,
+  );
+  assert.equal(asynchronous, true);
+});
+
+assert.equal(repairResponse.ok, true);
+assert.equal(repairResponse.data.results[0].outcome, "resubmitted");
+assert.equal(repairResponse.data.results[0].remote_id, "555");
+assert.equal(
+  requests.filter((item) => item.href.endsWith("/submissions/555") && item.method === "PUT").length,
+  1,
+);
+assert.equal(localStates.at(-1).state, "qc_pending");
+
+const syncResponse = await new Promise((resolve) => {
+  const asynchronous = listener(
+    { type: "SOLO_QA_SYNC", payload: {} },
+    { url: "http://127.0.0.1:8765/#exports" },
+    resolve,
+  );
+  assert.equal(asynchronous, true);
+});
+
+assert.equal(syncResponse.ok, true);
+assert.equal(syncResponse.data.matched, 1);
+assert.equal(localSyncs.length, 2);
+assert.equal(localSyncs[0].complete, false);
+assert.equal(localSyncs[0].items.length, 1);
+assert.equal(localSyncs[1].complete, true);
+assert.deepEqual(localSyncs[1].items, []);
+assert.deepEqual(localSyncs[1].remote_ids, ["901"]);
+const synced = localSyncs[0].items[0];
+assert.deepEqual(synced.delivery, {
+  score: 5,
+  description: "本次交付核对了独有业务对象。",
+});
+assert.deepEqual(synced.instruction, {
+  score: 4,
+  description: "第 2 轮逐项对照了题面约束。",
+});
+assert.equal(synced.planning.description, "按三个真实阶段推进并记录状态。");
+assert.equal(synced.reasoning.score, 4);
+assert.equal(synced.execution.score, 4);
+assert.equal(synced.dedup_hits.length, 1);
+assert.equal(synced.dedup_hits[0].submission_id, 812);
+assert.equal("unsafe" in synced.dedup_hits[0], false);

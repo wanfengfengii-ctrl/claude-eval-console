@@ -11,6 +11,23 @@ const REMOTE_STATUS_TO_LOCAL = {
   PENDING_FIX: "needs_fix",
   DISCARDED: "discarded",
 };
+const REMOTE_REVIEW_DIMENSIONS = [
+  "delivery",
+  "instruction",
+  "planning",
+  "reasoning",
+  "execution",
+];
+const REMOTE_DETAIL_CONTAINERS = [
+  "data",
+  "values",
+  "form_data",
+  "submission_data",
+  "payload",
+];
+const REMOTE_DESCRIPTION_MAX_CHARS = 2000;
+const REMOTE_DEDUP_MAX_HITS = 20;
+const REMOTE_DEDUP_MAX_CHARS = 12000;
 const FIELD_KEY_LABELS = {
   question_type: "任务类型",
   task_type: "任务类型",
@@ -213,9 +230,9 @@ async function remoteFile(path, blob, filename) {
   });
 }
 
-function jsonOptions(body) {
+function jsonOptions(body, method = "POST") {
   return {
-    method: "POST",
+    method,
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   };
@@ -298,8 +315,109 @@ async function recordLocal(bundle, values) {
   }));
 }
 
+function remoteDetailSources(item) {
+  if (!item || typeof item !== "object" || Array.isArray(item)) return [];
+  return [
+    item,
+    ...REMOTE_DETAIL_CONTAINERS
+      .map((key) => item[key])
+      .filter((value) => value && typeof value === "object" && !Array.isArray(value)),
+  ];
+}
+
+function compactRemoteScore(value) {
+  const score = Number(value);
+  return Number.isInteger(score) && score >= 1 && score <= 5 ? score : null;
+}
+
+function compactRemoteDescription(value) {
+  if (typeof value !== "string") return "";
+  return value.replace(/\s+/g, " ").trim().slice(0, REMOTE_DESCRIPTION_MAX_CHARS);
+}
+
+function compactRemoteReview(item, dimension) {
+  const aliases = dimension === "instruction"
+    ? ["instruction", "instruction_following"]
+    : [dimension];
+  let score = null;
+  let description = "";
+  for (const source of remoteDetailSources(item)) {
+    for (const alias of aliases) {
+      const nested = source[alias];
+      if (nested && typeof nested === "object" && !Array.isArray(nested)) {
+        if (score === null) score = compactRemoteScore(nested.score);
+        if (!description) {
+          description = compactRemoteDescription(nested.description ?? nested.desc);
+        }
+      } else if (!description) {
+        description = compactRemoteDescription(nested);
+      }
+      if (score === null) score = compactRemoteScore(source[`score_${alias}`]);
+      if (!description) {
+        description = compactRemoteDescription(
+          source[`desc_${alias}`] ?? source[`description_${alias}`],
+        );
+      }
+    }
+  }
+  return { score, description };
+}
+
+function compactRemoteDedupScalar(value, maxChars) {
+  if (typeof value === "string") return value.trim().slice(0, maxChars);
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "boolean") return value;
+  return undefined;
+}
+
+function compactRemoteDedupHit(value) {
+  if (typeof value === "string") {
+    const excerpt = compactRemoteDedupScalar(value, 600);
+    return excerpt ? { excerpt } : null;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const limits = {
+    field: 100,
+    dimension: 64,
+    peer_id: 128,
+    submission_id: 128,
+    ratio: 32,
+    similarity: 32,
+    excerpt: 600,
+    matched_excerpt: 600,
+  };
+  const result = {};
+  for (const [key, maxChars] of Object.entries(limits)) {
+    const compact = compactRemoteDedupScalar(value[key], maxChars);
+    if (compact !== undefined && compact !== "") result[key] = compact;
+  }
+  return Object.keys(result).length ? result : null;
+}
+
+function compactRemoteDedupHits(item) {
+  const containers = [
+    ...remoteDetailSources(item),
+    item?.qc,
+    item?.qc_result,
+    item?.quality_control,
+  ].filter((value) => value && typeof value === "object" && !Array.isArray(value));
+  const raw = containers
+    .map((value) => value.dedup_hits)
+    .find((value) => Array.isArray(value));
+  if (!raw) return undefined;
+  const result = [];
+  for (const value of raw.slice(0, REMOTE_DEDUP_MAX_HITS)) {
+    const compact = compactRemoteDedupHit(value);
+    if (!compact) continue;
+    const candidate = [...result, compact];
+    if (JSON.stringify(candidate).length > REMOTE_DEDUP_MAX_CHARS) break;
+    result.push(compact);
+  }
+  return result;
+}
+
 function compactRemote(item) {
-  return {
+  const result = {
     id: item.id,
     status: String(item.status || "SUBMITTED").slice(0, 64),
     session_id: String(item.session_id || "").slice(0, 128),
@@ -309,6 +427,12 @@ function compactRemote(item) {
     submitted_at: String(item.submitted_at || "").slice(0, 128),
     updated_at: String(item.updated_at || item.qc_finished_at || "").slice(0, 128),
   };
+  for (const dimension of REMOTE_REVIEW_DIMENSIONS) {
+    result[dimension] = compactRemoteReview(item, dimension);
+  }
+  const dedupHits = compactRemoteDedupHits(item);
+  if (dedupHits !== undefined) result.dedup_hits = dedupHits;
+  return result;
 }
 
 async function remoteDetails(items) {
@@ -349,10 +473,39 @@ async function listAllRemote() {
 
 async function syncAllRemote() {
   const remote = await listAllRemote();
-  const local = await localJson("/sync", jsonOptions({
-    items: remote.items,
-    complete: remote.complete,
-  }));
+  const local = {
+    matched: 0,
+    unmatched: 0,
+    ambiguous: 0,
+    remote_missing: 0,
+    synced_at: "",
+  };
+  const batchSize = 40;
+  for (let offset = 0; offset < remote.items.length; offset += batchSize) {
+    const result = await localJson("/sync", jsonOptions({
+      items: remote.items.slice(offset, offset + batchSize),
+      complete: false,
+    }));
+    for (const field of ["matched", "unmatched", "ambiguous"]) {
+      local[field] += Number(result[field] || 0);
+    }
+    local.synced_at = result.synced_at || local.synced_at;
+  }
+  if (remote.complete) {
+    const completed = await localJson("/sync", jsonOptions({
+      items: [],
+      complete: true,
+      remote_ids: remote.items.map((item) => String(item.id || "")).filter(Boolean),
+    }));
+    local.remote_missing = Number(completed.remote_missing || 0);
+    local.synced_at = completed.synced_at || local.synced_at;
+  } else if (!remote.items.length) {
+    const empty = await localJson("/sync", jsonOptions({
+      items: [],
+      complete: false,
+    }));
+    local.synced_at = empty.synced_at || local.synced_at;
+  }
   return {
     ...local,
     remote_total: remote.total,
@@ -490,6 +643,99 @@ async function submitBatch(payload) {
   return { results, stopped: false, remaining: 0 };
 }
 
+async function repairOne(turnKey, loadFormSchema) {
+  const bundle = await loadLocalBundle(turnKey);
+  const remoteId = String(bundle.solo_qa?.remote_id || "");
+  const remoteStatus = String(bundle.solo_qa?.remote_status || "");
+  if (!remoteId || remoteStatus !== "PENDING_FIX") {
+    return { turn_key: turnKey, outcome: "skipped", reason: "远端记录不是待返修状态" };
+  }
+  const detail = compactRemote(await remoteJson(`/submissions/${encodeURIComponent(remoteId)}`));
+  if (detail.status !== "PENDING_FIX") {
+    await recordLocal(bundle, {
+      state: REMOTE_STATUS_TO_LOCAL[detail.status] || "qc_pending",
+      remote_id: remoteId,
+      remote_status: detail.status,
+      qc_summary: detail.qc_summary,
+      submitted_at: detail.submitted_at,
+      remote_updated_at: detail.updated_at,
+      error: "",
+    });
+    return { turn_key: turnKey, outcome: "skipped", reason: "远端状态已经变化" };
+  }
+  try {
+    const schema = await loadFormSchema();
+    buildRemoteData(schema, bundle, { name: "pending", path: "pending", size: 0 });
+    const uploaded = await uploadTrajectory(bundle, schema);
+    const data = buildRemoteData(schema, bundle, uploaded);
+    const updated = await remoteJson(`/submissions/${encodeURIComponent(remoteId)}`, jsonOptions({
+      data,
+      schema_fingerprint: schema.fingerprint || "",
+      comment: "按质检结论依据本轮轨迹重写五维描述",
+    }, "PUT"));
+    const refreshed = compactRemote({
+      ...updated,
+      id: updated.id || remoteId,
+      status: updated.status || "SUBMITTED",
+    });
+    await recordLocal(bundle, {
+      state: REMOTE_STATUS_TO_LOCAL[refreshed.status] || "qc_pending",
+      remote_id: remoteId,
+      remote_status: refreshed.status || "SUBMITTED",
+      qc_summary: refreshed.qc_summary || updated.message || "返修已提交，正在重新质检",
+      submitted_at: refreshed.submitted_at || detail.submitted_at,
+      remote_updated_at: refreshed.updated_at,
+      error: "",
+    });
+    return {
+      turn_key: turnKey,
+      outcome: "resubmitted",
+      remote_id: remoteId,
+      status: refreshed.status || "SUBMITTED",
+    };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    await recordLocal(bundle, {
+      state: "needs_fix",
+      remote_id: remoteId,
+      remote_status: "PENDING_FIX",
+      qc_summary: detail.qc_summary || bundle.solo_qa?.qc_summary || "",
+      submitted_at: detail.submitted_at,
+      remote_updated_at: detail.updated_at,
+      error: message,
+    });
+    throw new Error(message);
+  }
+}
+
+async function repairBatch(payload) {
+  const keys = Array.isArray(payload?.turn_keys) ? [...new Set(payload.turn_keys.map(String))] : [];
+  if (!keys.length) throw new Error("请至少选择一个待返修轮次");
+  if (keys.length > 100 || keys.some((key) => !TURN_KEY_RE.test(key))) {
+    throw new Error("返修轮次列表格式不正确");
+  }
+  const results = [];
+  let schemaPromise = null;
+  const loadFormSchema = () => {
+    if (!schemaPromise) schemaPromise = remoteJson("/submissions/form-schema");
+    return schemaPromise;
+  };
+  for (let index = 0; index < keys.length; index += 1) {
+    const key = keys[index];
+    try {
+      results.push(await repairOne(key, loadFormSchema));
+    } catch (error) {
+      results.push({
+        turn_key: key,
+        outcome: "failed",
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return { results, stopped: true, remaining: keys.length - index - 1 };
+    }
+  }
+  return { results, stopped: false, remaining: 0 };
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   let senderOrigin = "";
   try { senderOrigin = new URL(sender.url || "").origin; } catch { senderOrigin = ""; }
@@ -501,6 +747,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     ? syncAllRemote
     : message?.type === "SOLO_QA_SUBMIT"
       ? () => submitBatch(message.payload || {})
+      : message?.type === "SOLO_QA_REPAIR"
+        ? () => repairBatch(message.payload || {})
       : null;
   if (!action) {
     sendResponse({ ok: false, error: "未知的提交助手操作" });

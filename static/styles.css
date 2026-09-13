@@ -387,6 +387,7 @@ textarea { padding: 13px 14px; border-radius: 10px; resize: vertical; line-heigh
 .export-preflight-panel strong { color: #3f514b; font-size: 10px; }
 .export-preflight-panel span { line-height: 1.45; }
 .export-preflight-panel.checking { color: #755c25; background: #fff8e7; }
+.export-preflight-panel.repairing { color: #755c25; background: #fff8e7; }
 .export-preflight-panel.passed { color: #216e48; background: #edf8f1; }
 .export-preflight-panel.warning { color: #8a651a; background: #fff6df; }
 .export-preflight-panel.failed { color: #a1463f; background: #fff0ee; }
@@ -446,6 +447,8 @@ textarea { padding: 13px 14px; border-radius: 10px; resize: vertical; line-heigh
 .export-evaluation-heading strong { color: #31584e; font-size: 10px; }
 .export-evaluation-heading span { padding: 3px 7px; border-radius: 999px; color: #66746f; background: #edf1ef; font-size: 8px; font-weight: 800; }
 .export-evaluation-heading span.manual { color: #8a5a13; background: #fff0d4; }
+.export-evaluation-heading span.repairing { color: #755c25; background: #fff2ce; }
+.export-evaluation-heading span.repair-failed { color: #a1463f; background: #fde4e1; }
 .export-evaluation-heading small { color: #7f8c87; font-size: 9px; }
 .export-evaluation-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 9px; }
 .export-evaluation-item { min-width: 0; display: grid; grid-template-columns: 1fr 72px; gap: 6px; align-items: center; }
@@ -461,6 +464,8 @@ textarea { padding: 13px 14px; border-radius: 10px; resize: vertical; line-heigh
 .export-readiness { display: inline-block; padding: 4px 7px; border-radius: 999px; font-size: 9px; font-weight: 800; white-space: nowrap; }
 .export-readiness.ready { color: #216e48; background: #e7f6ed; }
 .export-readiness.blocked { color: #a1463f; background: #fdecea; cursor: help; }
+.export-readiness.repairing { color: #755c25; background: #fff2ce; }
+.export-issues-inline.repair-message { color: #755c25; }
 .preflight-result { display: inline-block; padding: 4px 7px; border-radius: 999px; font-size: 9px; font-weight: 800; white-space: nowrap; }
 .preflight-result.passed { color: #216e48; background: #e7f6ed; }
 .preflight-result.warning { color: #8a651a; background: #fff2ce; }
@@ -598,6 +603,7 @@ textarea { padding: 13px 14px; border-radius: 10px; resize: vertical; line-heigh
 .validation-item > div { display: flex; justify-content: space-between; gap: 12px; font: 10px "SFMono-Regular", monospace; }
 .validation-item .pass { color: var(--accent); }
 .validation-item .fail { color: var(--danger); }
+.validation-item .skip { color: var(--warning); }
 .validation-item pre { max-height: 180px; margin: 9px 0 0; overflow: auto; color: #77828a; white-space: pre-wrap; font: 9px/1.55 "SFMono-Regular", monospace; }
 .empty-state { min-height: 500px; display: grid; place-content: center; text-align: center; color: #8a969e; }
 .empty-state div { font-size: 38px; }

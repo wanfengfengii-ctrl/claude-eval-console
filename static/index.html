@@ -19,7 +19,7 @@
             </div>
           </div>
           <div class="header-tools">
-            <div class="model-chip parallel-chip"><span></span><b id="parallel-status">并行 0 / 4</b></div>
+            <div class="model-chip parallel-chip"><span></span><b id="parallel-status">并行 0 / 6</b></div>
             <form class="model-switcher" id="model-form">
               <label for="global-model">全局模型</label>
               <select id="global-model" name="model" aria-label="全局模型" required>
@@ -66,7 +66,7 @@
               <span class="auto-refill-indicator" aria-hidden="true"></span>
               <div>
                 <strong>自动补题</strong>
-                <small id="auto-refill-detail">并行不足 4 时优先续作；每链最多 6 轮，默认按 Feature、Bug 修复和完整模块混合安排。</small>
+                <small id="auto-refill-detail">并行不足 6 时优先续作；每链最多 6 轮，默认按 Feature、Bug 修复和完整模块混合安排。</small>
                 <small class="auto-refill-deadline hidden" id="auto-refill-deadline"></small>
               </div>
             </div>
@@ -273,6 +273,7 @@
               <div class="solo-qa-actions">
                 <a class="secondary-button" href="https://solo2.jzxhnh.com/app/submissions" target="_blank" rel="noopener noreferrer">打开我的提交</a>
                 <button class="secondary-button" id="solo-qa-sync" type="button" disabled>同步我的提交</button>
+                <button class="secondary-button" id="solo-qa-repair" type="button" disabled>提交所选返修</button>
                 <button class="primary-button" id="solo-qa-submit" type="button" disabled>提交所选轮次</button>
               </div>
             </div>
@@ -392,6 +393,6 @@
         </div>
       </form>
     </dialog>
-    <script src="/app.js?v=70" defer></script>
+    <script src="/app.js?v=71" defer></script>
   </body>
 </html>

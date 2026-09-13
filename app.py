@@ -26,8 +26,10 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import uuid
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -126,8 +128,9 @@ SOLO_QA_PROJECT_REJECTION_MARKERS = (
     "选题不合格",
     "题材不合格",
 )
-SUBMITTER_NAME = os.environ.get("CLAUDE_EVAL_SUBMITTER", "张鑫宇").strip() or "张鑫宇"
-APP_VERSION = "20260912.2"
+SUBMITTER_NAME = os.environ.get("CLAUDE_EVAL_SUBMITTER", "牛宇航").strip() or "牛宇航"
+APP_VERSION = "20260913.13"
+EVALUATION_REPAIR_POLICY_VERSION = 2
 REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/\[\]-]{0,127}$")
 BACKGROUND_ID_RE = re.compile(r"backgrounded\s+[·•]\s+([A-Za-z0-9_-]+)", re.I)
@@ -161,9 +164,12 @@ BUILTIN_MODEL_OPTIONS = [
     ("haiku", "Haiku"),
 ]
 try:
-    MAX_PARALLEL_RUNS = max(1, min(4, int(os.environ.get("CLAUDE_EVAL_MAX_PARALLEL", "4"))))
+    MAX_PARALLEL_RUNS = max(1, min(6, int(os.environ.get("CLAUDE_EVAL_MAX_PARALLEL", "4"))))
 except ValueError:
     MAX_PARALLEL_RUNS = 4
+AUTO_CLOSE_TERMINAL = os.environ.get(
+    "CLAUDE_EVAL_AUTO_CLOSE_TERMINAL", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
 REVIEW_MODEL = "gpt-5.6-sol"
 TASK_GENERATION_MODEL = REVIEW_MODEL
 TASK_GENERATION_BATCH_SIZE = 2
@@ -175,6 +181,22 @@ TASK_GENERATION_RETRY_LIMIT = 1
 ITERATION_GENERATION_MODEL = REVIEW_MODEL
 ITERATION_GENERATION_ATTEMPTS = 2
 BUGFIX_GENERATION_ATTEMPT_TIMEOUT_SECONDS = 15 * 60
+try:
+    VERIFICATION_COMMAND_TIMEOUT_SECONDS = max(
+        60,
+        int(os.environ.get("CLAUDE_EVAL_VERIFICATION_TIMEOUT_SECONDS", str(15 * 60))),
+    )
+except ValueError:
+    VERIFICATION_COMMAND_TIMEOUT_SECONDS = 15 * 60
+try:
+    VERIFICATION_COMPOSE_BUILD_TIMEOUT_SECONDS = max(
+        VERIFICATION_COMMAND_TIMEOUT_SECONDS,
+        int(os.environ.get("CLAUDE_EVAL_COMPOSE_BUILD_TIMEOUT_SECONDS", str(90 * 60))),
+    )
+except ValueError:
+    VERIFICATION_COMPOSE_BUILD_TIMEOUT_SECONDS = 90 * 60
+VERIFICATION_PROGRESS_INTERVAL_SECONDS = 15
+VERIFICATION_OUTPUT_TAIL_BYTES = 256 * 1024
 AUTO_ITERATION_GENERATION_RECOVERY_LIMIT = 0
 AUTO_REFILL_MAX_ITERATIONS_PER_ROOT = 6
 AUTO_REFILL_NEW_MODULE_SLOTS = (3, 6)
@@ -182,8 +204,11 @@ MAX_NEW_MODULE_ITERATIONS_PER_ROOT = 2
 AUTO_REFILL_POLL_SECONDS = 5
 AUTO_REFILL_SOURCE_COOLDOWN_SECONDS = 30 * 60
 AUTO_REFILL_FAILURE_LIMIT = 3
+DOCKER_STARTUP_HEALTH_TIMEOUT_SECONDS = 5
+DOCKER_STARTUP_HEALTH_CACHE_SECONDS = 10
 CONTROL_STAGE_RETRY_LIMIT = 2
 CONTROL_STAGE_RETRY_BASE_SECONDS = 15
+EVALUATION_SPLIT_MAX_CONCURRENCY = 5
 UNASSESSED_TASK_DIFFICULTY = "待评估"
 TERMINAL_RUN_PHASES = {
     "complete", "turn_limit", "manual_review", "interrupted", "failed", "stopped",
@@ -311,7 +336,6 @@ EVALUATION_DISALLOWED_PHRASES = (
     "本次复核中",
     "未据此扣分",
     "属于环境故障",
-    "docker compose config --quiet",
     "逐项响应",
     "核心流程",
     "未影响定档",
@@ -328,16 +352,16 @@ EVALUATION_COMMAND_REFERENCE_RE = re.compile(
     + r")(?:[ \t]+[A-Za-z0-9_./:@%+=-]+)+",
     re.I,
 )
+EVALUATION_REVIEW_ATTRIBUTION_RE = re.compile(
+    r"后续(?:独立)?(?:验收|复核)|独立(?:验收|复核)|"
+    r"验收阶段|复核阶段|后续浏览器复核"
+)
+EVALUATION_FALSE_SUCCESS_RE = re.compile(r"虚假成功|虚报成功")
+EVALUATION_COMPLETION_CLAIM_RE = re.compile(
+    r"(?:已经|已|全部|均|都)?(?:完成|实现|修复|处理|改完|交付|部署|通过|成功)|搞定"
+)
 EVALUATION_HIGH_RISK_FRAGMENTS = (
-    "npx playwright test",
-    "npx vitest run",
-    "npm test",
-    "npm run build",
-    "docker compose build",
-    "docker compose config",
     "break-system-packages",
-    "全部通过",
-    "生产构建成功",
     "没有先给出明确阶段计划或持续状态记录",
     "为每条复现路径补充回归测试",
     "修复仅限上述问题",
@@ -400,11 +424,11 @@ EVALUATION_PROBLEM_MARKERS = (
     "失败", "错误", "未完成", "未验证", "未检查", "未记录", "未覆盖",
     "未实现", "未继续", "未能", "遗漏", "缺少", "中断", "阻断", "偏差",
     "不准确", "不完整", "不够", "不足", "没有", "还没", "没能", "无效", "重复", "冗余",
-    "返工", "找不到", "无法", "错过",
+    "返工", "找不到", "无法", "错过", "覆盖了相邻", "放反",
 )
 EVALUATION_IMPACT_MARKERS = (
     "导致", "造成", "因此", "使得", "从而", "结果", "后果", "影响", "留下",
-    "所以", "未能", "需要重新", "需要再次", "增加了", "阻断",
+    "所以", "未能", "需要重新", "需要再次", "需要返工", "增加了", "阻断",
 )
 EVALUATION_SPECIFIC_EVIDENCE_RE = re.compile(
     r"(?:[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)+)"
@@ -456,6 +480,33 @@ EVALUATION_FULL_SCORE_DEFICIENCY_PATTERNS = (
         r"(?:已经|随后|最终|后来)?(?:修复|恢复|改正|纠正|补齐)"
     ),
 )
+EVALUATION_NON_DEFICIENCY_ERROR_LABEL_RE = re.compile(
+    r"(?:校验|验证|表单|字段|输入|接口)错误(?:提示|消息|文案|状态|反馈|标记|码)?"
+    r"|错误(?:提示|消息|文案|状态|反馈|标记|码)"
+)
+EVALUATION_FULL_SCORE_RECOVERED_REWORK_RE = re.compile(
+    r"(?:首次|第一次|最初|起初|早期|一开始|中途|一度).{0,96}?"
+    r"(?:失败|未通过|报错).{0,160}?"
+    r"(?:定位|随即|调整|修改|修正|纠正|补齐|重跑|重新|恢复).{0,100}?"
+    r"(?:通过|成功|完成|恢复|修复|解决)",
+    re.I,
+)
+EVALUATION_FULL_SCORE_RECOVERED_ENVIRONMENT_RE = re.compile(
+    r"operation not permitted|connect\s+eperm|docker\s+(?:daemon|socket)|"
+    r"共享库|动态库|address already in use|端口(?:占用|冲突)",
+    re.I,
+)
+EVALUATION_EXPECTED_CONTRACT_RE = re.compile(
+    r"(?:错误|非法|无效|缺失)(?:输入|请求|参数|状态).{0,36}"
+    r"(?:按(?:题面|约束|契约)|预期|正常).{0,24}"
+    r"(?:返回|拒绝|拦截|保持|修复|规范化|不写入)"
+    r"|(?:按(?:题面|约束|契约)|预期|正常).{0,24}"
+    r"(?:返回|拒绝|拦截|保持|修复|规范化|不写入).{0,36}"
+    r"(?:错误|非法|无效|缺失)(?:输入|请求|参数|状态)"
+)
+EVALUATION_NONCURRENT_FACT_RE = re.compile(
+    r"(?:历史|既有|未修改基线|原有基线).{0,36}(?:问题|错误|失败|偏差|缺陷)"
+)
 EVALUATION_REPEAT_ACTION_RE = re.compile(
     r"(?:重复|多次|反复).{0,16}(?:读取|查看|调用|执行|运行|修改|尝试)"
     r"|(?:连续\s*[一二两三四五六七八九十\d]+\s*次).{0,16}"
@@ -478,6 +529,7 @@ EVALUATION_ARCHITECTURE_CLAIM_RE = re.compile(
 EVALUATION_QUOTED_EVIDENCE_RE = re.compile(
     r"`([^`\r\n]{2,})`|[“「]([^”」\r\n]{2,})[”」]"
 )
+EVALUATION_MARKDOWN_CODE_SPAN_RE = re.compile(r"`+([^`\r\n]+?)`+")
 EVALUATION_FUNCTION_REFERENCE_RE = re.compile(
     r"\b[A-Za-z_][A-Za-z0-9_]{2,}\(\)"
 )
@@ -504,6 +556,15 @@ EVALUATION_TERMINAL_FAILURE_RE = re.compile(
     r"|(?:没有|未留下).{0,24}(?:通过|成功).{0,10}(?:结果|记录|证明)",
     re.I,
 )
+EVALUATION_NEGATED_TERMINAL_FAILURE_PREFIX_RE = re.compile(
+    r"(?:未|没有|并未|不会|并没有)(?:直接)?"
+    r"(?:造成|导致|留下|出现|产生|影响)[^。！？；]{0,24}$"
+)
+EVALUATION_NEGATED_TERMINAL_FAILURE_MATCH_RE = re.compile(
+    r"(?:未|没有|并未|不会|并没有)(?:直接)?"
+    r"(?:造成|导致|留下|出现|产生|影响)[^。！？；]{0,24}"
+    r"(?:失败|未通过|未完成|未验证)\s*$"
+)
 EVALUATION_RECOVERY_RE = re.compile(
     r"(?:随后|之后|后续|修正后|调整后|处理后|改动后|改成|补上|最后一次|最终)"
     r".{0,60}(?:通过|完成|闭合|恢复正常|成功)",
@@ -520,11 +581,13 @@ PROMPT_HIGH_RISK_FRAGMENTS = (
 )
 BUG_REPAIR_REPEAT_SIMILARITY_LIMIT = 0.72
 BUG_REPAIR_RESIDUAL_MARKERS = ("上轮", "上次修复后", "修复后")
-EVALUATION_DESCRIPTION_GUIDANCE = f"""评分描述写成自然的项目工作记录，不写成评语或验收报告模板，不限制句数。每段按“做了什么—途中遇到什么—最后结果怎样”的顺序组织，从本项目特有的业务对象、测试数量、可观察结果或返工动作切入；没有发生波折时可以省略中间一项，不要为了凑结构编造过程。直接说本轮改了什么、哪里返工、还有什么没验证；一句只承载一组相关事实，功能很多时挑最能说明分数的两三项。不足可以逐项举例，但每项都要落到本轮真实发生的动作和后果。凡是低于 5 分的描述，必须用至少两个完整句子自然写明问题发生在第几轮；整段合计应包含具体步骤、文件、函数、接口、日志、报错或数量等至少一项客观证据，并说明具体不足及其实际影响，不强制这些内容挤在第一句。如果轨迹中找不到真实不足，应改评 5 分，不能为了保留非满分而编造问题。5 分描述必须写出实际核对或验收依据，并且只能保留正向完成事实；只要描述中保留了本轮真实发生的错误操作、遗漏、失误或返工，该维度就不能评 5 分。预期的 404、409、422 等业务反馈属于契约结果，不要误写成执行失误。五个维度不要使用相同的开头、转折和收尾，也不要把一个维度的扣分点搬到另一个维度：交付写最终得到什么，指令遵循对照明确要求，规划记录真实步骤和遗漏，推理写定位依据与判断失误，执行写“对象＋结果＋本轮独有数字或故障恢复”。措辞尽量口语化：根据语境把“未”写成“没有”或“还没”，把“均”写成“都”，把“包含”写成“有”；不要改动代码、文件名、接口字段、原始报错或引号内的原文。用通俗方式解释测试数据，不直接抄写 `[0,2,1,1]` 这类原始数字数组；应改写成“零费用项保持为零、其余费用按提交顺序分配”等可观察业务结果，原数组只保留在内部证据中。五维描述直接陈述本轮动作和结果，不使用“用户”这类泛化主语，不出现 AI、AI 浏览器、AI Agent、AI 模型、Codex、GPT、Claude Code 等身份、工具或模型名称，也不用“模型认为”“模型完成了”这类说法指代执行者。执行能力描述完全不出现 npm、npx、Docker 等原始命令名称，不罗列命令串；即使命令真实执行过，也改写成项目对象、失败现象、恢复动作和可核验结果。五维描述只能使用当前轮次轨迹、Git 变化和验收结果中真实存在的事实；数字、成功或失败、修改前后状态必须与证据一致。“重复读取”“多次调用”等次数判断必须写出轨迹中可核对的次数；状态被清空、内容被覆盖和架构不匹配等因果判断必须有直接输出，不能只凭后续测试结果反推。不要推测执行者心里“意识到”或“抓住”了什么，也不要为了扣分编造错误。禁用这些措辞：{'、'.join(EVALUATION_DISALLOWED_PHRASES)}。高风险公共片段同样禁用：{'、'.join(EVALUATION_HIGH_RISK_FRAGMENTS)}。不复述分数，不提评分工具、内部提示或生成过程。只评价当前轮次完成的内容。"""
+EVALUATION_DESCRIPTION_GUIDANCE = f"""评分描述写成自然的项目工作记录，不写成评语或验收报告模板，不限制句数。每段按“做了什么—途中遇到什么—最后结果怎样”的顺序组织，从本项目特有的业务对象、测试数量、可观察结果或返工动作切入；没有发生波折时可以省略中间一项，不要为了凑结构编造过程。直接说本轮改了什么、哪里返工、还有什么没验证；一句只承载一组相关事实，功能很多时挑最能说明分数的两三项。不足可以逐项举例，但每项都要落到本轮真实发生的动作和后果。凡是低于 5 分的描述，必须用至少两个完整句子自然写明问题发生在第几轮；整段合计应包含具体步骤、工具调用动作、文件、函数、接口、命令、日志、报错或数量等至少一项客观证据，并说明具体不足及其实际影响，不强制这些内容挤在第一句。如果轨迹中找不到真实不足，应改评 5 分，不能为了保留非满分而编造问题。5 分描述必须写出实际核对或验收依据；本轮真实发生且属于当前维度的错误操作、遗漏、失误或返工不能藏起来，应降低该维分数。历史问题、环境故障和预期的 404、409、422 等正常契约反馈不自动构成扣分点，写入描述时要具体交代触发条件、可见反馈及为什么不属于本轮缺陷。五个维度不要使用相同的开头、转折和收尾，也不要把一个维度的扣分点搬到另一个维度：交付写最终得到什么，指令遵循对照明确要求，规划记录真实步骤和遗漏，推理写可见说明、决策和定位依据，执行写“对象＋结果＋本轮独有数字或故障恢复”。措辞尽量口语化：根据语境把“未”写成“没有”或“还没”，把“均”写成“都”，把“包含”写成“有”；不要改动代码、文件名、接口字段、原始报错、命令或引号内的原文。五维公开描述不使用 Markdown 反引号；文件名、函数名、命令和输入值直接保留正文，原始报错需要区分时使用中文引号。用通俗方式解释测试数据，不直接抄写 `[0,2,1,1]` 这类原始数字数组；应改写成“零费用项保持为零、其余费用按提交顺序分配”等可观察业务结果，原数组只保留在内部证据中。五维描述直接陈述本轮动作和结果，不使用“用户”这类泛化主语，不出现 AI、AI 浏览器、AI Agent、AI 模型、Codex、GPT、Claude Code 等身份、工具或模型名称，也不用“模型认为”“模型完成了”这类说法指代执行者。命令可以作为证据，但只引用原作业轨迹或验收材料中真实出现且与判断直接相关的完整命令；后续独立验收的命令必须明确写成“后续独立验收”，不能冒充原作业操作，也不要罗列无关命令串。五维描述只能使用当前轮次轨迹、Git 变化和验收结果中真实存在的事实；数字、成功或失败、修改前后状态必须与证据一致。“重复读取”“多次调用”等次数判断必须写出轨迹中可核对的次数；状态被清空、内容被覆盖和架构不匹配等因果判断必须有直接输出，不能只凭后续测试结果反推。不要推测执行者心里“意识到”或“抓住”了什么，也不要为了扣分编造错误。禁用这些措辞：{'、'.join(EVALUATION_DISALLOWED_PHRASES)}。高风险公共片段同样禁用：{'、'.join(EVALUATION_HIGH_RISK_FRAGMENTS)}。不复述分数，不提评分工具、内部提示或生成过程。只评价当前轮次完成的内容。"""
 EVALUATION_DESCRIPTION_GUIDANCE += """ 环境、网络、权限、系统解释器、包管理器或系统运行库问题只能写入 other_issues，不能出现在任何非满分维度中作为扣分理由。遇到这类阻碍后完成适配属于恢复事实，不是能力缺点；如果轨迹没有另外记录错误命令、错误修改、冗余调用或遗漏步骤，该维度应评 5 分。确有错误操作时只描述错误动作和它造成的后果，不把环境故障本身写成不足。"""
 EVALUATION_RUBRIC_START = "第三步：打分并撰写反馈"
 EVALUATION_RUBRIC_END = "第四步：提交数据"
-EVALUATION_SCORE_GUIDANCE = """严格使用下方评分表的 1～5 分制，对五个维度分别定档，不得改用十分制、百分制或自行换算。先根据本轮轨迹与产物逐项确定最匹配档位，再填写该档整数；评分描述必须与分数一致。不要为了省事把五项机械地都评为 5 分：只有五个维度分别都有充分材料证明没有缺口时才可全部满分；轨迹中真实出现的遗漏、错误修改、无效重试、未完成验收或需求偏差，应体现在对应维度的分数中。但不能为了让分数有高低而编造不足。5 分描述必须给出真实核对或验收依据，并且不能同时写“早期错误后来修复”一类扣分事实；如果该事实确实属于当前维度，应降低分数，如果不属于当前维度则不要混写。低于 5 分时必须写明本轮真实存在的不足、具体证据和实际影响；如果只能写出完成情况和优点，该项应评 5 分。环境、网络或复核工具自身故障不能作为能力扣分依据；如果同一失败在暂存本轮改动后的未修改基线中也能复现，它属于历史基线，不能作为本轮扣分或执行缺口。只写“若干文件”或文件数量不算具体证据，必须给出完整文件名或关键报错原文。禁止照抄评分表，必须写本轮可核验实证。"""
+EVALUATION_SCORE_GUIDANCE = """严格按交付完整性、指令遵循、任务规划、推理能力、执行能力的固定顺序，使用下方评分表的 1～5 分制逐维独立定档，不得用总档印象代替各维标准，也不得改用十分制、百分制或自行换算。先根据本轮轨迹与产物逐项确定最匹配档位，再填写该档整数；评分描述必须与分数一致。不要为了省事把五项机械地都评为 5 分：只有五个维度分别都有充分材料证明没有缺口时才可全部满分；轨迹中真实出现的遗漏、错误修改、无效重试、未完成验收或需求偏差，应体现在对应维度的分数中。但不能为了让分数有高低而编造不足。5 分描述必须给出真实核对或验收依据，并且不能同时写“早期错误后来修复”一类扣分事实；如果该事实确实属于当前维度，应降低分数，如果不属于当前维度则不要混写。低于 5 分时必须写明本轮真实存在的不足、具体证据和实际影响；如果只能写出完成情况和优点，该项应评 5 分。环境、网络或复核工具自身故障不能作为能力扣分依据；如果同一失败在暂存本轮改动后的未修改基线中也能复现，它属于历史基线，不能作为本轮扣分或执行缺口。只写“若干文件”或文件数量不算具体证据，必须给出完整文件名或关键报错原文。禁止照抄评分表，必须写本轮可核验实证。"""
+EVALUATION_FACT_ATTRIBUTION_GUIDANCE = """先核验事实，再逐维定分，最后写描述。明确区分原作业实际操作、面向使用者的完成声明、源码事实、后续独立验收以及环境或网关故障；描述后续验收时必须显式写明来源，不能改写成原作业已经执行。指令义务只来自本轮实际 User Prompt 与当时有效上下文，后续评分提示、验收计划或复核新增条件不能反推为漏做。判定虚假成功必须同时找到本轮面向使用者的实际完成声明和与之矛盾的工具输出或产物事实；内部分析、计划、没有新增专项测试或没有写“未运行”不能单独定为虚假成功。后续独立验收通过不能抹掉原作业已经发生的虚假完成声明、真实失败、遗漏或没有验证的范围；临时副本补装依赖后的成功只证明该条件下的结果。环境、网关和检查脚本故障不自动成为五维扣分，也不统一限制最高分，已经证实的产品或过程问题仍按所属维度评价。504 后自动发送的“继续”属于同一业务目标，评分必须使用恢复前后的完整轨迹，保留所有实际调用、原始输出和过程问题，不能只摘取最后成功片段。评价推理能力只使用可见的说明、决策、排除过程和产物因果，不索取或猜测不可见的内部思维。"""
+EVALUATION_FACT_ATTRIBUTION_GUIDANCE += """ 历史评分、历史点评和质检建议分只用于识别套话或定位待复核处，不得沿用为本轮分数和事实，也不能为了制造差异改写真实场景。文字润色只能调整表达，发现分数、事实或验证范围矛盾时必须先按证据重新评价。"""
 TASK_DIFFICULTY_GUIDANCE = """task_difficulty 必须在检查真实代码、验收结果和本轮轨迹后独立判定，不采用题面、自报或历史记录中的难度标签。简单表示改动集中、路径直接且验证成本低；中等表示跨模块完成一条工程链路并处理常见失败路径；困难表示存在较多状态不变量、恢复逻辑或复杂跨层协作；地狱只用于产物确实同时包含多组深层机制且实现与验证负担显著的情况。"""
 DEVELOPER_PROMPT_STYLE_GUIDANCE = """题面使用自然、简洁的开发交接口吻，像项目负责人结合当前场景向开发者说明下一步工作。按业务因果和操作流程组织内容，不把数据库、接口、页面、异常、测试等字段机械地逐项拼接，不连续堆叠“必须”“不得”“须”“需要”等命令句，不使用“新增某模块，使用户能够”“提供某接口并覆盖”等模板反复起句，也不在结尾集中罗列通用工程或测试清单。技术约束、失败现象、兼容边界和验收证据仍要具体，但应放在它们对应的业务行为附近。"""
 BUG_REPAIR_PROMPT_STYLE_GUIDANCE = """先根据本轮需求检查功能是否真的实现，再记录已经稳定复现的 Bug。每个 Bug 另写一条 customer_summary，系统只按原顺序用中文分号把摘要拼成一整行，不添加通用开场、序号、命令或验收尾巴。每条摘要用客户能看懂的口语写清项目专属业务对象、触发条件、当前可观察结果和正确状态；不要写标题、项目符号、引号、Markdown、文件名、函数名、命令、测试框架、推测的根因、解决方法或通用测试要求。每条摘要控制在 12～90 个字符并尽量用一句话说清楚；编号、引号、连续标点和多余句末符号会在发送前由本地程序整理，不作为候选失败原因。若上一轮修复后同一问题仍存在，摘要必须依据新的复现证据描述修复后的残留状态，不能重发或同义改写当前题面；完全没有新的可观察差异时应停止自动续轮并交由人工确认。内部的 reproduction、actual、expected 和 evidence 仍须完整填写，不能为了凑修复轮把风险或测试缺口写成 Bug。"""
@@ -607,20 +670,35 @@ ITERATION_GENERATIONS: set[str] = set()
 ITERATION_JOB_LOCK = threading.Lock()
 ITERATION_JOBS: Dict[str, Dict[str, Any]] = {}
 CODEX_PROCESS_LOCK = threading.RLock()
-CODEX_PROCESSES: Dict[str, subprocess.Popen] = {}
+CODEX_PROCESSES: Dict[str, set[subprocess.Popen]] = {}
 CODEX_CANCELLED_JOBS: set[str] = set()
 CODEX_JOB_CONTEXT = threading.local()
+EVALUATION_SPLIT_GATE = threading.BoundedSemaphore(
+    EVALUATION_SPLIT_MAX_CONCURRENCY
+)
+EVALUATION_REPAIR_GATE = threading.BoundedSemaphore(2)
+EVALUATION_REPAIR_TRANSIENT_RETRY_LIMIT = 1
+EVALUATION_REPAIR_TRANSIENT_RETRY_DELAY_SECONDS = 2
 AUTO_REFILL_LOCK = threading.Lock()
 AUTO_REFILL_STATE_LOCK = threading.RLock()
 AUTO_REFILL_WAKE = threading.Event()
+DOCKER_STARTUP_HEALTH_LOCK = threading.Lock()
+STARTUP_RESOURCE_ROLLBACK_LOCK = threading.RLock()
+TERMINAL_OPEN_LOCK = threading.Lock()
 STATUS_CACHE: Dict[str, Any] = {}
 STATUS_CACHE_AT = 0.0
+DOCKER_STARTUP_HEALTH_AT = 0.0
+DOCKER_STARTUP_HEALTH_RESULT: Tuple[bool, str] = (False, "尚未检查 Docker 服务")
 HARNESS_VERSION_CACHE: Optional[str] = None
 LOGGER = logging.getLogger("claude_eval_console")
 
 
 class WorkflowError(RuntimeError):
     pass
+
+
+class SystemicStartupError(WorkflowError):
+    """A host-level startup failure that makes launching more runs unsafe."""
 
 
 class EvaluationRepairExhausted(WorkflowError):
@@ -746,16 +824,101 @@ def terminate_process(process: subprocess.Popen) -> None:
             pass
 
 
+class LocalCodexProcessGroup:
+    """Track sibling processes owned by one parallel scoring stage."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._processes: set[subprocess.Popen] = set()
+        self._aborted = False
+
+    def register(self, process: subprocess.Popen) -> None:
+        with self._lock:
+            aborted = self._aborted
+            if not aborted:
+                self._processes.add(process)
+        if aborted:
+            terminate_process(process)
+            raise JobCancelled("并行评分分片已取消")
+
+    def unregister(self, process: subprocess.Popen) -> None:
+        with self._lock:
+            self._processes.discard(process)
+
+    def terminate_all(self) -> None:
+        with self._lock:
+            self._aborted = True
+            processes = list(self._processes)
+            self._processes.clear()
+        if not processes:
+            return
+        with ThreadPoolExecutor(
+            max_workers=len(processes),
+            thread_name_prefix="evaluation-score-stop",
+        ) as executor:
+            list(executor.map(terminate_process, processes))
+
+    def active_count(self) -> int:
+        with self._lock:
+            return len(self._processes)
+
+
+def register_codex_process(job_key: str, process: subprocess.Popen) -> None:
+    """Register every process for a job so parallel shards remain cancellable."""
+    if not job_key:
+        return
+    with CODEX_PROCESS_LOCK:
+        cancelled = job_key in CODEX_CANCELLED_JOBS
+        if not cancelled:
+            CODEX_PROCESSES.setdefault(job_key, set()).add(process)
+    if cancelled:
+        terminate_process(process)
+        raise JobCancelled("后台任务已取消")
+
+
+def unregister_codex_process(job_key: str, process: subprocess.Popen) -> None:
+    if not job_key:
+        return
+    with CODEX_PROCESS_LOCK:
+        processes = CODEX_PROCESSES.get(job_key)
+        if not processes:
+            return
+        processes.discard(process)
+        if not processes:
+            CODEX_PROCESSES.pop(job_key, None)
+
+
+@contextmanager
+def evaluation_split_slot(
+    job_key: str,
+    abort_event: Optional[threading.Event] = None,
+) -> Iterator[None]:
+    """Bound global score concurrency while remaining responsive to cancellation."""
+    acquired = False
+    try:
+        while not acquired:
+            ensure_job_active(job_key)
+            if abort_event is not None and abort_event.is_set():
+                raise JobCancelled("并行评分分片已取消")
+            acquired = EVALUATION_SPLIT_GATE.acquire(timeout=0.25)
+        ensure_job_active(job_key)
+        if abort_event is not None and abort_event.is_set():
+            raise JobCancelled("并行评分分片已取消")
+        yield
+    finally:
+        if acquired:
+            EVALUATION_SPLIT_GATE.release()
+
+
 def cancel_background_job(job_key: str) -> bool:
     if not job_key:
         return False
     with CODEX_PROCESS_LOCK:
         CODEX_CANCELLED_JOBS.add(job_key)
-        process = CODEX_PROCESSES.get(job_key)
-    if process is not None:
+        processes = list(CODEX_PROCESSES.get(job_key, set()))
+    for process in processes:
         terminate_process(process)
-        return True
-    return False
+    return bool(processes)
 
 
 def cancel_all_background_jobs() -> None:
@@ -983,6 +1146,23 @@ def initialize_database() -> None:
               updated_at TEXT NOT NULL,
               PRIMARY KEY (run_id, turn_number)
             );
+            CREATE TABLE IF NOT EXISTS evaluation_repair_jobs (
+              run_id TEXT NOT NULL,
+              turn_number INTEGER NOT NULL,
+              source_sha256 TEXT NOT NULL,
+              output_sha256 TEXT,
+              status TEXT NOT NULL,
+              stage TEXT NOT NULL DEFAULT '',
+              issues TEXT NOT NULL DEFAULT '[]',
+              repaired_dimensions TEXT NOT NULL DEFAULT '[]',
+              error TEXT NOT NULL DEFAULT '',
+              started_at TEXT,
+              finished_at TEXT,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY (run_id, turn_number),
+              FOREIGN KEY (run_id, turn_number)
+                REFERENCES run_turns(run_id, turn_number) ON DELETE CASCADE
+            );
             CREATE TABLE IF NOT EXISTS settings (
               key TEXT PRIMARY KEY,
               value TEXT NOT NULL,
@@ -1024,6 +1204,23 @@ def initialize_database() -> None:
             CREATE UNIQUE INDEX IF NOT EXISTS solo_qa_remote_submission_id_uq
               ON solo_qa_submissions(remote_submission_id)
               WHERE remote_submission_id IS NOT NULL AND remote_submission_id != '';
+            CREATE TABLE IF NOT EXISTS solo_qa_remote_evaluations (
+              remote_submission_id TEXT PRIMARY KEY,
+              remote_status TEXT NOT NULL DEFAULT '',
+              delivery_score INTEGER,
+              delivery_description TEXT NOT NULL DEFAULT '',
+              instruction_following_score INTEGER,
+              instruction_following_description TEXT NOT NULL DEFAULT '',
+              planning_score INTEGER,
+              planning_description TEXT NOT NULL DEFAULT '',
+              reasoning_score INTEGER,
+              reasoning_description TEXT NOT NULL DEFAULT '',
+              execution_score INTEGER,
+              execution_description TEXT NOT NULL DEFAULT '',
+              dedup_hits TEXT NOT NULL DEFAULT '[]',
+              remote_updated_at TEXT,
+              last_synced_at TEXT NOT NULL
+            );
             """
         )
         columns = {row["name"] for row in database.execute("PRAGMA table_info(runs)")}
@@ -5154,8 +5351,6 @@ def automatic_iteration_worker(
             "stage": "已创建独立会话",
             "updated_at": now_text(),
         }
-        if auto_refill:
-            record_auto_refill_success()
     except JobCancelled:
         result = {
             "status": "stopped",
@@ -5378,6 +5573,47 @@ def cancel_automatic_iteration(source_run_id: str) -> Dict[str, Any]:
     return job
 
 
+def failed_startup_resource_count(exclude_run_id: str = "") -> int:
+    """Count only new launches with an ownership marker left by this process."""
+    parameters: List[Any] = []
+    exclusion = ""
+    if exclude_run_id:
+        exclusion = "AND runs.id != ?"
+        parameters.append(exclude_run_id)
+    try:
+        with db_connection() as database:
+            rows = database.execute(
+                f"""SELECT runs.id
+                    FROM runs
+                    WHERE deleted_at IS NULL
+                      AND phase = 'failed'
+                      AND container_cleaned = 0
+                      AND COALESCE(first_prompt_id, '') = ''
+                      AND COALESCE(session_id, '') = ''
+                      AND COALESCE(trajectory_path, '') = ''
+                      {exclusion}
+                      AND EXISTS (
+                        SELECT 1 FROM events
+                        WHERE events.run_id = runs.id
+                          AND events.message LIKE '正在为本题启动独立容器 %'
+                      )""",
+                tuple(parameters),
+            ).fetchall()
+        # Legacy rows can retain container_cleaned=0 after an operator has
+        # already removed their resources.  The per-run owner marker is
+        # written immediately before screen/docker launch and removed only
+        # after cleanup, so it avoids turning stale database flags into a
+        # permanent capacity lock.
+        return sum(
+            1
+            for row in rows
+            if startup_uses_submission_marker(str(row["id"]))
+            and not terminal_asset_paths(str(row["id"]))["prompt_submitted"].is_file()
+        )
+    except sqlite3.OperationalError:
+        return 0
+
+
 def automatic_refill_occupancy() -> int:
     placeholders = ",".join("?" for _ in SCHEDULED_RUN_PHASES)
     try:
@@ -5393,7 +5629,7 @@ def automatic_refill_occupancy() -> int:
     generating_iterations = sum(
         1 for job in iteration_job_values() if job.get("status") == "generating"
     )
-    return scheduled + generating_iterations
+    return scheduled + generating_iterations + failed_startup_resource_count()
 
 
 def auto_refill_iteration_candidate() -> Optional[Dict[str, Any]]:
@@ -5566,22 +5802,12 @@ def automatic_refill_once() -> Dict[str, Any]:
             record_auto_refill_detail(detail)
             return {"action": "iteration", "job": job, "detail": detail}
 
-        with db_connection() as database:
-            generating = database.execute(
-                """SELECT id FROM runs
-                   WHERE deleted_at IS NULL AND phase IN ('generation_queued', 'generation_running')
-                   ORDER BY created_at LIMIT 1"""
-            ).fetchone()
-        if generating:
-            return {
-                "action": "waiting_for_0_1_generation",
-                "run_id": str(generating["id"]),
-            }
         created = create_automatic_run(
             {
                 "project_directory": configuration["project_directory"],
                 "_auto_refill": True,
-            }
+            },
+            allow_parallel_generation=True,
         )
         detail = f"自动补题：没有可迭代项目，已创建新的 {created['project_number']} 0-1 任务"
         record_auto_refill_detail(detail)
@@ -5658,7 +5884,13 @@ def run_codex_structured(
     timeout: int,
     model: str = REVIEW_MODEL,
     sandbox: str = "read-only",
+    reasoning_effort: str = "",
+    process_group: Optional[LocalCodexProcessGroup] = None,
 ) -> Dict[str, Any]:
+    if reasoning_effort and reasoning_effort not in {
+        "minimal", "low", "medium", "high", "xhigh", "max", "ultra"
+    }:
+        raise WorkflowError("Codex 推理强度配置无效")
     job_key = current_job_key()
     ensure_job_active(job_key)
     with tempfile.TemporaryDirectory(prefix=f"eval-{prefix}-") as directory:
@@ -5668,8 +5900,7 @@ def run_codex_structured(
         schema_path.write_text(json.dumps(schema, ensure_ascii=False), encoding="utf-8")
         process: Optional[subprocess.Popen] = None
         try:
-            process = subprocess.Popen(
-                [
+            command = [
                     "codex",
                     "exec",
                     "--model",
@@ -5680,6 +5911,13 @@ def run_codex_structured(
                     "--ignore-user-config",
                     "--ignore-rules",
                     "--skip-git-repo-check",
+            ]
+            if reasoning_effort:
+                command.extend([
+                    "--config",
+                    f'model_reasoning_effort="{reasoning_effort}"',
+                ])
+            command.extend([
                     "--output-schema",
                     str(schema_path),
                     "--output-last-message",
@@ -5687,7 +5925,9 @@ def run_codex_structured(
                     "--cd",
                     str(cwd),
                     "-",
-                ],
+            ])
+            process = subprocess.Popen(
+                command,
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -5695,12 +5935,9 @@ def run_codex_structured(
                 env=os.environ.copy(),
                 start_new_session=True,
             )
-            if job_key:
-                with CODEX_PROCESS_LOCK:
-                    if job_key in CODEX_CANCELLED_JOBS:
-                        terminate_process(process)
-                        raise JobCancelled("后台任务已取消")
-                    CODEX_PROCESSES[job_key] = process
+            register_codex_process(job_key, process)
+            if process_group is not None:
+                process_group.register(process)
             stdout, stderr = process.communicate(input=prompt, timeout=timeout)
         except FileNotFoundError as exc:
             raise WorkflowError("找不到 Codex 命令") from exc
@@ -5709,10 +5946,10 @@ def run_codex_structured(
                 terminate_process(process)
             raise WorkflowError(f"{prefix} 超时，已停止") from exc
         finally:
-            if job_key and process is not None:
-                with CODEX_PROCESS_LOCK:
-                    if CODEX_PROCESSES.get(job_key) is process:
-                        CODEX_PROCESSES.pop(job_key, None)
+            if process is not None:
+                if process_group is not None:
+                    process_group.unregister(process)
+                unregister_codex_process(job_key, process)
         ensure_job_active(job_key)
         if process is None or process.returncode != 0:
             detail = (stderr or stdout or f"{prefix} 失败").strip()
@@ -5855,6 +6092,7 @@ def transcript_excerpt_from_path(
     entries: List[str] = []
     tool_ledger: List[str] = []
     started = prompt_id is None
+    events: List[Dict[str, Any]] = []
     try:
         with path.open("r", encoding="utf-8") as source:
             for line in source:
@@ -5862,46 +6100,59 @@ def transcript_excerpt_from_path(
                     event = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                event_type = str(event.get("type") or "")
-                message = event.get("message") if isinstance(event.get("message"), dict) else {}
-                content = message.get("content")
-                event_prompt_id = str(event.get("promptId") or "")
-                if event_type == "user" and isinstance(content, str):
-                    human_text = trace_human_prompt_text(event)
-                    if human_text is None:
-                        continue
-                    content = human_text
-                    if not started:
-                        if prompt_id and event_prompt_id == prompt_id:
-                            started = True
-                        else:
-                            continue
-                    elif prompt_id and event_prompt_id and event_prompt_id != prompt_id:
-                        break
-                    entries.append(f"USER[{event_prompt_id or '-'}]: {content[:8000]}")
-                    continue
-                if not started or not isinstance(content, list):
-                    continue
-                for block in content:
-                    if not isinstance(block, dict):
-                        continue
-                    block_type = str(block.get("type") or "")
-                    if event_type == "assistant" and block_type == "text":
-                        entries.append(f"ASSISTANT: {str(block.get('text') or '')[:8000]}")
-                    elif event_type == "assistant" and block_type == "tool_use":
-                        tool_input = json.dumps(block.get("input") or {}, ensure_ascii=False)
-                        tool_name = str(block.get("name") or "-")
-                        entries.append(f"TOOL {tool_name}: {tool_input[:8000]}")
-                        tool_ledger.append(f"CALL {tool_name}: {tool_input[:1200]}")
-                    elif event_type == "user" and block_type == "tool_result":
-                        result_content = block.get("content")
-                        if isinstance(result_content, list):
-                            result_content = json.dumps(result_content, ensure_ascii=False)
-                        compact_result = str(result_content or "")
-                        entries.append(f"TOOL RESULT: {compact_result[:8000]}")
-                        tool_ledger.append(f"RESULT: {compact_result[:1200]}")
+                if isinstance(event, dict):
+                    events.append(event)
     except OSError:
         return "轨迹文件读取失败"
+    automatic_api_resumes = trace_automatic_api_resume_indexes(events)
+    for index, event in enumerate(events):
+        event_type = str(event.get("type") or "")
+        message = event.get("message") if isinstance(event.get("message"), dict) else {}
+        content = message.get("content")
+        event_prompt_id = str(event.get("promptId") or "")
+        if event_type == "user":
+            human_text = trace_human_prompt_text(
+                event,
+                automatic_api_resume=index in automatic_api_resumes,
+            )
+            if human_text is not None:
+                content = human_text
+                if not started:
+                    if prompt_id and event_prompt_id == prompt_id:
+                        started = True
+                    else:
+                        continue
+                elif prompt_id and event_prompt_id and event_prompt_id != prompt_id:
+                    break
+                entries.append(f"USER[{event_prompt_id or '-'}]: {content[:8000]}")
+                continue
+        if not started or not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            block_type = str(block.get("type") or "")
+            if event_type == "assistant" and block_type == "text":
+                assistant_label = (
+                    "ASSISTANT FINAL"
+                    if message.get("stop_reason") in {"end_turn", "stop_sequence"}
+                    else "ASSISTANT"
+                )
+                entries.append(
+                    f"{assistant_label}: {str(block.get('text') or '')[:8000]}"
+                )
+            elif event_type == "assistant" and block_type == "tool_use":
+                tool_input = json.dumps(block.get("input") or {}, ensure_ascii=False)
+                tool_name = str(block.get("name") or "-")
+                entries.append(f"TOOL {tool_name}: {tool_input[:8000]}")
+                tool_ledger.append(f"CALL {tool_name}: {tool_input[:1200]}")
+            elif event_type == "user" and block_type == "tool_result":
+                result_content = block.get("content")
+                if isinstance(result_content, list):
+                    result_content = json.dumps(result_content, ensure_ascii=False)
+                compact_result = str(result_content or "")
+                entries.append(f"TOOL RESULT: {compact_result[:8000]}")
+                tool_ledger.append(f"RESULT: {compact_result[:1200]}")
     text = "\n".join(entries)
     if len(text) <= max_chars:
         return text or "轨迹中没有可读取的对话和工具调用"
@@ -6247,6 +6498,10 @@ def serialize_run(row: sqlite3.Row, include_events: bool = True) -> Dict[str, An
     data["turns"] = turns
     data["retry_run_id"] = str(retry_row["id"]) if retry_row else ""
     data["imported_baseline"] = bool(data.get("imported_baseline"))
+    try:
+        data["can_retry_startup"] = failed_startup_retry_candidate(row)
+    except (OSError, sqlite3.Error, WorkflowError):
+        data["can_retry_startup"] = False
     data["turn_count"] = max(
         (int(turn["turn_number"]) for turn in turns),
         default=0 if data["imported_baseline"] else 1,
@@ -6398,11 +6653,24 @@ def completed_turn_rows() -> List[Dict[str, Any]]:
                  solo.remote_updated_at AS solo_qa_remote_updated_at,
                  solo.last_synced_at AS solo_qa_last_synced_at,
                  solo.error AS solo_qa_error,
+                 repair.source_sha256 AS evaluation_repair_source_sha256,
+                 repair.output_sha256 AS evaluation_repair_output_sha256,
+                 repair.status AS evaluation_repair_job_status,
+                 repair.stage AS evaluation_repair_stage,
+                 repair.issues AS evaluation_repair_job_issues,
+                 repair.repaired_dimensions AS evaluation_repair_dimensions,
+                 repair.error AS evaluation_repair_error,
+                 repair.started_at AS evaluation_repair_started_at,
+                 repair.finished_at AS evaluation_repair_finished_at,
+                 repair.updated_at AS evaluation_repair_updated_at,
                  (SELECT COUNT(*) FROM run_turns counted WHERE counted.run_id = runs.id) AS turn_count
                FROM run_turns AS turns
                JOIN runs ON runs.id = turns.run_id
                LEFT JOIN solo_qa_submissions AS solo
                  ON solo.run_id = turns.run_id AND solo.turn_number = turns.turn_number
+               LEFT JOIN evaluation_repair_jobs AS repair
+                 ON repair.run_id = turns.run_id
+                AND repair.turn_number = turns.turn_number
                WHERE turns.status = 'complete'
                  AND turns.export_deleted_at IS NULL
                  AND runs.deleted_at IS NULL
@@ -6418,6 +6686,39 @@ EVALUATION_DIMENSION_KEYS = (
     "reasoning",
     "execution",
 )
+EVALUATION_DIMENSION_LABELS = {
+    "delivery": "交付完整性",
+    "instruction_following": "指令遵循",
+    "planning": "任务规划",
+    "reasoning": "推理能力",
+    "execution": "执行能力",
+}
+EVALUATION_SCORE_STAGE_DETAIL_FIELDS = (
+    "when",
+    "behavior",
+    "impact",
+    "expected",
+    "evidenceRefs",
+)
+EVALUATION_SCORE_STAGE_PROSE_LIMITS = {
+    "when": 300,
+    "behavior": 500,
+    "impact": 500,
+    "expected": 500,
+}
+EVALUATION_REMOTE_DIMENSION_KEYS = {
+    "delivery": "delivery",
+    "instruction_following": "instruction",
+    "planning": "planning",
+    "reasoning": "reasoning",
+    "execution": "execution",
+}
+EVALUATION_GENERIC_OPENING_RE = re.compile(
+    r"^(?:第\s*\d+\s*轮|本轮|本次|此次|这一轮)\s*"
+    r"(?:先|在|按|围绕|针对|通过|已经|已|完成|交付|实现|执行|修改|从|将|对|为)"
+)
+EVALUATION_HISTORY_PROMPT_LIMIT = 40
+EVALUATION_HISTORY_DESCRIPTION_LIMIT = 480
 
 
 def remove_generic_user_word(value: Any) -> str:
@@ -6428,6 +6729,16 @@ def remove_generic_user_word(value: Any) -> str:
         .replace("用户界面", "页面")
         .replace("用户", "操作人员")
     )
+
+
+def strip_evaluation_description_backticks(value: Any) -> str:
+    """Replace Markdown code spans with readable non-Markdown quotation."""
+    source = str(value or "")
+
+    def replace_span(match: re.Match) -> str:
+        return f"“{match.group(1)}”"
+
+    return EVALUATION_MARKDOWN_CODE_SPAN_RE.sub(replace_span, source).replace("`", "")
 
 
 def automatic_turn_evaluation(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -6447,7 +6758,36 @@ def turn_manual_evaluation(row: Dict[str, Any]) -> Dict[str, Any]:
     return evaluation if isinstance(evaluation, dict) else {}
 
 
-def turn_evaluation(row: Dict[str, Any]) -> Dict[str, Any]:
+def review_findings_grounding_evidence(review: Any) -> str:
+    """Return only factual evidence fields from a saved independent review."""
+    if not isinstance(review, dict):
+        return ""
+    evidence: List[str] = []
+    for key in ("bugs", "remaining_bugs", "quality_gaps"):
+        items = review.get(key)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            text = re.sub(r"\s+", " ", str(item.get("evidence") or "")).strip()
+            if text:
+                evidence.append(text)
+    return "\n".join(dict.fromkeys(evidence))
+
+
+def turn_review_grounding_evidence(row: Dict[str, Any]) -> str:
+    """Read factual review evidence without letting score text prove itself."""
+    try:
+        review = json.loads(row.get("turn_review_result") or "{}")
+    except (json.JSONDecodeError, TypeError):
+        return ""
+    return review_findings_grounding_evidence(review)
+
+
+def turn_evaluation(
+    row: Dict[str, Any], *, clean_description_markup: bool = True
+) -> Dict[str, Any]:
     """Return the effective evaluation, overlaying saved human score edits."""
     automatic = automatic_turn_evaluation(row)
     manual = turn_manual_evaluation(row)
@@ -6461,7 +6801,220 @@ def turn_evaluation(row: Dict[str, Any]) -> Dict[str, Any]:
         item = effective.get(key)
         if isinstance(item, dict) and "description" in item:
             item["description"] = remove_generic_user_word(item["description"])
+            if clean_description_markup:
+                item["description"] = strip_evaluation_description_backticks(
+                    item["description"]
+                )
     return effective
+
+
+def evaluation_description_comparison_text(value: Any) -> str:
+    """Normalize visible prose for conservative, high-confidence reuse checks."""
+    source = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    source = strip_evaluation_description_backticks(source)
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", source)
+
+
+def evaluation_description_similarity(
+    candidate: Any,
+    previous: Any,
+) -> Tuple[float, int, float]:
+    """Return sequence ratio, longest run and 7-gram Jaccard similarity."""
+    left = evaluation_description_comparison_text(candidate)
+    right = evaluation_description_comparison_text(previous)
+    if not left or not right:
+        return 0.0, 0, 0.0
+    matcher = difflib.SequenceMatcher(None, left, right, autojunk=False)
+    ratio = matcher.ratio()
+    longest = matcher.find_longest_match().size
+    ngram_size = 7
+    if min(len(left), len(right)) < ngram_size:
+        return ratio, longest, 0.0
+    left_ngrams = {
+        left[index:index + ngram_size]
+        for index in range(len(left) - ngram_size + 1)
+    }
+    right_ngrams = {
+        right[index:index + ngram_size]
+        for index in range(len(right) - ngram_size + 1)
+    }
+    union = left_ngrams | right_ngrams
+    jaccard = len(left_ngrams & right_ngrams) / len(union) if union else 0.0
+    return ratio, longest, jaccard
+
+
+def historical_evaluation_descriptions(
+    dimension_key: str,
+    *,
+    exclude_turn_key: str = "",
+    exclude_remote_id: str = "",
+    limit: int = EVALUATION_HISTORY_PROMPT_LIMIT,
+) -> List[Dict[str, str]]:
+    """Read effective local and account-visible remote prose for one dimension."""
+    if dimension_key not in EVALUATION_DIMENSION_KEYS:
+        raise ValueError("unsupported evaluation dimension")
+    maximum = max(1, min(int(limit), 200))
+    entries: List[Dict[str, str]] = []
+    seen: set[str] = set()
+
+    def add(reference: str, description: Any, source: str) -> None:
+        text = re.sub(r"\s+", " ", str(description or "")).strip()
+        fingerprint = evaluation_description_comparison_text(text)
+        if not text or not fingerprint or fingerprint in seen:
+            return
+        seen.add(fingerprint)
+        entries.append({
+            "reference": reference,
+            "description": text,
+            "source": source,
+        })
+
+    try:
+        with db_connection() as database:
+            local_rows = database.execute(
+                """SELECT turns.run_id, turns.turn_number,
+                          turns.review_result AS turn_review_result,
+                          turns.manual_evaluation AS turn_manual_evaluation,
+                          solo.remote_submission_id
+                     FROM run_turns AS turns
+                     JOIN runs ON runs.id = turns.run_id
+                LEFT JOIN solo_qa_submissions AS solo
+                       ON solo.run_id = turns.run_id
+                      AND solo.turn_number = turns.turn_number
+                    WHERE turns.status = 'complete'
+                      AND runs.deleted_at IS NULL
+                 ORDER BY turns.updated_at DESC, turns.run_id, turns.turn_number DESC
+                    LIMIT ?""",
+                (maximum * 4,),
+            ).fetchall()
+            for raw_row in local_rows:
+                row = dict(raw_row)
+                turn_key = f"{row['run_id']}:{int(row['turn_number'])}"
+                remote_id = str(row.get("remote_submission_id") or "")
+                if turn_key == exclude_turn_key or (
+                    exclude_remote_id and remote_id == exclude_remote_id
+                ):
+                    continue
+                evaluation = turn_evaluation(row)
+                item = evaluation.get(dimension_key)
+                if not isinstance(item, dict):
+                    continue
+                reference = f"SOLO-QA #{remote_id}" if remote_id else turn_key
+                add(reference, item.get("description"), "local")
+                if len(entries) >= maximum:
+                    break
+
+            if len(entries) < maximum:
+                column = f"{dimension_key}_description"
+                remote_rows = database.execute(
+                    f"""SELECT remote_submission_id, {column} AS description
+                           FROM solo_qa_remote_evaluations
+                          WHERE {column} != ''
+                          ORDER BY COALESCE(remote_updated_at, last_synced_at) DESC,
+                                   remote_submission_id DESC
+                          LIMIT ?""",
+                    (maximum * 2,),
+                ).fetchall()
+                for remote_row in remote_rows:
+                    remote_id = str(remote_row["remote_submission_id"] or "")
+                    if exclude_remote_id and remote_id == exclude_remote_id:
+                        continue
+                    add(
+                        f"SOLO-QA #{remote_id}",
+                        remote_row["description"],
+                        "account_remote",
+                    )
+                    if len(entries) >= maximum:
+                        break
+    except (OSError, sqlite3.Error):
+        return entries[:maximum]
+    return entries[:maximum]
+
+
+def evaluation_description_history_context(dimension_key: str) -> str:
+    """Format prior prose as style-avoidance material, never as factual evidence."""
+    history = historical_evaluation_descriptions(dimension_key)
+    if not history:
+        return ""
+    lines = []
+    for item in history:
+        description = str(item["description"])
+        if len(description) > EVALUATION_HISTORY_DESCRIPTION_LIMIT:
+            description = description[:EVALUATION_HISTORY_DESCRIPTION_LIMIT] + "…"
+        lines.append(f"- {item['reference']}：{description}")
+    return (
+        "\n以下是当前账号最近同维度的已交付点评，只用于避开重复表达，"
+        "绝不能当成本轮事实或证据。请改变开头主体、句序和证据组织，"
+        "不要复制连续片段，也不要只替换项目名或数字：\n"
+        + "\n".join(lines)
+        + "\n"
+    )
+
+
+def validate_evaluation_description_novelty(
+    evaluation: Dict[str, Any],
+    history_by_dimension: Dict[str, List[Dict[str, str]]],
+    *,
+    require_distinct_opening: bool,
+) -> None:
+    """Reject generic openings and only high-confidence historical reuse."""
+    for dimension_key in EVALUATION_DIMENSION_KEYS:
+        item = evaluation.get(dimension_key)
+        if not isinstance(item, dict):
+            continue
+        description = str(item.get("description") or "").strip()
+        label = EVALUATION_DIMENSION_LABELS[dimension_key]
+        if require_distinct_opening and EVALUATION_GENERIC_OPENING_RE.search(description):
+            raise WorkflowError(
+                f"自动检查的{label}描述使用通用轮次开头；"
+                "请从本项目独有业务对象或真实动作切入，并把轮次放到后文"
+            )
+        candidate_text = evaluation_description_comparison_text(description)
+        if len(candidate_text) < 60:
+            continue
+        for previous in history_by_dimension.get(dimension_key, []):
+            previous_description = str(previous.get("description") or "")
+            previous_text = evaluation_description_comparison_text(
+                previous_description
+            )
+            if len(previous_text) < 60:
+                continue
+            ratio, longest, jaccard = evaluation_description_similarity(
+                description, previous_description
+            )
+            # SOLO-QA's B-5/B-7 checks reject shared public fragments well
+            # before the whole paragraphs become near-duplicates.  Keep the
+            # original strict whole-text checks and also stop an 18+ character
+            # run when the surrounding paragraphs have meaningful overlap.
+            longest_match = difflib.SequenceMatcher(
+                None, candidate_text, previous_text, autojunk=False
+            ).find_longest_match()
+            longest_fragment = candidate_text[
+                longest_match.a:longest_match.a + longest_match.size
+            ]
+            # File paths, function names, commands and exact error strings are
+            # legitimate evidence anchors that multiple related turns may need
+            # to cite verbatim.  The low-ratio B-5/B-7 guard is intended for
+            # reused public prose, so require Chinese prose in that shared run;
+            # the original whole-text and n-gram checks still catch broader
+            # reuse in either language.
+            chinese_prose_length = len(
+                re.findall(r"[\u4e00-\u9fff]", longest_fragment)
+            )
+            shared_public_fragment = (
+                ratio >= 0.15
+                and longest >= 18
+                and chinese_prose_length >= 4
+            )
+            if candidate_text != previous_text and not (
+                ratio >= 0.78 and longest >= 36
+            ) and not shared_public_fragment and jaccard < 0.45:
+                continue
+            reference = str(previous.get("reference") or "历史记录")
+            raise WorkflowError(
+                f"自动检查的{label}描述与历史点评 {reference} 高度重复："
+                f"文本相似度 {ratio * 100:.1f}%，最长连续片段 {longest} 字"
+            )
 
 
 def completed_turn_task_type(
@@ -6503,8 +7056,10 @@ def normalize_manual_evaluation(
             raise WorkflowError(f"{labels[key]}分数必须是 1～5") from exc
         if score not in range(1, 6):
             raise WorkflowError(f"{labels[key]}分数必须是 1～5")
-        description = remove_generic_user_word(
-            re.sub(r"\s+", " ", str(item.get("description") or "")).strip()
+        description = strip_evaluation_description_backticks(
+            remove_generic_user_word(
+                re.sub(r"\s+", " ", str(item.get("description") or "")).strip()
+            )
         )
         if not description:
             raise WorkflowError(f"{labels[key]}描述不能为空")
@@ -6530,14 +7085,45 @@ def completed_turn_evaluation_policy_issues(
         turn_number = int(row.get("turn_number") or 0)
     except (TypeError, ValueError):
         turn_number = 0
+    policy_evaluation = json.loads(json.dumps(evaluation, ensure_ascii=False))
     try:
-        normalize_evaluation(
-            json.loads(json.dumps(evaluation, ensure_ascii=False)),
+        policy_evaluation = normalize_evaluation(
+            policy_evaluation,
             turn_number or None,
             enforce_generation_detail_policy=True,
         )
     except WorkflowError as exc:
         issues.append(str(exc))
+        for key in EVALUATION_DIMENSION_KEYS:
+            item = policy_evaluation.get(key)
+            if isinstance(item, dict) and "description" in item:
+                item["description"] = strip_evaluation_description_backticks(
+                    item["description"]
+                )
+    remote_state = str(row.get("solo_qa_state") or "not_submitted")
+    if remote_state not in {"qc_pending", "qc_passed", "discarded"}:
+        current_key = f"{row.get('run_id')}:{turn_number}"
+        current_remote_id = str(
+            row.get("solo_qa_remote_submission_id") or ""
+        )
+        history_by_dimension = {
+            key: historical_evaluation_descriptions(
+                key,
+                exclude_turn_key=current_key,
+                exclude_remote_id=current_remote_id,
+            )
+            for key in EVALUATION_DIMENSION_KEYS
+        }
+        try:
+            validate_evaluation_description_novelty(
+                policy_evaluation,
+                history_by_dimension,
+                require_distinct_opening=(
+                    policy_evaluation.get("_description_novelty_version") == 1
+                ),
+            )
+        except WorkflowError as exc:
+            issues.append(str(exc))
     trajectory_value = str(
         row.get("turn_trajectory_path") or row.get("run_trajectory_path") or ""
     ).strip()
@@ -6547,19 +7133,989 @@ def completed_turn_evaluation_policy_issues(
             trajectory_path,
             str(row.get("turn_prompt_id") or "") or None,
         )
-        issues.extend(evaluation_trace_command_issues(evaluation, trajectory))
+        verification = str(row.get("turn_verification") or "")
+        issues.extend(
+            evaluation_trace_command_issues(
+                policy_evaluation, trajectory, verification
+            )
+        )
+        try:
+            validate_false_success_claim(policy_evaluation, trajectory)
+        except WorkflowError as exc:
+            issues.append(str(exc))
         issues.extend(
             evaluation_trace_grounding_issues(
-                evaluation,
+                policy_evaluation,
                 trajectory,
                 {
                     "prompt": str(row.get("turn_prompt") or ""),
                     "result": str(row.get("turn_result") or ""),
-                    "verification": str(row.get("turn_verification") or ""),
+                    "verification": verification,
                 },
+                supplemental_evidence=turn_review_grounding_evidence(row),
             )
         )
     return list(dict.fromkeys(issue for issue in issues if issue))
+
+
+def evaluation_repair_source_sha256(
+    row: Dict[str, Any],
+    policy_issues: Optional[List[str]] = None,
+) -> str:
+    """Fingerprint the exact saved evaluation and evidence used by a repair."""
+    payload = {
+        "policy_version": EVALUATION_REPAIR_POLICY_VERSION,
+        "review_result": str(row.get("turn_review_result") or ""),
+        "manual_evaluation": str(row.get("turn_manual_evaluation") or ""),
+        "prompt": str(row.get("turn_prompt") or ""),
+        "result": str(row.get("turn_result") or ""),
+        "prompt_id": str(row.get("turn_prompt_id") or ""),
+        "verification": str(row.get("turn_verification") or ""),
+        "commit_sha": str(row.get("turn_commit_sha") or ""),
+        "session_id": str(row.get("session_id") or ""),
+        "snapshot_url": str(row.get("snapshot_url") or ""),
+        "harness_version": str(row.get("harness_version") or ""),
+        "repo_path": str(row.get("repo_path") or ""),
+        "solo_qa_state": str(row.get("solo_qa_state") or ""),
+        "solo_qa_remote_submission_id": str(
+            row.get("solo_qa_remote_submission_id") or ""
+        ),
+        "solo_qa_remote_status": str(row.get("solo_qa_remote_status") or ""),
+        "solo_qa_qc_summary": str(row.get("solo_qa_qc_summary") or ""),
+        "solo_qa_remote_updated_at": str(
+            row.get("solo_qa_remote_updated_at") or ""
+        ),
+        "trajectory_path": str(
+            row.get("turn_trajectory_path") or row.get("run_trajectory_path") or ""
+        ),
+        "trajectory_sha256": str(row.get("turn_trajectory_sha256") or ""),
+        "policy_issues": sorted(str(issue) for issue in (policy_issues or [])),
+    }
+    encoded = json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def evaluation_repair_json_list(value: Any) -> List[str]:
+    try:
+        decoded = json.loads(str(value or "[]"))
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(decoded, list):
+        return []
+    return [str(item) for item in decoded if str(item).strip()]
+
+
+def solo_qa_returned_evaluation_fingerprint(row: Dict[str, Any]) -> str:
+    """Fingerprint one actionable SOLO-QA wording rejection."""
+    if str(row.get("solo_qa_state") or "") != "needs_fix":
+        return ""
+    summary = re.sub(
+        r"\s+", " ", str(row.get("solo_qa_qc_summary") or "")
+    ).strip()
+    if not summary:
+        return ""
+    actionable_markers = (
+        "描述与轨迹不符",
+        "描述」与",
+        "描述与已交付",
+        "描述与先提交",
+        "公共长片段",
+        "套模板",
+        "分段复读",
+        "满分",
+        "具体依据无法",
+        "数量或状态码无法",
+        "反引号",
+    )
+    if "描述" not in summary or not any(
+        marker in summary for marker in actionable_markers
+    ):
+        return ""
+    payload = {
+        "remote_id": str(row.get("solo_qa_remote_submission_id") or ""),
+        "remote_status": str(row.get("solo_qa_remote_status") or ""),
+        "remote_updated_at": str(row.get("solo_qa_remote_updated_at") or ""),
+        "qc_summary": summary,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def solo_qa_returned_evaluation_repair_issues(
+    row: Dict[str, Any], evaluation: Dict[str, Any]
+) -> List[str]:
+    """Translate an actionable remote rejection into targeted prose repairs."""
+    fingerprint = solo_qa_returned_evaluation_fingerprint(row)
+    if not fingerprint or evaluation.get("_solo_qa_repair_qc_sha256") == fingerprint:
+        return []
+    summary = re.sub(
+        r"\s+", " ", str(row.get("solo_qa_qc_summary") or "")
+    ).strip()
+    selected = [
+        key
+        for key in EVALUATION_DIMENSION_KEYS
+        if EVALUATION_DIMENSION_LABELS[key] in summary
+    ]
+    # SOLO-QA can abbreviate a multi-field rejection as “某维度等 N 个维度”.
+    # The omitted names are not recoverable from that sentence, so rewrite all
+    # five descriptions rather than guessing which two were also flagged.
+    multi_match = re.search(r"等\s*([2-5])\s*个维度", summary)
+    if multi_match and int(multi_match.group(1)) > len(selected):
+        selected = list(EVALUATION_DIMENSION_KEYS)
+    if not selected:
+        return []
+
+    issues: List[str] = []
+    for key in selected:
+        label = EVALUATION_DIMENSION_LABELS[key]
+        if any(
+            marker in summary
+            for marker in ("重复", "公共长片段", "套模板", "分段复读")
+        ):
+            reason = f"自动检查的{label}描述与历史点评高度重复"
+        elif "满分" in summary:
+            reason = f"自动检查的{label}满分描述包含扣分点"
+        else:
+            reason = (
+                f"自动检查的{label}描述的具体依据无法在本轮轨迹或验收结果中找到"
+            )
+        issues.append(f"{reason}；SOLO-QA 打回原文：{summary}")
+    return issues
+
+
+def completed_turn_repairable_evaluation_issues(
+    row: Dict[str, Any],
+    evaluation: Optional[Dict[str, Any]] = None,
+) -> Tuple[List[str], List[str]]:
+    """Split score-prose policy failures from blockers that require real data."""
+    current = evaluation if isinstance(evaluation, dict) else turn_evaluation(
+        row, clean_description_markup=False
+    )
+    policy_issues = completed_turn_evaluation_policy_issues(row, current)
+    repairable = [
+        issue
+        for issue in policy_issues
+        if retryable_review_output_error(issue)
+        and bool(evaluation_dimension_from_error(issue)[0])
+    ]
+    repairable.extend(solo_qa_returned_evaluation_repair_issues(row, current))
+    return list(dict.fromkeys(repairable)), policy_issues
+
+
+def completed_turn_evaluation_repair_prerequisite_error(
+    row: Dict[str, Any],
+) -> str:
+    """Return why automatic prose repair must not run for this completed turn."""
+    if not automatic_turn_evaluation(row):
+        return "缺少可修复的自动评分"
+    if turn_manual_evaluation(row):
+        return "已有人工评分，自动修复不会覆盖人工修改"
+    if str(row.get("solo_qa_state") or "") in {
+        "qc_pending", "qc_passed", "discarded"
+    }:
+        return "该轮已进入远端质检或结束状态，自动修复不会改动"
+    if not str(row.get("turn_prompt") or "").strip():
+        return "缺少原始 User Prompt，不能自动重写评分"
+    session_id = str(row.get("session_id") or "").strip()
+    if not session_id or session_id.casefold().startswith("import"):
+        return "缺少真实 SessionID，不能自动重写评分"
+    prompt_id = str(row.get("turn_prompt_id") or "").strip()
+    if not prompt_id or prompt_id.casefold().startswith("import"):
+        return "缺少真实 TurnID/PromptID，不能自动重写评分"
+    trajectory_value = str(
+        row.get("turn_trajectory_path") or row.get("run_trajectory_path") or ""
+    ).strip()
+    trajectory_path = Path(trajectory_value).expanduser() if trajectory_value else None
+    if not trajectory_path or not trajectory_path.is_file():
+        return "轨迹文件不存在，不能自动重写评分"
+    expected_digest = str(row.get("turn_trajectory_sha256") or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_digest):
+        return "缺少轨迹 SHA-256，不能自动重写评分"
+    try:
+        actual_digest = hashlib.sha256(trajectory_path.read_bytes()).hexdigest()
+    except OSError as exc:
+        return f"轨迹文件读取失败：{exc}"
+    if actual_digest != expected_digest:
+        return "轨迹文件摘要不匹配，不能自动重写评分"
+    try:
+        verification = json.loads(str(row.get("turn_verification") or "[]"))
+    except (json.JSONDecodeError, TypeError):
+        return "验收结果不是有效 JSON，不能自动重写评分"
+    if not isinstance(verification, list):
+        return "验收结果格式不正确，不能自动重写评分"
+    return ""
+
+
+def completed_turn_evaluation_repair_state(
+    row: Dict[str, Any],
+    *,
+    export_issues: Optional[List[str]] = None,
+    repairable_issues: Optional[List[str]] = None,
+    policy_issues: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """Expose a structured, read-only repair state to the export page."""
+    evaluation = turn_evaluation(row, clean_description_markup=False)
+    if repairable_issues is None or policy_issues is None:
+        repairable, all_policy_issues = completed_turn_repairable_evaluation_issues(
+            row, evaluation
+        )
+    else:
+        repairable = list(repairable_issues)
+        all_policy_issues = list(policy_issues)
+    all_export_issues = list(export_issues or [])
+    unrepairable = [
+        issue for issue in all_export_issues if issue not in set(repairable)
+    ]
+    source_sha256 = evaluation_repair_source_sha256(row, all_policy_issues)
+    job_status = str(row.get("evaluation_repair_job_status") or "")
+    job_source = str(row.get("evaluation_repair_source_sha256") or "")
+    job_output = str(row.get("evaluation_repair_output_sha256") or "")
+    prerequisite_error = completed_turn_evaluation_repair_prerequisite_error(row)
+
+    status = "not_applicable"
+    message = prerequisite_error
+    if job_status in {"queued", "running"} and job_source == source_sha256:
+        status = job_status
+        message = str(row.get("evaluation_repair_stage") or "评分文字自动修复中")
+    elif (
+        job_status == "succeeded"
+        and job_output == source_sha256
+        and not repairable
+    ):
+        status = "succeeded"
+        message = "评分文字已根据本轮真实材料自动修复"
+    elif job_status == "failed" and job_source == source_sha256:
+        status = "failed"
+        message = str(row.get("evaluation_repair_error") or "评分文字自动修复失败")
+    elif repairable and not prerequisite_error:
+        status = "needed"
+        message = f"发现 {len(repairable)} 项可依据现有材料自动修复的评分文字问题"
+    elif not message and repairable:
+        message = "评分文字存在可重写问题，但当前缺少安全修复条件"
+
+    return {
+        "status": status,
+        "revision": source_sha256,
+        "can_start": status == "needed",
+        "repairable_issues": repairable,
+        "unrepairable_issues": unrepairable,
+        "message": message,
+        "stage": str(row.get("evaluation_repair_stage") or ""),
+        "error": str(row.get("evaluation_repair_error") or ""),
+        "repaired_dimensions": evaluation_repair_json_list(
+            row.get("evaluation_repair_dimensions")
+        ),
+        "updated_at": str(row.get("evaluation_repair_updated_at") or ""),
+    }
+
+
+def update_evaluation_repair_job(
+    turn_key: str,
+    source_sha256: str,
+    **fields: Any,
+) -> bool:
+    match = re.fullmatch(r"([a-f0-9]{12}):([1-9]\d*)", turn_key)
+    if not match:
+        return False
+    allowed = {
+        "status", "stage", "issues", "output_sha256", "repaired_dimensions",
+        "error", "started_at", "finished_at",
+    }
+    unknown = set(fields) - allowed
+    if unknown:
+        raise ValueError(f"Unknown evaluation repair fields: {sorted(unknown)}")
+    if not fields:
+        return False
+    fields["updated_at"] = now_text()
+    assignments = ", ".join(f"{key} = ?" for key in fields)
+    with db_connection() as database:
+        changed = database.execute(
+            f"""UPDATE evaluation_repair_jobs SET {assignments}
+                  WHERE run_id = ? AND turn_number = ? AND source_sha256 = ?""",
+            list(fields.values())
+            + [match.group(1), int(match.group(2)), source_sha256],
+        )
+    return changed.rowcount == 1
+
+
+def claim_evaluation_repair_job(turn_key: str, source_sha256: str) -> bool:
+    """Atomically let only one worker advance a queued revision to running."""
+    match = re.fullmatch(r"([a-f0-9]{12}):([1-9]\d*)", turn_key)
+    if not match:
+        return False
+    timestamp = now_text()
+    with db_connection() as database:
+        changed = database.execute(
+            """UPDATE evaluation_repair_jobs
+                  SET status = 'running',
+                      stage = '正在读取本轮评分与证据',
+                      started_at = COALESCE(started_at, ?),
+                      error = '', updated_at = ?
+                WHERE run_id = ? AND turn_number = ?
+                  AND source_sha256 = ? AND status = 'queued'""",
+            (
+                timestamp,
+                timestamp,
+                match.group(1),
+                int(match.group(2)),
+                source_sha256,
+            ),
+        )
+    return changed.rowcount == 1
+
+
+def evaluation_repair_cas_snapshot(row: Dict[str, Any]) -> Dict[str, str]:
+    """Keep every mutable input that can change repair eligibility in one CAS."""
+    fields = (
+        "turn_review_result",
+        "turn_manual_evaluation",
+        "turn_prompt",
+        "turn_result",
+        "turn_prompt_id",
+        "turn_verification",
+        "turn_commit_sha",
+        "turn_trajectory_path",
+        "turn_trajectory_sha256",
+        "session_id",
+        "snapshot_url",
+        "harness_version",
+        "repo_path",
+        "run_trajectory_path",
+        "solo_qa_remote_submission_id",
+        "solo_qa_remote_status",
+        "solo_qa_state",
+        "solo_qa_qc_summary",
+        "solo_qa_remote_updated_at",
+    )
+    return {field: str(row.get(field) or "") for field in fields}
+
+
+def evaluation_repair_transaction_row(
+    database: sqlite3.Connection,
+    run_id: str,
+    turn_number: int,
+) -> Dict[str, Any]:
+    """Read every mutable repair input from the transaction's locked view."""
+    row = database.execute(
+        """SELECT
+               turns.run_id,
+               turns.turn_number,
+               turns.review_result AS turn_review_result,
+               turns.manual_evaluation AS turn_manual_evaluation,
+               turns.prompt AS turn_prompt,
+               turns.result AS turn_result,
+               turns.prompt_id AS turn_prompt_id,
+               turns.verification AS turn_verification,
+               turns.commit_sha AS turn_commit_sha,
+               turns.trajectory_path AS turn_trajectory_path,
+               turns.trajectory_sha256 AS turn_trajectory_sha256,
+               turns.status AS turn_status,
+               turns.export_deleted_at AS turn_export_deleted_at,
+               runs.session_id,
+               runs.snapshot_url,
+               runs.harness_version,
+               runs.repo_path,
+               runs.trajectory_path AS run_trajectory_path,
+               runs.deleted_at AS run_deleted_at,
+               runs.review_result AS run_review_result,
+               runs.final_review_result AS run_final_review_result,
+               solo.remote_submission_id AS solo_qa_remote_submission_id,
+               COALESCE(solo.remote_status, '') AS solo_qa_remote_status,
+               COALESCE(solo.state, '') AS solo_qa_state,
+               COALESCE(solo.qc_summary, '') AS solo_qa_qc_summary,
+               COALESCE(solo.remote_updated_at, '') AS solo_qa_remote_updated_at,
+               (SELECT MAX(numbered.turn_number)
+                  FROM run_turns AS numbered
+                 WHERE numbered.run_id = turns.run_id
+                   AND numbered.status = 'complete') AS max_turn_number
+          FROM run_turns AS turns
+          JOIN runs ON runs.id = turns.run_id
+     LEFT JOIN solo_qa_submissions AS solo
+            ON solo.run_id = turns.run_id
+           AND solo.turn_number = turns.turn_number
+         WHERE turns.run_id = ? AND turns.turn_number = ?""",
+        (run_id, turn_number),
+    ).fetchone()
+    return dict(row) if row else {}
+
+
+def persist_completed_turn_evaluation_repair(
+    row: Dict[str, Any],
+    source_sha256: str,
+    repaired_evaluation: Dict[str, Any],
+    output_sha256: str = "",
+    repaired_dimensions: Optional[List[str]] = None,
+) -> None:
+    """CAS-save a full repaired evaluation without changing completion time."""
+    turn_key = f"{row['run_id']}:{int(row['turn_number'])}"
+    fresh = completed_turn_row(turn_key)
+    prerequisite_error = completed_turn_evaluation_repair_prerequisite_error(fresh)
+    if prerequisite_error:
+        raise WorkflowError(prerequisite_error)
+    repairable, policy_issues = completed_turn_repairable_evaluation_issues(fresh)
+    if evaluation_repair_source_sha256(fresh, policy_issues) != source_sha256:
+        raise WorkflowError("评分或证据已变化，本次自动修复结果已作废")
+    if not repairable:
+        raise WorkflowError("评分文字已经没有需要自动修复的问题")
+    original_review_text = str(fresh.get("turn_review_result") or "")
+    try:
+        review = json.loads(original_review_text)
+    except (json.JSONDecodeError, TypeError) as exc:
+        raise WorkflowError("自动评分记录不是有效 JSON") from exc
+    if not isinstance(review, dict):
+        raise WorkflowError("自动评分记录格式不正确")
+    original_evaluation = turn_evaluation(fresh, clean_description_markup=False)
+    for dimension_key in EVALUATION_DIMENSION_KEYS:
+        try:
+            original_score = int(original_evaluation[dimension_key]["score"])
+            repaired_score = int(repaired_evaluation[dimension_key]["score"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise WorkflowError("自动修复结果缺少有效的五维分数") from exc
+        if repaired_score != original_score:
+            raise WorkflowError(
+                f"{EVALUATION_DIMENSION_LABELS[dimension_key]}资料文字自动修复不能改变原分数"
+            )
+    review["evaluation"] = repaired_evaluation
+    repaired_review_text = json.dumps(review, ensure_ascii=False)
+    expected_snapshot = evaluation_repair_cas_snapshot(fresh)
+    with db_connection() as database:
+        database.execute("BEGIN IMMEDIATE")
+        current = evaluation_repair_transaction_row(
+            database,
+            str(fresh["run_id"]),
+            int(fresh["turn_number"]),
+        )
+        current_snapshot = evaluation_repair_cas_snapshot(current)
+        if (
+            not current
+            or current["turn_status"] != "complete"
+            or current["turn_export_deleted_at"] is not None
+            or current["run_deleted_at"] is not None
+            or current_snapshot != expected_snapshot
+            or str(current["turn_manual_evaluation"] or "")
+            or str(current["solo_qa_state"] or "")
+            in {"qc_pending", "qc_passed", "discarded"}
+        ):
+            database.rollback()
+            raise WorkflowError(
+                "评分、证据或提交状态已变化，本次自动修复结果已作废"
+            )
+        candidate_row = dict(current)
+        candidate_row["turn_review_result"] = repaired_review_text
+        candidate_policy_issues = completed_turn_evaluation_policy_issues(
+            candidate_row,
+            repaired_evaluation,
+        )
+        if candidate_policy_issues:
+            database.rollback()
+            raise WorkflowError(
+                "自动修复结果在落库前复检未通过："
+                + "；".join(candidate_policy_issues)
+            )
+        final_output_sha256 = output_sha256 or evaluation_repair_source_sha256(
+            candidate_row,
+            candidate_policy_issues,
+        )
+        trajectory_value = str(
+            current["turn_trajectory_path"]
+            or current["run_trajectory_path"]
+            or ""
+        )
+        trajectory_path = Path(trajectory_value).expanduser()
+        expected_digest = str(current["turn_trajectory_sha256"] or "").lower()
+        try:
+            actual_digest = hashlib.sha256(trajectory_path.read_bytes()).hexdigest()
+        except OSError as exc:
+            database.rollback()
+            raise WorkflowError(f"轨迹文件读取失败：{exc}") from exc
+        if actual_digest != expected_digest:
+            database.rollback()
+            raise WorkflowError("轨迹文件在自动修复期间发生变化，结果已作废")
+        turn_number = int(fresh["turn_number"])
+        run_result_field = "review_result" if turn_number == 1 else "final_review_result"
+        run_mirror_value = str(
+            current[
+                "run_review_result" if turn_number == 1 else "run_final_review_result"
+            ]
+            or ""
+        )
+        update_run_mirror = turn_number == 1 or turn_number == int(
+            current["max_turn_number"] or 0
+        )
+        if update_run_mirror:
+            if run_mirror_value not in {"", original_review_text}:
+                database.rollback()
+                raise WorkflowError(
+                    "任务评分镜像已变化，本次自动修复结果已作废"
+                )
+            mirrored = database.execute(
+                f"""UPDATE runs SET {run_result_field} = ?
+                      WHERE id = ? AND COALESCE({run_result_field}, '') = ?""",
+                (repaired_review_text, fresh["run_id"], run_mirror_value),
+            )
+            if mirrored.rowcount != 1:
+                database.rollback()
+                raise WorkflowError("任务评分镜像没有同步，自动修复结果未落库")
+        changed = database.execute(
+            """UPDATE run_turns SET review_result = ?
+                 WHERE run_id = ? AND turn_number = ?
+                   AND review_result = ?
+                   AND COALESCE(manual_evaluation, '') = ''
+                   AND status = 'complete'""",
+            (
+                repaired_review_text,
+                fresh["run_id"],
+                int(fresh["turn_number"]),
+                original_review_text,
+            ),
+        )
+        if changed.rowcount != 1:
+            database.rollback()
+            raise WorkflowError("评分已变化，本次自动修复结果没有落库")
+        timestamp = now_text()
+        completed_job = database.execute(
+            """UPDATE evaluation_repair_jobs
+                  SET output_sha256 = ?, status = 'succeeded',
+                      stage = '评分文字已自动修复并复检通过',
+                      repaired_dimensions = ?, error = '',
+                      finished_at = ?, updated_at = ?
+                WHERE run_id = ? AND turn_number = ?
+                  AND source_sha256 = ? AND status = 'running'""",
+            (
+                final_output_sha256,
+                json.dumps(repaired_dimensions or [], ensure_ascii=False),
+                timestamp,
+                timestamp,
+                fresh["run_id"],
+                int(fresh["turn_number"]),
+                source_sha256,
+            ),
+        )
+        if completed_job.rowcount != 1:
+            database.rollback()
+            raise WorkflowError("评分修复任务状态已变化，修复结果没有落库")
+
+
+def evaluation_repair_worker(turn_key: str, source_sha256: str) -> None:
+    """Rewrite only grounded score prose, then revalidate and atomically save it."""
+    previous_job_key = current_job_key()
+    job_key = f"evaluation-repair:{turn_key}"
+    CODEX_JOB_CONTEXT.key = job_key
+    try:
+        with EVALUATION_REPAIR_GATE:
+            ensure_job_active(job_key)
+            if not claim_evaluation_repair_job(turn_key, source_sha256):
+                return
+            row = completed_turn_row(turn_key)
+            prerequisite_error = completed_turn_evaluation_repair_prerequisite_error(row)
+            if prerequisite_error:
+                raise WorkflowError(prerequisite_error)
+            repairable, policy_issues = completed_turn_repairable_evaluation_issues(row)
+            if evaluation_repair_source_sha256(row, policy_issues) != source_sha256:
+                raise WorkflowError("评分或证据已变化，本次自动修复任务已取消")
+            if not repairable:
+                raise WorkflowError("评分文字已经没有需要自动修复的问题")
+            update_evaluation_repair_job(
+                turn_key,
+                source_sha256,
+                stage=f"正在依据轨迹修复 {len(repairable)} 项评分文字",
+                error="",
+            )
+            trajectory_path = Path(
+                str(
+                    row.get("turn_trajectory_path")
+                    or row.get("run_trajectory_path")
+                    or ""
+                )
+            ).expanduser()
+            trajectory = transcript_excerpt_from_path(
+                trajectory_path, str(row.get("turn_prompt_id") or "") or None
+            )
+            verification = json.loads(str(row.get("turn_verification") or "[]"))
+            original = turn_evaluation(row, clean_description_markup=False)
+            transient_attempt = 0
+            while True:
+                try:
+                    with tempfile.TemporaryDirectory(
+                        prefix="eval-completed-prose-repair-"
+                    ) as repair_directory:
+                        repaired = normalize_evaluation_with_targeted_repairs(
+                            original,
+                            int(row["turn_number"]),
+                            Path(repair_directory),
+                            str(row.get("turn_prompt") or ""),
+                            verification,
+                            trajectory,
+                            supplemental_evidence=turn_review_grounding_evidence(row),
+                            history_exclude_turn_key=turn_key,
+                            history_exclude_remote_id=str(
+                                row.get("solo_qa_remote_submission_id") or ""
+                            ),
+                            preserve_scores=True,
+                            initial_repair_issues=(
+                                solo_qa_returned_evaluation_repair_issues(
+                                    row, original
+                                )
+                            ),
+                        )
+                    break
+                except JobCancelled:
+                    raise
+                except Exception as exc:
+                    if (
+                        transient_attempt >= EVALUATION_REPAIR_TRANSIENT_RETRY_LIMIT
+                        or not retryable_control_error(str(exc))
+                    ):
+                        raise
+                    transient_attempt += 1
+                    update_evaluation_repair_job(
+                        turn_key,
+                        source_sha256,
+                        stage=(
+                            "评分文字修复遇到临时网络或网关中断，"
+                            f"正在自动重试 {transient_attempt}/"
+                            f"{EVALUATION_REPAIR_TRANSIENT_RETRY_LIMIT}"
+                        ),
+                        error="",
+                    )
+                    ensure_job_active(job_key)
+                    if EVALUATION_REPAIR_TRANSIENT_RETRY_DELAY_SECONDS:
+                        time.sleep(EVALUATION_REPAIR_TRANSIENT_RETRY_DELAY_SECONDS)
+                    ensure_job_active(job_key)
+            returned_qc_fingerprint = solo_qa_returned_evaluation_fingerprint(row)
+            if returned_qc_fingerprint:
+                repaired["_solo_qa_repair_qc_sha256"] = returned_qc_fingerprint
+            for dimension_key in EVALUATION_DIMENSION_KEYS:
+                if int(repaired[dimension_key]["score"]) != int(
+                    original[dimension_key]["score"]
+                ):
+                    raise WorkflowError(
+                        f"{EVALUATION_DIMENSION_LABELS[dimension_key]}资料文字自动修复不能改变原分数"
+                    )
+            candidate_row = dict(row)
+            try:
+                candidate_review = json.loads(
+                    str(row.get("turn_review_result") or "{}")
+                )
+            except (json.JSONDecodeError, TypeError) as exc:
+                raise WorkflowError("自动评分记录不是有效 JSON") from exc
+            if not isinstance(candidate_review, dict):
+                raise WorkflowError("自动评分记录格式不正确")
+            candidate_review["evaluation"] = repaired
+            candidate_row["turn_review_result"] = json.dumps(
+                candidate_review, ensure_ascii=False
+            )
+            candidate_policy_issues = completed_turn_evaluation_policy_issues(
+                candidate_row, repaired
+            )
+            if candidate_policy_issues:
+                raise WorkflowError(
+                    "自动修复结果复检未通过："
+                    + "；".join(candidate_policy_issues)
+                )
+            changed_dimensions = [
+                key
+                for key in EVALUATION_DIMENSION_KEYS
+                if original.get(key) != repaired.get(key)
+            ]
+            persist_completed_turn_evaluation_repair(
+                row,
+                source_sha256,
+                repaired,
+                repaired_dimensions=changed_dimensions,
+            )
+            try:
+                add_event(
+                    str(row["run_id"]),
+                    "评分文字自动修复完成："
+                    + "、".join(
+                        EVALUATION_DIMENSION_LABELS[key]
+                        for key in changed_dimensions
+                    ),
+                    "info",
+                )
+            except Exception as exc:
+                log_workflow_exception(str(row["run_id"]), "evaluation-repair-event", exc)
+    except JobCancelled:
+        update_evaluation_repair_job(
+            turn_key,
+            source_sha256,
+            status="queued",
+            stage="服务停止，等待恢复评分文字修复",
+            error="",
+            finished_at=None,
+        )
+    except Exception as exc:
+        detail = str(exc).strip() or "评分文字自动修复失败"
+        update_evaluation_repair_job(
+            turn_key,
+            source_sha256,
+            status="failed",
+            stage="评分文字自动修复失败",
+            error=detail[-2000:],
+            finished_at=now_text(),
+        )
+        try:
+            run_id = turn_key.split(":", 1)[0]
+            add_event(run_id, f"评分文字自动修复失败：{detail[-500:]}", "warning")
+            log_workflow_exception(run_id, "evaluation-repair", exc)
+        except Exception:
+            pass
+    finally:
+        CODEX_JOB_CONTEXT.key = previous_job_key
+
+
+def schedule_evaluation_repair(turn_key: str, source_sha256: str) -> None:
+    job_key = f"evaluation-repair:{turn_key}"
+    clear_job_cancellation(job_key)
+    threading.Thread(
+        target=evaluation_repair_worker,
+        args=(turn_key, source_sha256),
+        daemon=True,
+        name=f"evaluation-repair-{turn_key.replace(':', '-')}",
+    ).start()
+
+
+def queue_completed_turn_evaluation_repairs(
+    payload: Dict[str, Any],
+    *,
+    schedule_jobs: bool = True,
+) -> Dict[str, Any]:
+    """Idempotently queue grounded prose repairs for completed turns."""
+    raw_keys = payload.get("turn_keys")
+    rows = completed_turn_rows()
+    available = {
+        f"{row['run_id']}:{int(row['turn_number'])}": row for row in rows
+    }
+    if raw_keys in (None, []):
+        keys = list(available)
+    else:
+        keys = normalize_export_turn_keys(raw_keys)
+        missing = [key for key in keys if key not in available]
+        if missing:
+            raise WorkflowError(f"所选轮次不存在或尚未完成：{missing[0]}")
+    retry_failed = payload.get("retry_failed") is True
+    queued: List[Tuple[str, str]] = []
+    results: List[Dict[str, Any]] = []
+    for key in keys:
+        row = available[key]
+        evaluation = turn_evaluation(row, clean_description_markup=False)
+        repairable, policy_issues = completed_turn_repairable_evaluation_issues(
+            row, evaluation
+        )
+        source_sha256 = evaluation_repair_source_sha256(row, policy_issues)
+        prerequisite_error = completed_turn_evaluation_repair_prerequisite_error(row)
+        if not repairable or prerequisite_error:
+            results.append({
+                "key": key,
+                "status": "skipped",
+                "message": prerequisite_error or "没有可自动修复的评分文字问题",
+            })
+            continue
+        timestamp = now_text()
+        with db_connection() as database:
+            database.execute("BEGIN IMMEDIATE")
+            current = evaluation_repair_transaction_row(
+                database,
+                str(row["run_id"]),
+                int(row["turn_number"]),
+            )
+            if (
+                not current
+                or current.get("turn_status") != "complete"
+                or current.get("turn_export_deleted_at") is not None
+                or current.get("run_deleted_at") is not None
+                or evaluation_repair_cas_snapshot(current)
+                != evaluation_repair_cas_snapshot(row)
+            ):
+                results.append({
+                    "key": key,
+                    "status": "stale",
+                    "message": "评分或证据已变化，已跳过旧的自动修复请求",
+                })
+                continue
+            current_evaluation = turn_evaluation(
+                current,
+                clean_description_markup=False,
+            )
+            current_repairable, current_policy_issues = (
+                completed_turn_repairable_evaluation_issues(
+                    current,
+                    current_evaluation,
+                )
+            )
+            current_source_sha256 = evaluation_repair_source_sha256(
+                current,
+                current_policy_issues,
+            )
+            current_prerequisite_error = (
+                completed_turn_evaluation_repair_prerequisite_error(current)
+            )
+            if (
+                current_source_sha256 != source_sha256
+                or current_repairable != repairable
+            ):
+                results.append({
+                    "key": key,
+                    "status": "stale",
+                    "message": "评分检查结果已变化，已跳过旧的自动修复请求",
+                })
+                continue
+            if current_prerequisite_error:
+                results.append({
+                    "key": key,
+                    "status": "skipped",
+                    "message": current_prerequisite_error,
+                })
+                continue
+            existing = database.execute(
+                """SELECT source_sha256, output_sha256, status
+                     FROM evaluation_repair_jobs
+                     WHERE run_id = ? AND turn_number = ?""",
+                (row["run_id"], int(row["turn_number"])),
+            ).fetchone()
+            if (
+                existing
+                and str(existing["source_sha256"] or "") == source_sha256
+                and str(existing["status"] or "") in {"queued", "running"}
+            ):
+                results.append({
+                    "key": key,
+                    "status": str(existing["status"]),
+                    "message": "同一版本的评分文字已经在修复队列中",
+                })
+                continue
+            if (
+                existing
+                and str(existing["source_sha256"] or "") == source_sha256
+                and str(existing["status"] or "") == "succeeded"
+            ):
+                results.append({
+                    "key": key,
+                    "status": "succeeded",
+                    "message": "同一版本的评分文字已经完成自动修复",
+                })
+                continue
+            if (
+                existing
+                and str(existing["source_sha256"] or "") == source_sha256
+                and str(existing["status"] or "") == "failed"
+                and not retry_failed
+            ):
+                results.append({
+                    "key": key,
+                    "status": "failed",
+                    "message": "同一版本已自动修复失败，等待材料变化或人工重试",
+                })
+                continue
+            database.execute(
+                """INSERT INTO evaluation_repair_jobs(
+                       run_id, turn_number, source_sha256, output_sha256,
+                       status, stage, issues, repaired_dimensions, error,
+                       started_at, finished_at, updated_at
+                     ) VALUES (?, ?, ?, NULL, 'queued', ?, ?, '[]', '', NULL, NULL, ?)
+                     ON CONFLICT(run_id, turn_number) DO UPDATE SET
+                       source_sha256 = excluded.source_sha256,
+                       output_sha256 = NULL,
+                       status = 'queued',
+                       stage = excluded.stage,
+                       issues = excluded.issues,
+                       repaired_dimensions = '[]',
+                       error = '',
+                       started_at = NULL,
+                       finished_at = NULL,
+                       updated_at = excluded.updated_at""",
+                (
+                    row["run_id"],
+                    int(row["turn_number"]),
+                    source_sha256,
+                    f"等待修复 {len(repairable)} 项评分文字",
+                    json.dumps(repairable, ensure_ascii=False),
+                    timestamp,
+                ),
+            )
+        queued.append((key, source_sha256))
+        results.append({
+            "key": key,
+            "status": "queued",
+            "message": f"已排队修复 {len(repairable)} 项评分文字",
+        })
+    if schedule_jobs:
+        for key, source_sha256 in queued:
+            schedule_evaluation_repair(key, source_sha256)
+    return {
+        "queued": len(queued),
+        "results": results,
+        "updated_at": now_text(),
+    }
+
+
+def recover_evaluation_repair_jobs() -> int:
+    """Revalidate and resume unfinished repair jobs after a service restart."""
+    timestamp = now_text()
+    with db_connection() as database:
+        database.execute(
+            """UPDATE evaluation_repair_jobs
+                  SET status = 'queued',
+                      stage = '服务恢复，等待继续评分文字修复',
+                      error = '', updated_at = ?
+                WHERE status = 'running'""",
+            (timestamp,),
+        )
+        rows = database.execute(
+            """SELECT run_id, turn_number, source_sha256
+                 FROM evaluation_repair_jobs
+                WHERE status = 'queued'
+                ORDER BY updated_at"""
+        ).fetchall()
+    for saved in rows:
+        key = f"{saved['run_id']}:{int(saved['turn_number'])}"
+        old_source = str(saved["source_sha256"] or "")
+        try:
+            result = queue_completed_turn_evaluation_repairs(
+                {"turn_keys": [key], "retry_failed": True},
+                schedule_jobs=False,
+            )
+            result_status = str((result.get("results") or [{}])[0].get("status") or "")
+        except Exception as exc:
+            result_status = "failed"
+            detail = str(exc).strip() or "服务恢复时无法重新核对评分文字修复任务"
+            update_evaluation_repair_job(
+                key,
+                old_source,
+                status="failed",
+                stage="服务恢复后评分文字修复未继续",
+                error=detail[-2000:],
+                finished_at=now_text(),
+            )
+        else:
+            if result_status not in {"queued", "running"}:
+                update_evaluation_repair_job(
+                    key,
+                    old_source,
+                    status="failed",
+                    stage="服务恢复后旧的评分文字修复任务已失效",
+                    error="评分、证据或修复条件已变化，旧任务没有继续执行",
+                    finished_at=now_text(),
+                )
+    with db_connection() as database:
+        resumable = database.execute(
+            """SELECT run_id, turn_number, source_sha256
+                 FROM evaluation_repair_jobs
+                WHERE status = 'queued'
+                ORDER BY updated_at"""
+        ).fetchall()
+    for row in resumable:
+        schedule_evaluation_repair(
+            f"{row['run_id']}:{int(row['turn_number'])}",
+            str(row["source_sha256"] or ""),
+        )
+    return len(resumable)
 
 
 def save_completed_turn_evaluation(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -6645,8 +8201,12 @@ def solo_qa_readiness(
     return bool(export_ready) and not issues, issues
 
 
-def solo_qa_values(row: Dict[str, Any]) -> Dict[str, Any]:
-    evaluation = turn_evaluation(row)
+def solo_qa_values(
+    row: Dict[str, Any], *, clean_description_markup: bool = True
+) -> Dict[str, Any]:
+    evaluation = turn_evaluation(
+        row, clean_description_markup=clean_description_markup
+    )
 
     def value(name: str, fallback: Any = "") -> Any:
         result = evaluation.get(name)
@@ -6697,9 +8257,13 @@ def solo_qa_values(row: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def solo_qa_payload_sha256(row: Dict[str, Any]) -> str:
+def solo_qa_payload_sha256(
+    row: Dict[str, Any], *, clean_description_markup: bool = True
+) -> str:
     canonical = {
-        "values": solo_qa_values(row),
+        "values": solo_qa_values(
+            row, clean_description_markup=clean_description_markup
+        ),
         "trajectory_sha256": str(row.get("turn_trajectory_sha256") or "").lower(),
     }
     return hashlib.sha256(
@@ -6712,15 +8276,20 @@ def solo_qa_payload_sha256(row: Dict[str, Any]) -> str:
 def solo_qa_state_summary(row: Dict[str, Any], ready: bool) -> Dict[str, Any]:
     state = str(row.get("solo_qa_state") or "not_submitted")
     stored_digest = str(row.get("solo_qa_payload_sha256") or "")
+    remote_id = str(row.get("solo_qa_remote_submission_id") or "")
     changed = False
     if stored_digest and ready:
         try:
             changed = stored_digest != solo_qa_payload_sha256(row)
+            if changed and remote_id:
+                legacy_digest = solo_qa_payload_sha256(
+                    row, clean_description_markup=False
+                )
+                changed = stored_digest != legacy_digest
         except WorkflowError:
             changed = True
     if changed and state not in {"not_submitted", "failed", "remote_missing"}:
         state = "local_changed"
-    remote_id = str(row.get("solo_qa_remote_submission_id") or "")
     return {
         "state": state,
         "remote_id": remote_id,
@@ -6875,6 +8444,124 @@ def record_solo_qa_state(payload: Dict[str, Any]) -> Dict[str, Any]:
     return solo_qa_state_summary(refreshed, refreshed_ready)
 
 
+def normalize_solo_qa_remote_evaluation(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep only bounded score text needed for account-local duplicate avoidance."""
+    normalized: Dict[str, Any] = {}
+    for dimension_key, remote_key in EVALUATION_REMOTE_DIMENSION_KEYS.items():
+        raw = item.get(remote_key)
+        raw = raw if isinstance(raw, dict) else {}
+        try:
+            score = int(raw.get("score"))
+        except (TypeError, ValueError):
+            score = None
+        if score not in range(1, 6):
+            score = None
+        description = strip_evaluation_description_backticks(
+            remove_generic_user_word(
+                re.sub(r"\s+", " ", str(raw.get("description") or "")).strip()
+            )
+        )[:2000]
+        normalized[dimension_key] = {
+            "score": score,
+            "description": description,
+        }
+
+    safe_hits: List[Dict[str, Any]] = []
+    allowed_hit_fields = {
+        "field": 100,
+        "dimension": 64,
+        "peer_id": 128,
+        "submission_id": 128,
+        "ratio": 32,
+        "similarity": 32,
+        "excerpt": 600,
+        "matched_excerpt": 600,
+    }
+    raw_hits = item.get("dedup_hits")
+    if isinstance(raw_hits, list):
+        for raw_hit in raw_hits[:20]:
+            if not isinstance(raw_hit, dict):
+                continue
+            safe_hit: Dict[str, Any] = {}
+            for field, maximum in allowed_hit_fields.items():
+                value = raw_hit.get(field)
+                if isinstance(value, str):
+                    value = value.strip()[:maximum]
+                    if value:
+                        safe_hit[field] = value
+                elif isinstance(value, bool):
+                    safe_hit[field] = value
+                elif isinstance(value, (int, float)):
+                    safe_hit[field] = value
+            if safe_hit:
+                candidate = [*safe_hits, safe_hit]
+                if len(json.dumps(candidate, ensure_ascii=False)) > 12000:
+                    break
+                safe_hits.append(safe_hit)
+    normalized["dedup_hits"] = safe_hits
+    return normalized
+
+
+def save_solo_qa_remote_evaluation(
+    database: sqlite3.Connection,
+    remote_id: str,
+    remote_status: str,
+    item: Dict[str, Any],
+    timestamp: str,
+) -> None:
+    """Upsert descriptions returned by the helper without erasing richer history."""
+    normalized = normalize_solo_qa_remote_evaluation(item)
+    values: List[Any] = [remote_id, remote_status]
+    for dimension_key in EVALUATION_DIMENSION_KEYS:
+        dimension = normalized[dimension_key]
+        values.extend((dimension["score"], dimension["description"]))
+    values.extend((
+        json.dumps(normalized["dedup_hits"], ensure_ascii=False),
+        str(item.get("updated_at") or "").strip()[:128] or None,
+        timestamp,
+    ))
+    database.execute(
+        """INSERT INTO solo_qa_remote_evaluations(
+             remote_submission_id, remote_status,
+             delivery_score, delivery_description,
+             instruction_following_score, instruction_following_description,
+             planning_score, planning_description,
+             reasoning_score, reasoning_description,
+             execution_score, execution_description,
+             dedup_hits, remote_updated_at, last_synced_at
+           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           ON CONFLICT(remote_submission_id) DO UPDATE SET
+             remote_status = CASE WHEN excluded.remote_status != ''
+               THEN excluded.remote_status ELSE solo_qa_remote_evaluations.remote_status END,
+             delivery_score = COALESCE(excluded.delivery_score, delivery_score),
+             delivery_description = CASE WHEN excluded.delivery_description != ''
+               THEN excluded.delivery_description ELSE delivery_description END,
+             instruction_following_score = COALESCE(
+               excluded.instruction_following_score, instruction_following_score
+             ),
+             instruction_following_description = CASE
+               WHEN excluded.instruction_following_description != ''
+               THEN excluded.instruction_following_description
+               ELSE instruction_following_description END,
+             planning_score = COALESCE(excluded.planning_score, planning_score),
+             planning_description = CASE WHEN excluded.planning_description != ''
+               THEN excluded.planning_description ELSE planning_description END,
+             reasoning_score = COALESCE(excluded.reasoning_score, reasoning_score),
+             reasoning_description = CASE WHEN excluded.reasoning_description != ''
+               THEN excluded.reasoning_description ELSE reasoning_description END,
+             execution_score = COALESCE(excluded.execution_score, execution_score),
+             execution_description = CASE WHEN excluded.execution_description != ''
+               THEN excluded.execution_description ELSE execution_description END,
+             dedup_hits = CASE WHEN excluded.dedup_hits != '[]'
+               THEN excluded.dedup_hits ELSE dedup_hits END,
+             remote_updated_at = COALESCE(
+               excluded.remote_updated_at, remote_updated_at
+             ),
+             last_synced_at = excluded.last_synced_at""",
+        tuple(values),
+    )
+
+
 def sync_solo_qa_submissions(payload: Dict[str, Any]) -> Dict[str, Any]:
     items = payload.get("items")
     if not isinstance(items, list):
@@ -6885,6 +8572,17 @@ def sync_solo_qa_submissions(payload: Dict[str, Any]) -> Dict[str, Any]:
     unmatched = 0
     ambiguous = 0
     remote_ids: set[str] = set()
+    supplied_remote_ids = payload.get("remote_ids")
+    if supplied_remote_ids is not None:
+        if not isinstance(supplied_remote_ids, list) or len(supplied_remote_ids) > MAX_EXPORT_TURNS:
+            raise WorkflowError("同步远端编号格式不正确")
+        for value in supplied_remote_ids:
+            try:
+                remote_id = validate_solo_qa_remote_id(value, required=True)
+            except WorkflowError as exc:
+                raise WorkflowError("同步远端编号格式不正确") from exc
+            assert remote_id is not None
+            remote_ids.add(remote_id)
     timestamp = now_text()
     with db_connection() as database:
         for item in items:
@@ -6898,6 +8596,10 @@ def sync_solo_qa_submissions(payload: Dict[str, Any]) -> Dict[str, Any]:
                 continue
             assert remote_id is not None
             remote_ids.add(remote_id)
+            remote_status = str(item.get("status") or "").strip()[:64]
+            save_solo_qa_remote_evaluation(
+                database, remote_id, remote_status, item, timestamp
+            )
             session_id = str(item.get("session_id") or "").strip()
             turn_id = str(item.get("turn_id") or "").strip()
             try:
@@ -6934,7 +8636,6 @@ def sync_solo_qa_submissions(payload: Dict[str, Any]) -> Dict[str, Any]:
                     unmatched += 1
                 continue
             candidate = candidates[0]
-            remote_status = str(item.get("status") or "").strip()[:64]
             state = solo_qa_remote_state(remote_status)
             qc_summary = str(item.get("qc_summary") or "").strip()[:4000]
             submitted_at = str(item.get("submitted_at") or "").strip()[:128] or None
@@ -7006,11 +8707,17 @@ def completed_turns() -> List[Dict[str, Any]]:
     records: List[Dict[str, Any]] = []
     for row in completed_turn_rows():
         evaluation = turn_evaluation(row)
+        raw_evaluation = turn_evaluation(row, clean_description_markup=False)
+        repairable_issues, evaluation_policy_issues = (
+            completed_turn_repairable_evaluation_issues(row, raw_evaluation)
+        )
         turn_number = int(row["turn_number"])
         fallback_difficulty = (
             row.get("run_task_difficulty") if int(row.get("turn_count") or 0) == 1 else ""
         )
-        export_ready, export_issues = export_readiness(row)
+        export_ready, export_issues = export_readiness(
+            row, evaluation_policy_issues=evaluation_policy_issues
+        )
         solo_qa_ready, solo_qa_issues = solo_qa_readiness(
             row, export_ready, export_issues
         )
@@ -7030,6 +8737,12 @@ def completed_turns() -> List[Dict[str, Any]]:
             "evaluation_override_updated_at": row.get("turn_manual_evaluation_updated_at") or "",
             "export_ready": export_ready,
             "export_issues": export_issues,
+            "evaluation_repair": completed_turn_evaluation_repair_state(
+                row,
+                export_issues=export_issues,
+                repairable_issues=repairable_issues,
+                policy_issues=evaluation_policy_issues,
+            ),
             "solo_qa_ready": solo_qa_ready,
             "solo_qa_issues": solo_qa_issues,
             "solo_qa": solo_qa_state_summary(row, solo_qa_ready),
@@ -7157,7 +8870,11 @@ def delivery_export_row(row: Dict[str, Any]) -> List[Any]:
     return values
 
 
-def export_readiness(row: Dict[str, Any]) -> Tuple[bool, List[str]]:
+def export_readiness(
+    row: Dict[str, Any],
+    *,
+    evaluation_policy_issues: Optional[List[str]] = None,
+) -> Tuple[bool, List[str]]:
     """Validate evidence fields before a completed turn can enter the workbook."""
     issues: List[str] = []
     evaluation = turn_evaluation(row)
@@ -7221,14 +8938,20 @@ def export_readiness(row: Dict[str, Any]) -> Tuple[bool, List[str]]:
     if evaluation:
         # Revalidate with the concrete turn number so turn-aware wording and
         # consistency checks use the same policy as review generation.
-        issues.extend(completed_turn_evaluation_policy_issues(row, evaluation))
+        issues.extend(
+            evaluation_policy_issues
+            if evaluation_policy_issues is not None
+            else completed_turn_evaluation_policy_issues(row, evaluation)
+        )
     harness_version = normalize_harness_version(row.get("harness_version") or "")
     if not harness_version:
         issues.append("缺少 Harness 版本")
     return not issues, issues
 
 
-def trace_human_prompt_text(event: Dict[str, Any]) -> Optional[str]:
+def trace_human_prompt_text(
+    event: Dict[str, Any], *, automatic_api_resume: bool = False
+) -> Optional[str]:
     if event.get("type") != "user" or event.get("isSidechain") is True:
         return None
     message = event.get("message") if isinstance(event.get("message"), dict) else {}
@@ -7241,10 +8964,7 @@ def trace_human_prompt_text(event: Dict[str, Any]) -> Optional[str]:
             "[request interrupted by user for tool use]",
         }:
             return None
-        # A one-word prompt is injected by the controller after a temporary
-        # upstream API error. It continues the same logical turn and must not
-        # become the boundary of a new exported turn.
-        if re.sub(r"[\s。！？!?]+", "", content) == "继续":
+        if automatic_api_resume and re.sub(r"[\s。！？!?]+", "", content) == "继续":
             return None
         return content
     if not isinstance(content, list) or any(
@@ -7263,9 +8983,61 @@ def trace_human_prompt_text(event: Dict[str, Any]) -> Optional[str]:
         "[request interrupted by user for tool use]",
     }:
         return None
-    if re.sub(r"[\s。！？!?]+", "", text) == "继续":
+    if automatic_api_resume and re.sub(r"[\s。！？!?]+", "", text) == "继续":
         return None
     return text or None
+
+
+def trace_automatic_api_resume_indexes(events: List[Dict[str, Any]]) -> set[int]:
+    """Identify one-word continuations that resume an interrupted CLI turn."""
+    pending_api_error = False
+    pending_incomplete_turn = False
+    segment_active = False
+    segment_has_terminal_stop = False
+    indexes: set[int] = set()
+    for index, event in enumerate(events):
+        message = event.get("message") if isinstance(event.get("message"), dict) else {}
+        content = message.get("content")
+        if event.get("type") == "assistant":
+            pending_incomplete_turn = False
+            terminal_stop = message.get("stop_reason") in {
+                "end_turn",
+                "stop_sequence",
+            }
+            segment_has_terminal_stop = segment_has_terminal_stop or terminal_stop
+            text_blocks = (
+                [
+                    str(block.get("text") or "")
+                    for block in content
+                    if isinstance(block, dict) and block.get("type") == "text"
+                ]
+                if isinstance(content, list)
+                else []
+            )
+            assistant_text = "\n".join(text_blocks).strip()
+            if event.get("isApiErrorMessage") or assistant_text.startswith("API Error:"):
+                pending_api_error = True
+            elif terminal_stop:
+                pending_api_error = False
+            continue
+        if event.get("type") == "system" and event.get("subtype") == "turn_duration":
+            pending_incomplete_turn = bool(
+                segment_active and not segment_has_terminal_stop
+            )
+            continue
+        if event.get("type") != "user":
+            continue
+        human_text = trace_human_prompt_text(event)
+        if human_text is None:
+            continue
+        normalized = re.sub(r"[\s。！？!?]+", "", human_text)
+        if normalized == "继续" and (pending_api_error or pending_incomplete_turn):
+            indexes.add(index)
+        segment_active = True
+        segment_has_terminal_stop = False
+        pending_api_error = False
+        pending_incomplete_turn = False
+    return indexes
 
 
 def read_trace_events(path: Path) -> Tuple[List[Dict[str, Any]], List[str]]:
@@ -7336,6 +9108,7 @@ def completed_turn_preflight(row: Dict[str, Any]) -> Dict[str, Any]:
                 block("轨迹文件 SHA-256 与数据库记录不一致")
 
     if events:
+        automatic_api_resumes = trace_automatic_api_resume_indexes(events)
         trace_sessions = {
             str(event.get("sessionId") or "").strip()
             for event in events
@@ -7347,7 +9120,10 @@ def completed_turn_preflight(row: Dict[str, Any]) -> Dict[str, Any]:
 
         human_prompts: List[Tuple[int, str, str]] = []
         for index, event in enumerate(events):
-            text = trace_human_prompt_text(event)
+            text = trace_human_prompt_text(
+                event,
+                automatic_api_resume=index in automatic_api_resumes,
+            )
             if text is None:
                 continue
             human_prompts.append(
@@ -7884,22 +9660,164 @@ def migrate_completed_legacy_iterations() -> None:
             add_event(str(row["id"]), f"旧迭代目录自动迁移未完成：{exc}", "warning")
 
 
+def docker_engine_health(*, force: bool = False) -> Tuple[bool, str]:
+    """Return a short cached Docker server probe without enumerating containers."""
+    global DOCKER_STARTUP_HEALTH_AT, DOCKER_STARTUP_HEALTH_RESULT
+    with DOCKER_STARTUP_HEALTH_LOCK:
+        checked_at = time.monotonic()
+        if (
+            not force
+            and DOCKER_STARTUP_HEALTH_AT > 0
+            and checked_at - DOCKER_STARTUP_HEALTH_AT
+            < DOCKER_STARTUP_HEALTH_CACHE_SECONDS
+        ):
+            return DOCKER_STARTUP_HEALTH_RESULT
+        try:
+            result = run_command(
+                ["docker", "version", "--format", "{{.Server.Version}}"],
+                timeout=DOCKER_STARTUP_HEALTH_TIMEOUT_SECONDS,
+                check=False,
+            )
+            server_version = result.stdout.strip()
+            if result.returncode == 0 and server_version:
+                health = (True, f"Docker Server {server_version}")
+            else:
+                output = re.sub(
+                    r"\s+", " ", (result.stderr or result.stdout or "Docker Server 未响应")
+                ).strip()
+                health = (False, output[-500:])
+        except WorkflowError as exc:
+            health = (False, str(exc))
+        DOCKER_STARTUP_HEALTH_AT = checked_at
+        DOCKER_STARTUP_HEALTH_RESULT = health
+        return health
+
+
+def ensure_docker_engine_ready(*, force: bool = False) -> None:
+    healthy, detail = docker_engine_health(force=force)
+    if not healthy:
+        raise SystemicStartupError(f"Docker 服务不可用，已停止创建新终端：{detail}")
+
+
+def docker_container_exists(container_name: str) -> bool:
+    """Inspect exactly one container name and distinguish absence from daemon failure."""
+    if not container_name:
+        return False
+    try:
+        result = run_command(
+            [
+                "docker", "container", "inspect", "--format", "{{.Id}}",
+                container_name,
+            ],
+            timeout=DOCKER_STARTUP_HEALTH_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except WorkflowError as exc:
+        raise SystemicStartupError(f"Docker 容器查询无响应：{exc}") from exc
+    if result.returncode == 0:
+        return bool(result.stdout.strip())
+    output = (result.stderr or result.stdout or "").strip()
+    if "no such container" in output.casefold():
+        return False
+    raise SystemicStartupError(
+        f"Docker 容器查询失败：{output[-500:] or f'退出码 {result.returncode}'}"
+    )
+
+
+def docker_container_owned_by_run(
+    container_name: str, row: sqlite3.Row
+) -> Tuple[bool, bool, str]:
+    """Verify the run label, or the legacy image plus exact /workspace bind."""
+    try:
+        result = run_command(
+            ["docker", "container", "inspect", "--format", "{{json .}}", container_name],
+            timeout=DOCKER_STARTUP_HEALTH_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except WorkflowError as exc:
+        raise SystemicStartupError(f"Docker 容器所有权查询无响应：{exc}") from exc
+    if result.returncode != 0:
+        output = (result.stderr or result.stdout or "").strip()
+        if "no such container" in output.casefold():
+            return False, True, "容器不存在"
+        raise SystemicStartupError(
+            f"Docker 容器所有权查询失败：{output[-500:] or f'退出码 {result.returncode}'}"
+        )
+    try:
+        inspected = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise WorkflowError("Docker 容器所有权信息不是有效 JSON") from exc
+    if not isinstance(inspected, dict):
+        raise WorkflowError("Docker 容器所有权信息格式错误")
+    config = inspected.get("Config") if isinstance(inspected.get("Config"), dict) else {}
+    labels = config.get("Labels") if isinstance(config.get("Labels"), dict) else {}
+    run_id = str(row["id"])
+    labeled_run_id = str(labels.get("claude-eval.run-id") or "")
+    if labeled_run_id:
+        owned = labeled_run_id == run_id
+        return True, owned, "run-id 标签匹配" if owned else "run-id 标签不匹配"
+
+    mounts = inspected.get("Mounts") if isinstance(inspected.get("Mounts"), list) else []
+    expected_workspace = Path(str(row["repo_path"] or "")).expanduser().resolve()
+    workspace_matches = any(
+        isinstance(mount, dict)
+        and str(mount.get("Type") or "") == "bind"
+        and str(mount.get("Destination") or "") == "/workspace"
+        and Path(str(mount.get("Source") or "")).expanduser().resolve()
+        == expected_workspace
+        for mount in mounts
+    )
+    image_matches = str(config.get("Image") or "") == DOCKER_IMAGE
+    owned = image_matches and workspace_matches
+    return (
+        True,
+        owned,
+        "旧容器镜像和 workspace 挂载匹配"
+        if owned
+        else "旧容器缺少 run-id 标签，且镜像或 workspace 挂载不匹配",
+    )
+
+
 def docker_container_running(container_name: str) -> bool:
     if not container_name:
         return False
-    result = run_command(
-        ["docker", "inspect", "--format", "{{.State.Running}}", container_name],
-        timeout=20,
-        check=False,
+    try:
+        result = run_command(
+            [
+                "docker", "container", "inspect", "--format",
+                "{{.State.Running}}", container_name,
+            ],
+            timeout=20,
+            check=False,
+        )
+    except WorkflowError as exc:
+        raise SystemicStartupError(f"Docker 容器状态查询无响应：{exc}") from exc
+    if result.returncode == 0:
+        return result.stdout.strip() == "true"
+    output = (result.stderr or result.stdout or "").strip()
+    if "no such container" in output.casefold():
+        return False
+    raise SystemicStartupError(
+        f"Docker 容器状态查询失败：{output[-500:] or f'退出码 {result.returncode}'}"
     )
-    return result.returncode == 0 and result.stdout.strip() == "true"
 
 
 def screen_session_running(screen_name: str) -> bool:
     if not screen_name:
         return False
     result = run_command(["screen", "-ls"], timeout=20, check=False)
-    return result.returncode in {0, 1} and f".{screen_name}" in result.stdout
+    return result.returncode in {0, 1} and screen_listing_contains(
+        result.stdout, screen_name
+    )
+
+
+def screen_listing_contains(listing: str, screen_name: str) -> bool:
+    return bool(
+        screen_name
+        and re.search(
+            rf"(?m)^\s*\d+\.{re.escape(screen_name)}\s+\(", str(listing or "")
+        )
+    )
 
 
 TERMINAL_ANSI_ESCAPE_RE = re.compile(
@@ -7999,7 +9917,10 @@ def terminal_asset_paths(run_id: str) -> Dict[str, Path]:
         "screen_snapshot": root / "screen-current.txt",
         "exit_status": root / "exit-status",
         "prompt": root / "next-prompt.txt",
+        "prompt_submitted": root / "prompt-submitted",
         "permission_status": root / "permission-status",
+        "terminal_tty": root / "terminal-tty",
+        "startup_owner": root / "startup-owner.json",
     }
 
 
@@ -8012,7 +9933,10 @@ def write_terminal_launcher(row: sqlite3.Row) -> Dict[str, Path]:
     if workspace.exists() and any(workspace.iterdir()):
         raise WorkflowError(f"新容器的工作目录必须为空：{workspace}")
     workspace.mkdir(parents=False, exist_ok=True)
-    for marker in (paths["exit_status"], paths["screen_log"], paths["permission_status"]):
+    for marker in (
+        paths["exit_status"], paths["screen_log"], paths["permission_status"],
+        paths["prompt_submitted"],
+    ):
         if marker.exists():
             marker.unlink()
     launcher = f"""#!/bin/zsh
@@ -8020,6 +9944,7 @@ set -u
 container_name={shlex.quote(str(row['container_name']))}
 workspace={shlex.quote(str(workspace))}
 image={shlex.quote(DOCKER_IMAGE)}
+run_id={shlex.quote(str(row['id']))}
 model={shlex.quote(str(row['model'] or CLAUDE_MODEL))}
 python_bin={shlex.quote(sys.executable)}
 settings_file={shlex.quote(str(CLAUDE_SETTINGS_PATH))}
@@ -8034,7 +9959,7 @@ if [[ -z "$api_key" ]]; then
   read -r -s "api_key?请输入本次任务的 API Key（输入不显示）："
   printf '\n'
 fi
-docker run -it --init --restart=no --cap-drop ALL --security-opt no-new-privileges --name "$container_name" --mount "type=bind,src=$workspace,dst=/workspace" -e "apikey=$api_key" -e "ANTHROPIC_MODEL=$model" "$image"
+docker run -it --init --restart=no --cap-drop ALL --security-opt no-new-privileges --label "claude-eval.run-id=$run_id" --name "$container_name" --mount "type=bind,src=$workspace,dst=/workspace" -e "apikey=$api_key" -e "ANTHROPIC_MODEL=$model" "$image"
 status=$?
 unset api_key
 printf '%s\n' "$status" > "$exit_status"
@@ -8051,28 +9976,153 @@ exit "$status"
     return paths
 
 
-def open_terminal_screen(screen_name: str) -> None:
+def terminal_tab_title(run_id: str) -> str:
+    return f"Claude Eval · {run_id}"
+
+
+def open_terminal_screen(run_id: str, screen_name: str) -> None:
     command = f"/usr/bin/screen -r {shlex.quote(screen_name)}"
+    title = terminal_tab_title(run_id)
     apple_script = (
         'tell application "Terminal"\n'
-        f"do script {json.dumps(command)}\n"
+        f"set taskTab to do script {json.dumps(command)}\n"
+        f"set custom title of taskTab to {json.dumps(title, ensure_ascii=False)}\n"
         "activate\n"
+        "return tty of taskTab\n"
         "end tell"
     )
-    run_command(["osascript", "-e", apple_script], timeout=30)
+    # Terminal automation becomes unreliable when several tabs are opened at
+    # once. Serialize only this optional UI step; the detached screen remains
+    # the durable owner of the container process.
+    with TERMINAL_OPEN_LOCK:
+        result = run_command(["osascript", "-e", apple_script], timeout=15)
+    tty_name = result.stdout.strip()
+    if not re.fullmatch(r"/dev/tty[A-Za-z0-9._-]+", tty_name):
+        raise WorkflowError("Terminal 已打开，但无法记录任务标签页，已停止以避免后续误关终端")
+    paths = terminal_asset_paths(run_id)
+    paths["root"].mkdir(parents=True, exist_ok=True)
+    paths["terminal_tty"].write_text(tty_name + "\n", encoding="utf-8")
+
+
+def close_terminal_screen_by_title(run_id: str) -> bool:
+    """Fallback for startup UI calls that opened a tab but returned no TTY."""
+    apple_script = """on run argv
+set targetTitle to item 1 of argv
+tell application "Terminal"
+    repeat with terminalWindow in windows
+        repeat with terminalTab in tabs of terminalWindow
+            try
+                if (custom title of terminalTab as text) is targetTitle then
+                    if busy of terminalTab then return "busy"
+                    if (count of tabs of terminalWindow) is 1 then
+                        close terminalWindow
+                    else
+                        close terminalTab
+                    end if
+                    return "closed"
+                end if
+            end try
+        end repeat
+    end repeat
+end tell
+return "missing"
+end run"""
+    try:
+        result = run_command(
+            ["osascript", "-e", apple_script, terminal_tab_title(run_id)],
+            timeout=10,
+            check=False,
+        )
+    except (OSError, WorkflowError):
+        return False
+    return result.returncode == 0 and result.stdout.strip().lower() in {
+        "closed", "missing",
+    }
+
+
+def close_terminal_screen(run_id: str, *, force: bool = False) -> bool:
+    """Close only the idle Terminal tab that was opened for this run."""
+    if sys.platform != "darwin" or (not AUTO_CLOSE_TERMINAL and not force):
+        return False
+    tty_path = terminal_asset_paths(run_id)["terminal_tty"]
+    try:
+        tty_name = tty_path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return close_terminal_screen_by_title(run_id) if force else False
+    if not re.fullmatch(r"/dev/tty[A-Za-z0-9._-]+", tty_name):
+        return close_terminal_screen_by_title(run_id) if force else False
+    apple_script = """on run argv
+set targetTTY to item 1 of argv
+set targetTitle to item 2 of argv
+tell application "Terminal"
+    repeat with terminalWindow in windows
+        repeat with terminalTab in tabs of terminalWindow
+            try
+                if (tty of terminalTab as text) is targetTTY and (custom title of terminalTab as text) is targetTitle then
+                    if busy of terminalTab then return "busy"
+                    if (count of tabs of terminalWindow) is 1 then
+                        close terminalWindow
+                    else
+                        close terminalTab
+                    end if
+                    return "closed"
+                end if
+            end try
+        end repeat
+    end repeat
+end tell
+return "missing"
+end run"""
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        try:
+            result = run_command(
+                [
+                    "osascript", "-e", apple_script, tty_name,
+                    terminal_tab_title(run_id),
+                ],
+                timeout=10,
+                check=False,
+            )
+        except (OSError, WorkflowError):
+            return False
+        status = result.stdout.strip().lower()
+        if result.returncode == 0 and status in {"closed", "missing"}:
+            tty_path.unlink(missing_ok=True)
+            return True
+        if status != "busy":
+            return False
+        time.sleep(0.25)
+    return False
 
 
 def launch_docker_terminal(row: sqlite3.Row) -> str:
     container_name = str(row["container_name"] or f"claude-eval-{row['id']}")
     screen_name = str(row["screen_name"] or f"claude-eval-{row['id']}")
-    if docker_container_running(container_name):
-        raise WorkflowError(f"容器已在运行：{container_name}")
-    inspect = run_command(["docker", "inspect", container_name], timeout=20, check=False)
-    if inspect.returncode == 0:
+    ensure_docker_engine_ready()
+    unresolved = failed_startup_resource_count(exclude_run_id=str(row["id"]))
+    if unresolved >= MAX_PARALLEL_RUNS:
+        raise SystemicStartupError(
+            f"检测到 {unresolved} 个失败启动仍占用资源，已停止创建新终端；请先清理"
+        )
+    if docker_container_exists(container_name):
         raise WorkflowError(f"容器名称已被占用：{container_name}")
     if screen_session_running(screen_name):
         raise WorkflowError(f"终端会话名称已被占用：{screen_name}")
     paths = write_terminal_launcher(row)
+    paths["startup_owner"].write_text(
+        json.dumps(
+            {
+                "run_id": str(row["id"]),
+                "container_name": container_name,
+                "screen_name": screen_name,
+                "startup_protocol": 2,
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    add_event(str(row["id"]), f"正在为本题启动独立容器 {container_name}")
     run_command(
         [
             "screen", "-c", str(paths["screenrc"]), "-dmS", screen_name,
@@ -8081,8 +10131,235 @@ def launch_docker_terminal(row: sqlite3.Row) -> str:
         timeout=30,
         capture_output=False,
     )
-    open_terminal_screen(screen_name)
+    try:
+        open_terminal_screen(str(row["id"]), screen_name)
+    except (OSError, WorkflowError) as exc:
+        add_event(
+            str(row["id"]),
+            f"Terminal 标签页未能自动打开，容器将在后台 screen 中继续启动：{exc}",
+            "warning",
+        )
     return screen_name
+
+
+def unstarted_run_has_prompt_or_trace(row: sqlite3.Row) -> bool:
+    """Use durable evidence and local markers before deciding startup is disposable."""
+    for field in ("first_prompt_id", "session_id", "trajectory_path"):
+        if str(row[field] or "").strip():
+            return True
+    try:
+        turn = turn_row(str(row["id"]), 1)
+    except WorkflowError:
+        return True
+    for field in ("prompt_id", "trajectory_path", "checkpointed_at"):
+        if str(turn[field] or "").strip():
+            return True
+    paths = terminal_asset_paths(str(row["id"]))
+    if paths["prompt_submitted"].is_file():
+        return True
+    if paths["prompt"].is_file() and not startup_uses_submission_marker(
+        str(row["id"])
+    ):
+        return True
+    run_directory = run_directory_for(row)
+    for trace_root in (run_directory / "traces", run_directory / ".trace-snapshot"):
+        try:
+            if trace_root.is_dir() and next(trace_root.rglob("*.jsonl"), None):
+                return True
+        except OSError:
+            return True
+    return False
+
+
+def startup_uses_submission_marker(run_id: str) -> bool:
+    owner_path = terminal_asset_paths(run_id)["startup_owner"]
+    try:
+        owner = json.loads(owner_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(owner, dict) or str(owner.get("run_id") or "") != run_id:
+        return False
+    try:
+        return int(owner.get("startup_protocol") or 0) >= 2
+    except (TypeError, ValueError):
+        return False
+
+
+def failed_startup_retry_candidate(row: sqlite3.Row) -> bool:
+    if str(row["phase"] or "") != "failed":
+        return False
+    if str(row["repo_name"] or "") == "题目生成中":
+        return False
+    if not run_has_startup_attempt_evidence(str(row["id"])):
+        return False
+    if unstarted_run_has_prompt_or_trace(row):
+        return False
+    workspace = Path(str(row["repo_path"] or ""))
+    if not workspace.exists():
+        return True
+    return workspace.is_dir() and not any(workspace.iterdir())
+
+
+def run_has_startup_resource_evidence(run_id: str) -> bool:
+    if terminal_asset_paths(run_id)["startup_owner"].is_file():
+        return True
+    with db_connection() as database:
+        row = database.execute(
+            """SELECT 1 FROM events
+               WHERE run_id = ?
+                 AND message LIKE '正在为本题启动独立容器 %'
+               LIMIT 1""",
+            (run_id,),
+        ).fetchone()
+    return bool(row)
+
+
+def run_has_startup_attempt_evidence(run_id: str) -> bool:
+    if run_has_startup_resource_evidence(run_id):
+        return True
+    with db_connection() as database:
+        row = database.execute(
+            """SELECT 1 FROM events
+               WHERE run_id = ? AND message = '正在进行本题容器启动预检'
+               LIMIT 1""",
+            (run_id,),
+        ).fetchone()
+    return bool(row)
+
+
+def rollback_unstarted_run_resources(run_id: str) -> Dict[str, Any]:
+    """Best-effort rollback scoped to one run, only before any prompt/trace exists."""
+    with STARTUP_RESOURCE_ROLLBACK_LOCK:
+        row = run_row(run_id)
+        if unstarted_run_has_prompt_or_trace(row):
+            return {
+                "eligible": False,
+                "cleaned": False,
+                "detail": "已发现题面或轨迹证据，启动资源已保留",
+            }
+        expected_name = f"claude-eval-{run_id}"
+        container_name = str(row["container_name"] or "")
+        screen_name = str(row["screen_name"] or "")
+        if container_name != expected_name or screen_name != expected_name:
+            return {
+                "eligible": False,
+                "cleaned": False,
+                "detail": "资源名称与任务不匹配，未执行自动清理",
+            }
+        if not run_has_startup_resource_evidence(run_id):
+            update_run(run_id, container_cleaned=1)
+            return {
+                "eligible": True,
+                "cleaned": True,
+                "detail": "启动前检查失败，没有创建容器或终端",
+            }
+
+        cleanup_errors: List[str] = []
+        try:
+            container_present, container_owned, ownership_detail = (
+                docker_container_owned_by_run(container_name, row)
+            )
+        except WorkflowError as exc:
+            return {
+                "eligible": True,
+                "cleaned": False,
+                "detail": str(exc),
+            }
+        if container_present and not container_owned:
+            return {
+                "eligible": False,
+                "cleaned": False,
+                "detail": f"容器所有权无法确认，未执行清理：{ownership_detail}",
+            }
+
+        try:
+            screen_result = run_command(
+                ["screen", "-S", screen_name, "-X", "quit"],
+                timeout=10,
+                check=False,
+            )
+            if screen_result.returncode not in {0, 1}:
+                cleanup_errors.append("screen 会话未确认关闭")
+        except WorkflowError as exc:
+            cleanup_errors.append(str(exc))
+
+        if container_present:
+            try:
+                remove_result = run_command(
+                    ["docker", "container", "rm", "--force", container_name],
+                    timeout=20,
+                    check=False,
+                )
+                if remove_result.returncode != 0 and "no such container" not in (
+                    remove_result.stderr or remove_result.stdout or ""
+                ).casefold():
+                    cleanup_errors.append(
+                        (remove_result.stderr or remove_result.stdout or "容器删除失败")[-500:]
+                    )
+            except WorkflowError as exc:
+                cleanup_errors.append(str(exc))
+
+        container_absent = False
+        try:
+            container_absent = not docker_container_exists(container_name)
+            if not container_absent:
+                cleanup_errors.append("容器删除后仍然存在")
+        except WorkflowError as exc:
+            cleanup_errors.append(str(exc))
+
+        screen_absent = False
+        try:
+            screen_check = run_command(["screen", "-ls"], timeout=10, check=False)
+            screen_absent = (
+                screen_check.returncode in {0, 1}
+                and not screen_listing_contains(screen_check.stdout, screen_name)
+            )
+            if not screen_absent:
+                cleanup_errors.append("screen 会话关闭后仍然存在或状态无法确认")
+        except WorkflowError as exc:
+            cleanup_errors.append(str(exc))
+
+        terminal_closed = close_terminal_screen(run_id, force=True)
+        resources_cleaned = container_absent and screen_absent
+        if resources_cleaned:
+            update_run(run_id, container_cleaned=1)
+            terminal_asset_paths(run_id)["startup_owner"].unlink(missing_ok=True)
+        detail = (
+            "启动资源已按任务编号回滚"
+            if resources_cleaned and not cleanup_errors
+            else "；".join(error for error in cleanup_errors if error)
+            or "启动资源状态没有完全确认"
+        )
+        return {
+            "eligible": True,
+            "cleaned": resources_cleaned,
+            "terminal_closed": terminal_closed,
+            "detail": detail,
+        }
+
+
+def container_permission_accept_input(value: Any) -> str:
+    """Choose Yes from both numbered and cursor-based Claude permission prompts."""
+    visible = TERMINAL_ANSI_ESCAPE_RE.sub("", str(value or "")).replace("\x00", " ")
+    visible = visible.replace("\r", "\n")
+    if not re.search(r"Bypass\s*Permissions", visible, re.I):
+        return ""
+    numbered_yes = re.search(
+        r"(?mi)^\s*(\d+)\s*[.)]\s*Yes,?\s*I\s*accept\s*$", visible
+    )
+    if numbered_yes:
+        return numbered_yes.group(1) + "\r"
+    selected_yes = re.search(
+        r"(?mi)^\s*[❯>o]\s*Yes,?\s*I\s*accept\s*$", visible
+    )
+    if selected_yes:
+        return "\r"
+    selected_no = re.search(r"(?mi)^\s*[❯>o]\s*No(?:,\s*exit)?\s*$", visible)
+    yes_option = re.search(r"(?mi)^\s*Yes,?\s*I\s*accept\s*$", visible)
+    if selected_no and yes_option:
+        arrow = "\x1b[B" if yes_option.start() > selected_no.start() else "\x1b[A"
+        return arrow + "\r"
+    return ""
 
 
 def accept_container_permission_prompt(run_id: str, screen_name: str, container_name: str) -> None:
@@ -8097,9 +10374,13 @@ def accept_container_permission_prompt(run_id: str, screen_name: str, container_
             output = paths["screen_log"].read_text(encoding="utf-8", errors="ignore")[-30000:]
         except OSError:
             output = ""
-        if all(token in output for token in ("Bypass", "Permissions", "Yes,", "accept")):
+        current_screen = terminal_screen_text(run_id, screen_name)
+        accept_input = container_permission_accept_input(
+            current_screen if current_screen.strip() else output
+        )
+        if accept_input:
             run_command(
-                ["screen", "-S", screen_name, "-p", "0", "-X", "stuff", "2\r"],
+                ["screen", "-S", screen_name, "-p", "0", "-X", "stuff", accept_input],
                 timeout=20,
             )
             paths["permission_status"].write_text("accepted\n", encoding="utf-8")
@@ -8107,6 +10388,7 @@ def accept_container_permission_prompt(run_id: str, screen_name: str, container_
             time.sleep(3)
             return
         time.sleep(0.5)
+    raise WorkflowError("无法识别 Claude 权限确认菜单，已保留终端且未发送题面")
 
 
 def wait_for_docker_container(run_id: str, container_name: str) -> None:
@@ -8137,11 +10419,13 @@ def send_prompt_to_screen(run_id: str, screen_name: str, prompt: str) -> None:
         raise WorkflowError("对话终端已关闭，无法继续发送题面")
     paths = terminal_asset_paths(run_id)
     paths["root"].mkdir(parents=True, exist_ok=True)
+    paths["prompt_submitted"].unlink(missing_ok=True)
     paths["prompt"].write_text(prompt, encoding="utf-8")
     run_command(["screen", "-S", screen_name, "-p", "0", "-X", "readbuf", str(paths["prompt"])])
     run_command(["screen", "-S", screen_name, "-p", "0", "-X", "paste", "."])
     time.sleep(0.5)
     run_command(["screen", "-S", screen_name, "-p", "0", "-X", "stuff", "\r"])
+    paths["prompt_submitted"].write_text(now_text() + "\n", encoding="utf-8")
 
 
 def send_api_resume_to_screen(run_id: str, screen_name: str) -> None:
@@ -8258,6 +10542,11 @@ def trace_turn_state(trace_root: Path, prompt: str) -> Optional[Dict[str, Any]]:
         if not prompt_matches:
             continue
         start_index, prompt_id = prompt_matches[-1]
+        automatic_resumes = trace_automatic_api_resume_indexes(events)
+        attempt_start_index = max(
+            [start_index]
+            + [index for index in automatic_resumes if index > start_index]
+        )
         final_text = ""
         final_index: Optional[int] = None
         api_error = ""
@@ -8265,13 +10554,20 @@ def trace_turn_state(trace_root: Path, prompt: str) -> Optional[Dict[str, Any]]:
         for index, event in enumerate(events[start_index + 1 :], start=start_index + 1):
             message = event.get("message") if isinstance(event.get("message"), dict) else {}
             content = message.get("content")
-            if event.get("type") != "assistant" or not isinstance(content, list):
+            if event.get("type") != "assistant":
                 continue
-            text_blocks = [
-                str(block.get("text") or "")
-                for block in content
-                if isinstance(block, dict) and block.get("type") == "text" and block.get("text")
-            ]
+            if isinstance(content, list):
+                text_blocks = [
+                    str(block.get("text") or "")
+                    for block in content
+                    if isinstance(block, dict)
+                    and block.get("type") == "text"
+                    and block.get("text")
+                ]
+            elif isinstance(content, str) and content:
+                text_blocks = [content]
+            else:
+                text_blocks = []
             assistant_text = "\n".join(text_blocks).strip()
             if event.get("isApiErrorMessage") or assistant_text.startswith("API Error:"):
                 status = str(event.get("apiErrorStatus") or "").strip()
@@ -8301,12 +10597,30 @@ def trace_turn_state(trace_root: Path, prompt: str) -> Optional[Dict[str, Any]]:
             and not api_error_resumed
         )
         interruption_reason = trace_user_interruption(events, start_index)
+        attempt_has_terminal_stop = any(
+            event.get("type") == "assistant"
+            and isinstance(event.get("message"), dict)
+            and event["message"].get("stop_reason") in {"end_turn", "stop_sequence"}
+            for event in events[attempt_start_index + 1 :]
+        )
+        incomplete_turn = bool(
+            not complete
+            and not unresolved_api_error
+            and not interruption_reason
+            and not attempt_has_terminal_stop
+            and any(
+                event.get("type") == "system"
+                and event.get("subtype") == "turn_duration"
+                for event in events[attempt_start_index + 1 :]
+            )
+        )
         return {
             "session_id": path.stem,
             "prompt_id": prompt_id,
             "result": final_text,
             "complete": complete,
             "api_error": api_error if unresolved_api_error else "",
+            "incomplete_turn": incomplete_turn,
             "interrupted": bool(not complete and interruption_reason),
             "interruption_reason": interruption_reason if not complete else "",
             "path": path,
@@ -8559,9 +10873,17 @@ def monitor_docker_turn(run_id: str, turn_number: int) -> None:
                     update_run(run_id, first_prompt_id=prompt_id)
                 else:
                     update_run(run_id, second_prompt_id=prompt_id)
-            if trace_state.get("api_error"):
-                api_error = str(trace_state["api_error"])
-                if retryable_api_error(api_error):
+            api_error = str(trace_state.get("api_error") or "")
+            incomplete_turn = bool(trace_state.get("incomplete_turn"))
+            if api_error or incomplete_turn:
+                interruption_detail = (
+                    api_error
+                    or "请求在网络重试后结束，但轨迹没有生成最终回复"
+                )
+                retryable_interruption = bool(
+                    incomplete_turn or retryable_api_error(api_error)
+                )
+                if retryable_interruption:
                     try:
                         if resume_after_api_error(
                             run_id,
@@ -8594,9 +10916,9 @@ def monitor_docker_turn(run_id: str, turn_number: int) -> None:
                 preserve_interrupted_docker_turn(
                     run_id,
                     turn_number,
-                    f"Claude API 中断：{api_error}",
+                    f"Claude API 中断：{interruption_detail}",
                 )
-                if retryable_api_error(api_error):
+                if retryable_interruption:
                     try:
                         schedule_automatic_api_retry(run_id)
                     except WorkflowError as exc:
@@ -8621,7 +10943,6 @@ def monitor_docker_turn(run_id: str, turn_number: int) -> None:
                 workspace = Path(str(row["repo_path"]))
                 commands = json.loads(row["verification_commands"] or "[]")
                 result_text = str(trace_state["result"] or "")
-                trace_path = str(trace_state["path"])
                 update_turn(
                     run_id,
                     turn_number,
@@ -8635,7 +10956,6 @@ def monitor_docker_turn(run_id: str, turn_number: int) -> None:
                         status_detail="第一轮完成/会话空闲，正在运行交付验收",
                         first_result=result_text,
                         workspace_path=str(workspace),
-                        trajectory_path=trace_path,
                     )
                     add_event(run_id, "第一轮完成，会话保持空闲；开始运行交付验收", "success")
                 else:
@@ -8645,7 +10965,6 @@ def monitor_docker_turn(run_id: str, turn_number: int) -> None:
                         status_detail=f"第 {turn_number} 轮完成/会话空闲，正在运行交付验收",
                         second_result=result_text,
                         workspace_path=str(workspace),
-                        trajectory_path=trace_path,
                     )
                     add_event(run_id, f"第 {turn_number} 轮完成，会话保持空闲；开始运行交付验收", "success")
                 checks = verification_results(commands, workspace, run_id) if commands else []
@@ -8672,7 +10991,10 @@ def monitor_docker_turn(run_id: str, turn_number: int) -> None:
                     checkpoint_completed_work(run_id, turn_number)
                     update_run(
                         run_id,
-                        status_detail=f"第 {turn_number} 轮 Git 已推送，正在导出轨迹检查点",
+                        status_detail=(
+                            f"第 {turn_number} 轮 Git 已推送，"
+                            "正在保存原始轨迹并导出逐轮检查点"
+                        ),
                     )
                     export_turn_checkpoint(run_id, turn_number)
                 except Exception as exc:
@@ -8874,6 +11196,7 @@ def write_trace_through_turn(source: Path, destination: Path, prompt: str) -> Pa
             records.append((raw, event if isinstance(event, dict) else None))
 
     trace_events = [event or {} for _, event in records]
+    automatic_api_resumes = trace_automatic_api_resume_indexes(trace_events)
     prompt_matches = trace_prompt_matches(trace_events, comparable_prompt)
     if not prompt_matches:
         raise WorkflowError("轨迹中没有找到本轮 Prompt，未生成检查点")
@@ -8882,7 +11205,10 @@ def write_trace_through_turn(source: Path, destination: Path, prompt: str) -> Pa
     next_prompt_index = len(records)
     for index in range(start_index + 1, len(records)):
         event = records[index][1]
-        if event and trace_human_prompt_text(event) is not None:
+        if event and trace_human_prompt_text(
+            event,
+            automatic_api_resume=index in automatic_api_resumes,
+        ) is not None:
             next_prompt_index = index
             break
 
@@ -8977,17 +11303,10 @@ def export_turn_checkpoint(
     run_directory.mkdir(parents=True, exist_ok=True)
     destination = run_directory / "traces" / session_id / f"turn-{turn_number:02d}.jsonl"
     if source_trace is None:
-        with tempfile.TemporaryDirectory(prefix=".trace-checkpoint-", dir=str(run_directory)) as temp:
-            trace_root = copy_container_traces(row, Path(temp))
-            candidates = list(trace_root.rglob(f"{session_id}.jsonl"))
-            if not candidates:
-                raise WorkflowError("容器轨迹中没有找到当前 SessionID")
-            current_trace = max(candidates, key=lambda item: item.stat().st_mtime)
-            write_trace_through_turn(current_trace, destination, str(turn["prompt"] or ""))
-    else:
-        if not source_trace.is_file():
-            raise WorkflowError("本轮轨迹源文件不存在")
-        write_trace_through_turn(source_trace, destination, str(turn["prompt"] or ""))
+        source_trace = export_container_trace_snapshot(run_id)
+    if not source_trace.is_file():
+        raise WorkflowError("本轮轨迹源文件不存在")
+    write_trace_through_turn(source_trace, destination, str(turn["prompt"] or ""))
 
     digest = hashlib.sha256(destination.read_bytes()).hexdigest()
     checkpointed_at = now_text()
@@ -8998,7 +11317,6 @@ def export_turn_checkpoint(
         trajectory_sha256=digest,
         checkpointed_at=checkpointed_at,
     )
-    update_run(run_id, trajectory_path=str(destination))
     write_trajectory_manifest(run_id, destination.parent / "manifest.json")
     add_event(
         run_id,
@@ -9048,8 +11366,16 @@ def export_and_remove_container(run_id: str, force: bool = False) -> Path:
     screen_name = str(row["screen_name"] or "")
     if screen_session_running(screen_name):
         run_command(["screen", "-S", screen_name, "-X", "quit"], timeout=20, check=False)
+    terminal_tty = terminal_asset_paths(run_id)["terminal_tty"]
+    terminal_was_tracked = terminal_tty.is_file()
+    terminal_closed = close_terminal_screen(run_id)
     update_run(run_id, trajectory_path=str(final_trace), container_cleaned=1)
     add_event(run_id, "Claude 会话已关闭，本题容器已删除", "success")
+    if terminal_was_tracked:
+        if terminal_closed:
+            add_event(run_id, "本题 Terminal 标签页已自动关闭", "success")
+        elif AUTO_CLOSE_TERMINAL and sys.platform == "darwin":
+            add_event(run_id, "本题 Terminal 标签页未能自动关闭，请手动检查", "warning")
     return traces
 
 
@@ -9110,6 +11436,12 @@ def verification_environment(run_id: str) -> Dict[str, str]:
     """Give every run an isolated Compose namespace and a private host-port range."""
     environment = os.environ.copy()
     environment["COMPOSE_PROJECT_NAME"] = compose_project_name(run_id)
+    # Keep build output readable while preserving BuildKit's shared layer cache
+    # across the isolated Compose project names used by separate runs.
+    environment["BUILDKIT_PROGRESS"] = "plain"
+    environment["COMPOSE_PROGRESS"] = "plain"
+    environment["COMPOSE_ANSI"] = "never"
+    environment.pop("COMPOSE_PROFILES", None)
     start = 20_000 + (int(hashlib.sha256(run_id.encode()).hexdigest()[:8], 16) % 25_000)
     port_names = (
         "APP_PORT", "WEB_PORT", "FRONTEND_PORT", "API_PORT",
@@ -9146,47 +11478,192 @@ def verification_failure_kind(output: str) -> str:
     return "environment" if any(marker in normalized for marker in environment_markers) else "product"
 
 
+COMPOSE_VERIFICATION_ACTIONS = {
+    "build", "config", "create", "down", "exec", "images", "logs", "ps",
+    "pull", "restart", "rm", "run", "start", "stop", "up", "wait",
+}
+COMPOSE_GLOBAL_OPTIONS_WITH_VALUES = {
+    "--ansi", "--env-file", "--file", "--parallel", "--profile",
+    "--progress", "--project-directory", "--project-name", "-f", "-p",
+}
+COMPOSE_GLOBAL_FLAG_OPTIONS = {
+    "--all-resources", "--compatibility", "--dry-run",
+}
+
+
+def verification_command_action(command: str) -> str:
+    """Return the Docker Compose action without depending on option placement."""
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return ""
+    if len(tokens) < 3 or tokens[:2] != ["docker", "compose"]:
+        return ""
+    index = 2
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            index += 1
+            break
+        if token in COMPOSE_GLOBAL_FLAG_OPTIONS:
+            index += 1
+            continue
+        if token in COMPOSE_GLOBAL_OPTIONS_WITH_VALUES:
+            index += 2
+            continue
+        if any(
+            token.startswith(f"{option}=")
+            for option in COMPOSE_GLOBAL_OPTIONS_WITH_VALUES
+        ):
+            index += 1
+            continue
+        if token.startswith("-f") and token != "-f":
+            index += 1
+            continue
+        if token.startswith("-p") and token != "-p":
+            index += 1
+            continue
+        if token.startswith("-"):
+            return ""
+        break
+    if index >= len(tokens):
+        return ""
+    action = tokens[index]
+    return action if action in COMPOSE_VERIFICATION_ACTIONS else ""
+
+
+def verification_command_timeout(command: str) -> int:
+    action = verification_command_action(command)
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        tokens = []
+    explicitly_builds = any(
+        token == "--build" or token.startswith("--build=")
+        for token in tokens[2:]
+    )
+    if action == "build" or (action in {"run", "up"} and explicitly_builds):
+        return VERIFICATION_COMPOSE_BUILD_TIMEOUT_SECONDS
+    return VERIFICATION_COMMAND_TIMEOUT_SECONDS
+
+
+def verification_command_explicitly_selects_profile(command: str) -> bool:
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return False
+    return any(
+        token == "--profile" or token.startswith("--profile=")
+        for token in tokens[2:]
+    )
+
+
+def format_elapsed_seconds(seconds: int) -> str:
+    minutes, remaining = divmod(max(0, int(seconds)), 60)
+    return f"{minutes}分{remaining:02d}秒" if minutes else f"{remaining}秒"
+
+
+def verification_progress_excerpt(output: str, limit: int = 320) -> str:
+    visible = TERMINAL_ANSI_ESCAPE_RE.sub("", str(output or "")).replace("\x00", " ")
+    lines = [re.sub(r"\s+", " ", line).strip() for line in visible.splitlines()]
+    meaningful = [line for line in lines if line]
+    return meaningful[-1][-limit:] if meaningful else "等待命令输出"
+
+
+def verification_log_path(run_id: str, command_index: int, command: str) -> Path:
+    action = verification_command_action(command) or "command"
+    stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S-%f")
+    return DATA_DIR / "verification" / run_id / f"{stamp}-{command_index:02d}-{action}.log"
+
+
+def subprocess_output_tail(stream: Any, max_bytes: int = VERIFICATION_OUTPUT_TAIL_BYTES) -> str:
+    # The child inherits this file descriptor and writes through the same open
+    # file description.  pread() leaves that shared write offset untouched, so
+    # progress sampling cannot make a running build overwrite earlier log data.
+    descriptor = stream.fileno()
+    size = os.fstat(descriptor).st_size
+    data = os.pread(descriptor, max_bytes, max(0, size - max_bytes))
+    if isinstance(data, bytes):
+        return data.decode("utf-8", errors="replace")
+    return str(data or "")
+
+
 def run_cancellable_subprocess(
     args: List[str],
     cwd: Path,
     environment: Dict[str, str],
     timeout: int,
+    *,
+    progress_callback: Optional[Callable[[str, int], None]] = None,
+    progress_interval: float = VERIFICATION_PROGRESS_INTERVAL_SECONDS,
+    output_path: Optional[Path] = None,
 ) -> subprocess.CompletedProcess:
     job_key = current_job_key()
     ensure_job_active(job_key)
     process: Optional[subprocess.Popen] = None
+    output = ""
+    if output_path is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_stream = output_path.open("w+b")
+    else:
+        output_stream = tempfile.TemporaryFile(mode="w+b")
+    started_at = time.monotonic()
+    last_progress_at = started_at
     try:
         process = subprocess.Popen(
             args,
             cwd=str(cwd),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stdout=output_stream,
+            stderr=subprocess.STDOUT,
             env=environment,
             start_new_session=True,
         )
-        if job_key:
-            with CODEX_PROCESS_LOCK:
-                if job_key in CODEX_CANCELLED_JOBS:
-                    terminate_process(process)
-                    raise JobCancelled("后台任务已取消")
-                CODEX_PROCESSES[job_key] = process
-        stdout, stderr = process.communicate(timeout=timeout)
+        register_codex_process(job_key, process)
+        deadline = started_at + timeout
+        while process.poll() is None:
+            ensure_job_active(job_key)
+            current = time.monotonic()
+            if current >= deadline:
+                terminate_process(process)
+                output = subprocess_output_tail(output_stream)
+                raise subprocess.TimeoutExpired(
+                    args,
+                    timeout,
+                    output=output,
+                    stderr="",
+                )
+            try:
+                process.wait(timeout=min(1.0, max(0.01, deadline - current)))
+            except subprocess.TimeoutExpired:
+                pass
+            current = time.monotonic()
+            if (
+                progress_callback is not None
+                and current - last_progress_at >= max(0.05, progress_interval)
+            ):
+                output = subprocess_output_tail(output_stream)
+                try:
+                    progress_callback(output, int(current - started_at))
+                except Exception:
+                    # Progress reporting is observational and must not abort the
+                    # verification command when SQLite or UI state is transient.
+                    pass
+                last_progress_at = current
+        output = subprocess_output_tail(output_stream)
     except FileNotFoundError as exc:
         raise WorkflowError(f"找不到命令：{args[0]}") from exc
-    except subprocess.TimeoutExpired:
+    except BaseException:
         if process is not None:
             terminate_process(process)
         raise
     finally:
-        if job_key and process is not None:
-            with CODEX_PROCESS_LOCK:
-                if CODEX_PROCESSES.get(job_key) is process:
-                    CODEX_PROCESSES.pop(job_key, None)
+        if process is not None:
+            unregister_codex_process(job_key, process)
+        output_stream.close()
     ensure_job_active(job_key)
     if process is None:
         raise WorkflowError("命令没有启动")
-    return subprocess.CompletedProcess(args, process.returncode, stdout, stderr)
+    return subprocess.CompletedProcess(args, process.returncode, output, "")
 
 
 def verification_results(commands: Iterable[str], cwd: Path, run_id: str) -> List[Dict[str, Any]]:
@@ -9194,20 +11671,84 @@ def verification_results(commands: Iterable[str], cwd: Path, run_id: str) -> Lis
     environment = verification_environment(run_id)
     project_name = environment["COMPOSE_PROJECT_NAME"]
     uses_compose = False
+    failed_compose_build: Optional[Dict[str, Any]] = None
     try:
-        for command in commands:
+        for command_index, command in enumerate(commands, start=1):
             ensure_job_active()
-            uses_compose = uses_compose or command.startswith("docker compose ")
-            add_event(run_id, f"验收：{command}（Compose 项目 {project_name}）")
+            action = verification_command_action(command)
+            uses_compose = uses_compose or bool(action)
+            if action in {"run", "up"} and failed_compose_build is not None:
+                skipped = {
+                    "command": command,
+                    "exit_code": -2,
+                    "output": (
+                        "前置 docker compose build 未成功；为避免隐式重复构建，"
+                        "本条验收未执行。"
+                    ),
+                    "compose_project": project_name,
+                    "failure_kind": failed_compose_build["failure_kind"],
+                    "skipped": True,
+                    "blocked_by": failed_compose_build["command"],
+                }
+                results.append(skipped)
+                update_run(run_id, status_detail=f"验收已跳过：{command}")
+                add_event(
+                    run_id,
+                    f"验收已跳过：{command}；前置 Compose 构建未成功，避免重复构建",
+                    "warning",
+                )
+                continue
+            command_environment = environment.copy()
+            environment_overrides: Dict[str, str] = {}
+            if (
+                action == "build"
+                and not verification_command_explicitly_selects_profile(command)
+            ):
+                # A bare Compose build omits services behind profiles. Build all
+                # declared images here so a later `compose run verify` does not
+                # start a cold build under the shorter command timeout.
+                command_environment["COMPOSE_PROFILES"] = "*"
+                environment_overrides["COMPOSE_PROFILES"] = "*"
+            profile_note = (
+                "，已激活所有 Compose profiles"
+                if environment_overrides
+                else ""
+            )
+            add_event(
+                run_id,
+                f"验收：{command}（Compose 项目 {project_name}{profile_note}）",
+            )
+            timeout = verification_command_timeout(command)
+            log_path = verification_log_path(run_id, command_index, command)
+            started_at = time.monotonic()
+
+            def report_progress(output: str, elapsed: int, current_command: str = command) -> None:
+                update_run(
+                    run_id,
+                    status_detail=(
+                        f"交付验收进行中（{format_elapsed_seconds(elapsed)}）："
+                        f"{current_command} · {verification_progress_excerpt(output)}"
+                    ),
+                )
+
+            update_run(
+                run_id,
+                status_detail=(
+                    f"交付验收进行中：{command}（最长 "
+                    f"{format_elapsed_seconds(timeout)}{profile_note}）"
+                ),
+            )
             try:
                 completed = run_cancellable_subprocess(
                     ["/bin/zsh", "-lc", command],
                     cwd,
-                    environment,
-                    15 * 60,
+                    command_environment,
+                    timeout,
+                    progress_callback=report_progress,
+                    output_path=log_path,
                 )
                 combined = (completed.stdout + "\n" + completed.stderr).strip()
-                results.append({
+                result = {
                     "command": command,
                     "exit_code": completed.returncode,
                     "output": combined[-8000:],
@@ -9216,15 +11757,45 @@ def verification_results(commands: Iterable[str], cwd: Path, run_id: str) -> Lis
                         "none" if completed.returncode == 0
                         else verification_failure_kind(combined)
                     ),
-                })
-            except subprocess.TimeoutExpired:
-                results.append({
+                    "elapsed_seconds": int(time.monotonic() - started_at),
+                }
+                if environment_overrides:
+                    result["environment_overrides"] = environment_overrides
+                results.append(result)
+                if action == "build":
+                    failed_compose_build = None if completed.returncode == 0 else result
+                level = "success" if completed.returncode == 0 else "warning"
+                add_event(
+                    run_id,
+                    f"验收结束：{command}（退出码 {completed.returncode}，"
+                    f"用时 {format_elapsed_seconds(result['elapsed_seconds'])}）",
+                    level,
+                )
+            except subprocess.TimeoutExpired as exc:
+                partial = str(exc.output or exc.stdout or "").strip()
+                timeout_text = format_elapsed_seconds(timeout)
+                result = {
                     "command": command,
                     "exit_code": -1,
-                    "output": "执行超过 15 分钟，已停止",
+                    "output": (
+                        f"执行超过 {timeout_text}，已停止"
+                        + (f"\n\n超时前输出：\n{partial[-7600:]}" if partial else "")
+                    ),
                     "compose_project": project_name,
                     "failure_kind": "environment",
-                })
+                    "elapsed_seconds": int(time.monotonic() - started_at),
+                    "timed_out": True,
+                }
+                if environment_overrides:
+                    result["environment_overrides"] = environment_overrides
+                results.append(result)
+                if action == "build":
+                    failed_compose_build = result
+                add_event(
+                    run_id,
+                    f"验收超时：{command}（{timeout_text}）；已保留超时前输出",
+                    "warning",
+                )
     finally:
         if uses_compose:
             try:
@@ -9286,6 +11857,15 @@ def evaluation_schema() -> Dict[str, Any]:
         "required": ["score", "description"],
         "additionalProperties": False,
     }
+
+    def five_strings(max_length: int) -> Dict[str, Any]:
+        return {
+            "type": "array",
+            "items": {"type": "string", "minLength": 1, "maxLength": max_length},
+            "minItems": len(EVALUATION_DIMENSION_KEYS),
+            "maxItems": len(EVALUATION_DIMENSION_KEYS),
+        }
+
     return {
         "type": "object",
         "properties": {
@@ -9305,10 +11885,28 @@ def evaluation_schema() -> Dict[str, Any]:
             "reasoning": score,
             "execution": score,
             "other_issues": {"type": "string"},
+            "score_stage_version": {"type": "integer", "enum": [2]},
+            "scores": {
+                "type": "array",
+                "items": {"type": "integer", "minimum": 1, "maximum": 5},
+                "minItems": len(EVALUATION_DIMENSION_KEYS),
+                "maxItems": len(EVALUATION_DIMENSION_KEYS),
+            },
+            "descriptions": five_strings(600),
+            "other": {"type": "string", "maxLength": 600},
+            "when": five_strings(EVALUATION_SCORE_STAGE_PROSE_LIMITS["when"]),
+            "behavior": five_strings(EVALUATION_SCORE_STAGE_PROSE_LIMITS["behavior"]),
+            "impact": five_strings(EVALUATION_SCORE_STAGE_PROSE_LIMITS["impact"]),
+            "expected": five_strings(EVALUATION_SCORE_STAGE_PROSE_LIMITS["expected"]),
+            "evidenceRefs": five_strings(2000),
+            "processFindings": {"type": "string", "minLength": 1, "maxLength": 3500},
+            "artifactFindings": {"type": "string", "minLength": 1, "maxLength": 2000},
         },
         "required": [
             "task_type", "task_difficulty", "language_framework", "environment_reproducibility",
             "delivery", "instruction_following", "planning", "reasoning", "execution", "other_issues",
+            "score_stage_version", "scores", "descriptions", "other", "when", "behavior",
+            "impact", "expected", "evidenceRefs", "processFindings", "artifactFindings",
         ],
         "additionalProperties": False,
     }
@@ -9428,9 +12026,22 @@ def validate_nonfull_evaluation_description(
             for sentence in problem_sentences
         )
     else:
+        description_has_position = bool(
+            EVALUATION_POSITION_EVIDENCE_RE.search(description)
+        )
         located_problem = any(
             EVALUATION_POSITION_EVIDENCE_RE.search(sentence)
             for sentence in problem_sentences
+        ) or (
+            description_has_position
+            and any(
+                re.search(
+                    r"(?:这一|该)(?:项|个|处|次|具体)?"
+                    r"(?:改动|修改|操作|调用|步骤|做法)",
+                    sentence,
+                )
+                for sentence in problem_sentences
+            )
         )
     if not located_problem:
         raise WorkflowError(
@@ -9467,8 +12078,56 @@ def evaluation_description_sentences(value: Any) -> List[str]:
 def evaluation_full_score_deficiency(description: str) -> str:
     """Return a concrete self-attributed deficiency that contradicts 5 points."""
     for sentence in evaluation_description_sentences(description):
-        if any(pattern.search(sentence) for pattern in EVALUATION_FULL_SCORE_DEFICIENCY_PATTERNS):
-            return sentence
+        # Product requirements often discuss a validation-error label moving,
+        # persisting or being restored.  Treat the label as a business object;
+        # only an actual mistaken action (for example “错误修改…随后修复”)
+        # is a scoring deficiency.
+        deficiency_candidate = EVALUATION_NON_DEFICIENCY_ERROR_LABEL_RE.sub(
+            "校验提示",
+            sentence,
+        )
+        explicit_deficiency = any(
+            pattern.search(deficiency_candidate)
+            for pattern in EVALUATION_FULL_SCORE_DEFICIENCY_PATTERNS
+        )
+        recovered_rework = EVALUATION_FULL_SCORE_RECOVERED_REWORK_RE.search(
+            deficiency_candidate
+        )
+        if not explicit_deficiency and not recovered_rework:
+            continue
+        if EVALUATION_EXPECTED_CONTRACT_RE.search(sentence):
+            continue
+        if EVALUATION_NONCURRENT_FACT_RE.search(sentence):
+            continue
+        if recovered_rework and not explicit_deficiency:
+            recovery_context = recovered_rework.group(0)
+            has_environment_context = any(
+                pattern.search(recovery_context)
+                for _, pattern in EVALUATION_NON_DEDUCTIBLE_ENVIRONMENT_PATTERNS
+            ) or bool(
+                EVALUATION_FULL_SCORE_RECOVERED_ENVIRONMENT_RE.search(
+                    recovery_context
+                )
+            )
+            if not has_environment_context:
+                prefix = deficiency_candidate[
+                    max(0, recovered_rework.start() - 64):recovered_rework.start()
+                ]
+                has_environment_reference = any(
+                    pattern.search(prefix)
+                    for _, pattern in EVALUATION_NON_DEDUCTIBLE_ENVIRONMENT_PATTERNS
+                ) or bool(
+                    EVALUATION_FULL_SCORE_RECOVERED_ENVIRONMENT_RE.search(prefix)
+                )
+                has_environment_context = has_environment_reference and bool(
+                    re.search(
+                        r"(?:因为|由于|导致|使得?|造成|因此|所以|因而)[^，；。]{0,32}$",
+                        prefix,
+                    )
+                )
+            if has_environment_context:
+                continue
+        return sentence
     return ""
 
 
@@ -9647,13 +12306,6 @@ def normalize_evaluation(
                 f"自动检查的 {key} 描述不能出现 AI 身份、工具或模型名称："
                 f"{identity_reference}"
             )
-        if key == "execution":
-            command_reference = evaluation_command_references(item["description"])
-            if command_reference:
-                raise WorkflowError(
-                    "自动检查的执行能力描述不能出现通用命令名称："
-                    f"{command_reference[0]}"
-                )
         validate_evaluation_score_description_consistency(
             key,
             score,
@@ -9666,7 +12318,9 @@ def normalize_evaluation(
             expected_turn_number,
             enforce_generation_detail_policy=enforce_generation_detail_policy,
         )
-        item["description"] = naturalize_evaluation_description(item["description"])
+        item["description"] = strip_evaluation_description_backticks(
+            naturalize_evaluation_description(item["description"])
+        )
     evaluation["language_framework"] = normalize_frameworks(evaluation.get("language_framework"))
     evaluation["other_issues"] = re.sub(r"\s+", " ", str(evaluation.get("other_issues") or "")).strip()
     return evaluation
@@ -9675,12 +12329,26 @@ def normalize_evaluation(
 def evaluation_command_references(text: Any) -> List[str]:
     """Extract shell commands that a score description presents as evidence."""
     source = str(text or "")
-    references = [
-        re.sub(r"\s+", " ", match.group(0)).strip(" `\"'.,;:")
-        for match in EVALUATION_COMMAND_REFERENCE_RE.finditer(source)
-    ]
+    references: List[str] = []
+    for match in EVALUATION_COMMAND_REFERENCE_RE.finditer(source):
+        reference = re.sub(r"\s+", " ", match.group(0)).strip(" `\"'.,;:")
+        # “Vitest 31 项 / Playwright 9 个场景” describes a result count,
+        # not a shell invocation with a numeric argument.  Keep command
+        # grounding strict for real command lines while avoiding this common
+        # Chinese prose false positive.
+        following = source[match.end():]
+        if (
+            re.fullmatch(r"[A-Za-z./-]+\s+\d+", reference)
+            and re.match(r"\s*(?:项|条|个|组|场景|用例|文件)", following)
+        ):
+            continue
+        references.append(reference)
     command_names = {name.casefold() for name in EVALUATION_COMMAND_NAMES}
-    for code_span in re.findall(r"`([^`\r\n]+)`", source):
+    quoted_spans = [
+        next((group for group in match.groups() if group), "")
+        for match in EVALUATION_QUOTED_EVIDENCE_RE.finditer(source)
+    ]
+    for code_span in quoted_spans:
         normalized = re.sub(r"\s+", " ", code_span).strip().casefold()
         if normalized in command_names:
             references.append(normalized)
@@ -9723,16 +12391,30 @@ def trajectory_executed_commands(trajectory: str) -> List[str]:
 
 
 def trajectory_evaluation_evidence(trajectory: str) -> Tuple[str, str, List[str]]:
-    """Return read-only tool evidence without changing the saved trajectory."""
+    """Return source evidence, direct outputs, and tool-call lines."""
     tool_lines: List[str] = []
     result_lines: List[str] = []
     call_lines: List[str] = []
+    in_result_block = False
     for raw_line in str(trajectory or "").splitlines():
         line = raw_line.strip()
         if line.startswith(("TOOL ", "CALL ")) and not line.startswith("TOOL RESULT"):
+            in_result_block = False
             tool_lines.append(line)
             call_lines.append(line)
         elif line.startswith("TOOL RESULT") or line.startswith("RESULT:"):
+            in_result_block = True
+            tool_lines.append(line)
+            result_lines.append(line)
+        elif line.startswith(("ASSISTANT:", "ASSISTANT FINAL:", "USER[")):
+            in_result_block = False
+            # Public completion claims and prompt obligations are source facts too.
+            # Keep them out of direct_result_text so they cannot prove tool effects.
+            tool_lines.append(line)
+        elif in_result_block and line:
+            # Compact trajectories keep the first output line behind TOOL RESULT
+            # and subsequent output lines unprefixed.  Preserve the whole block so
+            # exact failures, counts, and status codes remain groundable.
             tool_lines.append(line)
             result_lines.append(line)
     return "\n".join(tool_lines), "\n".join(result_lines), call_lines
@@ -9781,8 +12463,10 @@ def evaluation_trace_grounding_issues(
     evaluation: Dict[str, Any],
     trajectory: str,
     verification: Any = "",
+    *,
+    supplemental_evidence: Any = "",
 ) -> List[str]:
-    """Ground negative process claims in existing trace/check output only."""
+    """Ground claims in trace/check output and separately trusted evidence."""
     labels = {
         "delivery": "交付完整性",
         "instruction_following": "指令遵循",
@@ -9796,7 +12480,14 @@ def evaluation_trace_grounding_issues(
         if isinstance(verification, str)
         else json.dumps(verification, ensure_ascii=False)
     )
-    evidence_text = compact_evaluation_evidence(f"{tool_text}\n{verification_text}")
+    supplemental_text = (
+        supplemental_evidence
+        if isinstance(supplemental_evidence, str)
+        else json.dumps(supplemental_evidence, ensure_ascii=False)
+    )
+    evidence_text = compact_evaluation_evidence(
+        f"{tool_text}\n{verification_text}\n{supplemental_text}"
+    )
     direct_result_text = compact_evaluation_evidence(
         f"{result_text}\n{verification_text}"
     )
@@ -9877,7 +12568,11 @@ def evaluation_trace_grounding_issues(
                     if issues:
                         break
 
-            sentence_without_turn = re.sub(r"第\s*\d+\s*轮", "", sentence)
+            sentence_without_turn = re.sub(
+                r"第\s*\d+\s*(?:轮|步(?:操作|调用)?)",
+                "",
+                sentence,
+            )
             number_claims = re.findall(
                 r"(?<![A-Za-z0-9])\d+(?:\.\d+)?(?![A-Za-z0-9])",
                 sentence_without_turn,
@@ -9943,11 +12638,14 @@ def validate_evaluation_trace_grounding(
     evaluation: Dict[str, Any],
     trajectory: str,
     verification: Any = "",
+    *,
+    supplemental_evidence: Any = "",
 ) -> None:
     issues = evaluation_trace_grounding_issues(
         evaluation,
         trajectory,
         verification,
+        supplemental_evidence=supplemental_evidence,
     )
     if issues:
         raise WorkflowError(issues[0])
@@ -9997,7 +12695,9 @@ def trace_shell_result_records(trajectory: str) -> List[Tuple[str, str]]:
                     command = str(payload.get("command") or payload.get("cmd") or "")
             continue
         if result_lines is not None:
-            if line.startswith(("ASSISTANT:", "USER[", "...原始叙述")):
+            if line.startswith(
+                ("ASSISTANT:", "ASSISTANT FINAL:", "USER[", "...原始叙述")
+            ):
                 flush()
                 command = ""
             else:
@@ -10173,7 +12873,15 @@ def validate_evaluation_final_verification_consistency(
         if not isinstance(item, dict):
             continue
         description = str(item.get("description") or "")
-        terminal_matches = list(EVALUATION_TERMINAL_FAILURE_RE.finditer(description))
+        terminal_matches = []
+        for match in EVALUATION_TERMINAL_FAILURE_RE.finditer(description):
+            prefix = description[max(0, match.start() - 36):match.start()]
+            match_context = description[max(0, match.start() - 36):match.end()]
+            if EVALUATION_NEGATED_TERMINAL_FAILURE_PREFIX_RE.search(prefix):
+                continue
+            if EVALUATION_NEGATED_TERMINAL_FAILURE_MATCH_RE.search(match_context):
+                continue
+            terminal_matches.append(match)
         if not terminal_matches:
             continue
         scopes = evaluation_description_scopes(description)
@@ -10205,10 +12913,48 @@ def validate_evaluation_final_verification_consistency(
             )
 
 
+def verification_executed_commands(verification: Any) -> List[str]:
+    """Collect commands recorded by the independent acceptance runner."""
+    value = verification
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return evaluation_command_references(value)
+    commands: List[str] = []
+
+    def visit(item: Any) -> None:
+        if isinstance(item, dict):
+            if item.get("skipped") is True:
+                return
+            for key, nested in item.items():
+                if key in {"command", "cmd"}:
+                    commands.extend(evaluation_command_references(nested))
+                    normalized = re.sub(r"\s+", " ", str(nested or "")).strip().casefold()
+                    if normalized in {name.casefold() for name in EVALUATION_COMMAND_NAMES}:
+                        commands.append(normalized)
+                else:
+                    visit(nested)
+        elif isinstance(item, list):
+            for nested in item:
+                visit(nested)
+
+    visit(value)
+    return list(dict.fromkeys(command for command in commands if command))
+
+
+def evaluation_reference_sentence(description: str, reference: str) -> str:
+    for sentence in evaluation_description_sentences(description):
+        if reference.casefold() in sentence.casefold():
+            return sentence
+    return description
+
+
 def evaluation_trace_command_issues(
-    evaluation: Dict[str, Any], trajectory: str
+    evaluation: Dict[str, Any], trajectory: str, verification: Any = ""
 ) -> List[str]:
     executed = trajectory_executed_commands(trajectory)
+    independently_executed = verification_executed_commands(verification)
     labels = {
         "delivery": "交付完整性",
         "instruction_following": "指令遵循",
@@ -10226,65 +12972,63 @@ def evaluation_trace_command_issues(
                 for actual in executed
             ):
                 continue
+            if any(
+                actual == reference or actual.startswith(f"{reference} ")
+                for actual in independently_executed
+            ):
+                sentence = evaluation_reference_sentence(description, reference)
+                if EVALUATION_REVIEW_ATTRIBUTION_RE.search(sentence):
+                    continue
+                issues.append(
+                    f"{label}描述引用了后续验收命令但没有注明来源：{reference}"
+                )
+                continue
             issues.append(f"{label}描述引用了本轮轨迹中未执行的命令：{reference}")
     return issues
 
 
 def validate_evaluation_trace_commands(
-    evaluation: Dict[str, Any], trajectory: str
+    evaluation: Dict[str, Any], trajectory: str, verification: Any = ""
 ) -> None:
-    issues = evaluation_trace_command_issues(evaluation, trajectory)
+    issues = evaluation_trace_command_issues(evaluation, trajectory, verification)
     if issues:
         raise WorkflowError(issues[0])
 
 
-def remove_unverified_evaluation_command_references(
+def validate_false_success_claim(
     evaluation: Dict[str, Any], trajectory: str
-) -> List[str]:
-    """Replace review-only command names before an evaluation is persisted.
-
-    The reviewer also sees commands executed by the console in an isolated
-    verification workspace. Those commands are valid review evidence, but
-    they must not be described as actions from the Claude turn unless the
-    command also appears in that turn's trajectory.
-    """
-    executed = trajectory_executed_commands(trajectory)
-    removed: List[str] = []
-    for key in (
-        "delivery",
-        "instruction_following",
-        "planning",
-        "reasoning",
-        "execution",
-    ):
+) -> None:
+    """Require a real user-facing completion claim before calling success false."""
+    assistant_lines = [
+        line.removeprefix("ASSISTANT FINAL:").strip()
+        for line in str(trajectory or "").splitlines()
+        if line.startswith("ASSISTANT FINAL:")
+    ]
+    completion_claims = [
+        line for line in assistant_lines if EVALUATION_COMPLETION_CLAIM_RE.search(line)
+    ]
+    labels = {
+        "delivery": "交付完整性",
+        "instruction_following": "指令遵循",
+        "planning": "任务规划",
+        "reasoning": "推理能力",
+        "execution": "执行能力",
+    }
+    for key, label in labels.items():
         item = evaluation.get(key)
-        if not isinstance(item, dict):
+        description = str(item.get("description") or "") if isinstance(item, dict) else ""
+        if not EVALUATION_FALSE_SUCCESS_RE.search(description):
             continue
-        description = str(item.get("description") or "")
-        for reference in evaluation_command_references(description):
-            if any(
-                actual == reference or actual.startswith(f"{reference} ")
-                for actual in executed
-            ):
-                continue
-            escaped = re.escape(reference)
-            description = re.sub(
-                rf"`\s*{escaped}\s*`",
-                "验收检查",
-                description,
-                flags=re.I,
+        if not completion_claims:
+            raise WorkflowError(
+                f"自动检查的{label}描述判定虚假成功，但本轮没有面向使用者的实际完成声明"
             )
-            description = re.sub(escaped, "验收检查", description, flags=re.I)
-            removed.append(reference)
-        item["description"] = re.sub(
-            r"验收检查(?:\s*(?:、|和|及|与)\s*验收检查)+",
-            "验收检查",
-            description,
-        )
-        item["description"] = re.sub(
-            r"\s*验收检查\s*", "验收检查", item["description"]
-        )
-    return list(dict.fromkeys(removed))
+        if not re.search(r"宣称|声称|回复|表示", description) or not re.search(
+            r"实际|但|然而|却|相反", description
+        ):
+            raise WorkflowError(
+                f"自动检查的{label}描述判定虚假成功，但没有对照完成声明与实际产物"
+            )
 
 
 def retryable_review_output_error(detail: str) -> bool:
@@ -10294,9 +13038,13 @@ def retryable_review_output_error(detail: str) -> bool:
         marker in message
         for marker in (
             "描述引用了本轮轨迹中未执行的命令",
+            "描述引用了后续验收命令但没有注明来源",
+            "描述判定虚假成功，但本轮没有面向使用者的实际完成声明",
+            "描述判定虚假成功，但没有对照完成声明与实际产物",
             "描述包含模板化措辞",
             "描述包含高风险公共片段",
-            "执行能力描述不能出现通用命令名称",
+            "描述与历史点评",
+            "描述使用通用轮次开头",
             "非满分描述需要至少两个完整句子",
             "非满分描述未写明第",
             "非满分描述第一句未写明第",
@@ -10318,6 +13066,7 @@ def retryable_review_output_error(detail: str) -> bool:
             "描述中的架构判断缺少本轮轨迹里的报错或检查输出原文",
             "描述与本轮最后一次检查结果矛盾",
             "评分描述定向修正未能收敛",
+            "评分描述定向修正未能同步评分版本 2",
             "描述包含不易理解的原始数字数组",
             "描述不能出现 AI 身份、工具或模型名称",
         )
@@ -10495,25 +13244,124 @@ def run_codex_evaluation_dimension_repair(
     dimension_label: str,
     turn_number: int,
     validation_error: str,
+    *,
+    supplemental_evidence: str = "",
+    history_exclude_turn_key: str = "",
+    history_exclude_remote_id: str = "",
+    preserve_score: bool = False,
 ) -> Dict[str, Any]:
     """Repair one rejected dimension without reopening code review."""
     item = evaluation.get(dimension_key)
     if not isinstance(item, dict):
         raise WorkflowError(f"缺少{dimension_label}评分，无法定向修正描述")
+    score_stage_v2 = evaluation.get("score_stage_version") == 2
+    dimension_index = EVALUATION_DIMENSION_KEYS.index(dimension_key)
+    current_detail: Dict[str, str] = {}
+    if score_stage_v2:
+        for field in EVALUATION_SCORE_STAGE_DETAIL_FIELDS:
+            values = evaluation.get(field)
+            if isinstance(values, list) and len(values) == len(EVALUATION_DIMENSION_KEYS):
+                current_detail[field] = str(values[dimension_index])
+        current_detail["processFindings"] = str(
+            evaluation.get("processFindings") or ""
+        )
     verification_text = json.dumps(verification, ensure_ascii=False)
     if len(verification_text) > 24000:
         verification_text = verification_text[-24000:]
     final_verification_summary = trajectory_final_verification_summary(trajectory)
-    prompt = f"""只修正第 {turn_number} 轮“{dimension_label}”这一项，不改其他四个维度，也不重新判断代码是否通过。现有分数是 {int(item.get('score') or 0)} 分，通常保持不变，但分数和描述必须一致：5 分只能写有真实核对或验收依据的正向事实，不能同时保留错误、遗漏、失误或返工；材料确实证明当前维度发生过这些问题时应降低分数，不属于当前维度时不要混写。低于 5 分时，请依据原题面、已有描述、验收结果和本轮操作轨迹，把真实存在的不足、客观证据及实际影响写成容易看懂的至少两个完整句子；这些内容可以分布在整段中，不必全部塞进第一句。必须写明第 {turn_number} 轮，并把不足定位到材料中真实存在的具体步骤、文件、函数、接口、日志或报错。不能添加材料中不存在的失败、修改动作、测试结果或因果关系；“重复”“多次”要写出可核对次数，状态清空、内容覆盖或架构不匹配必须引用直接输出。若材料没有支持额外细节，应把该项改评 5 分，不能推测或编造。直接写发生的动作和结果，不要出现“用户”这类泛化主语，也不要出现 AI、AI 浏览器、AI Agent、AI 模型、Codex、GPT、Claude Code 等身份、工具或模型名称，或用“模型认为”“模型完成了”一类主语。不要写命令名称、评分工具或内部校验过程，也不要抄写原始数字数组；把数组表达的含义改成容易理解的业务结果。
+    evaluation_rubric = evaluation_rubric_text()
+    review_evidence_context = (
+        "\n已经保存的独立代码复核证据字段：\n"
+        f"{supplemental_evidence}\n"
+        if supplemental_evidence
+        else ""
+    )
+    score_stage_instruction = ""
+    score_stage_context = ""
+    novelty_repair = any(
+        marker in validation_error
+        for marker in ("描述与历史点评", "描述使用通用轮次开头")
+    )
+    novelty_instruction = ""
+    if novelty_repair:
+        novelty_instruction = """
+这是查重返修。不要使用跨项目常见的收尾句式，包括“原作业最后记录”“后续独立验收”“没有发现可稳定复现的业务错误”“没有发现明确要求遗漏或无关范围扩展”“没有留下交付缺口”。必须用本项目独有的文件、函数、接口、页面动作或报错组织整段，并以本项目特有的可见结果结束；任意连续公共片段都应控制在 18 个字以内。
+"""
+    score_lock_instruction = ""
+    if preserve_score:
+        score_lock_instruction = f"""
+这是已完成记录的资料文字修复，不是重新评分。score 必须保持为 {int(item.get('score') or 0)}；不得通过删掉已有材料支持的真实不足来维持分数。如果现有分数与真实事实无法同时成立，应保留事实，让本次修复失败并转人工处理。
+"""
+    score_decision_guidance = (
+        f"现有分数是 {int(item.get('score') or 0)} 分且必须保持不变。"
+        "只修正文字与证据表达；若真实事实无法支持原分数，不得删改事实来强行通过。"
+        if preserve_score
+        else (
+            f"现有分数是 {int(item.get('score') or 0)} 分，通常保持不变，但分数和描述必须一致："
+            "5 分必须写有真实核对或验收依据的完成事实；材料确实证明当前维度发生过错误、"
+            "遗漏、失误或返工时应降低分数，不属于当前维度的历史问题、环境故障或正常输入"
+            "拦截则应交代来源与结果，不能靠删词掩盖。"
+        )
+    )
+    full_score_consistency_instruction = (
+        f"""如果未通过原因是满分描述写入了失败或返工，先判断该事实是否属于“{dimension_label}”。这是已完成记录的锁分修复，score 必须保持为 {int(item.get('score') or 0)}：只属于其他维度时，改用当前维度自身的真实依据；确实属于当前维度且无法与原分一致时，保留事实并让本次复检转人工，不得降低分数，也不得删掉真实不足来强行通过。"""
+        if preserve_score
+        else f"""如果未通过原因是满分描述写入了失败或返工，先判断该事实是否属于“{dimension_label}”：属于当前维度就降低分数并保留具体事实；只属于其他维度就保持当前维度的正确分数，改用当前维度自身的真实依据，相关失败仍由其所属维度保留，不能为了通过检查把事实从所有维度删除。"""
+    )
+    history_entries = historical_evaluation_descriptions(
+        dimension_key,
+        exclude_turn_key=history_exclude_turn_key,
+        exclude_remote_id=history_exclude_remote_id,
+    )
+    history_context = ""
+    if history_entries:
+        history_lines = []
+        for history_item in history_entries:
+            history_description = str(history_item["description"])
+            if len(history_description) > EVALUATION_HISTORY_DESCRIPTION_LIMIT:
+                history_description = (
+                    history_description[:EVALUATION_HISTORY_DESCRIPTION_LIMIT] + "…"
+                )
+            history_lines.append(
+                f"- {history_item['reference']}：{history_description}"
+            )
+        history_context = (
+            "\n以下是当前账号最近同维度的已交付点评，只用于避开重复表达，"
+            "绝不能当成本轮事实或证据。请改变开头主体、句序和证据组织，"
+            "不要复制连续片段，也不要只替换项目名或数字：\n"
+            + "\n".join(history_lines)
+            + "\n"
+        )
+    if score_stage_v2:
+        score_stage_instruction = f"""
+本记录使用评分版本 2。除 score 和 description 外，还必须为“{dimension_label}”重新返回 when、behavior、impact、expected、evidenceRefs 和 processFinding；这些字段必须与修正后的分数、描述和同一份证据一致。when 仍以“第 {turn_number} 轮第 N 步操作”或“第 {turn_number} 轮第 N 步调用”开头；processFinding 必须以“{dimension_label}=N分”开头，其中 N 等于修正后的 score，并说明事实及相邻档差别。不要改写其他四个维度。
+"""
+        score_stage_context = (
+            "\n当前维度的评分版本 2 内部证据：\n"
+            f"{json.dumps(current_detail, ensure_ascii=False)}\n"
+        )
+    prompt = f"""材料已经备齐；不得调用 shell、浏览器、网络、文件读取或其他工具，不得再次检查仓库，只按下方材料直接输出 schema JSON。
+
+只修正第 {turn_number} 轮“{dimension_label}”这一项，不改其他四个维度，也不重新判断代码是否通过。{score_decision_guidance}低于 5 分时，请依据原题面、已有描述、验收结果和本轮操作轨迹，把真实存在的不足、客观证据及实际影响写成容易看懂的至少两个完整句子；这些内容可以分布在整段中，不必全部塞进第一句。必须写明第 {turn_number} 轮，并把不足定位到材料中真实存在的具体步骤、工具调用动作、文件、函数、接口、命令、日志或报错。低于 5 分时还必须逐字引用至少一个材料中真实出现的完整文件名或路径、函数名、接口路径、命令或报错原文；只写“第 N 步”、测试数量或“HTTP 请求”不算客观证据。开头必须从本项目独有业务对象或真实动作切入，不能以“第 {turn_number} 轮”“本轮”“本次”“此次”起句；轮次放到后文即可。命令只能引用原作业轨迹或验收材料中真实出现的内容；引用验收材料里的命令时必须在同一句明确写“后续独立验收”，不能冒充原作业已经执行。不能添加材料中不存在的失败、修改动作、测试结果或因果关系；测试套件、前后端与通过数量的对应关系必须保持和材料一致，不能交换数字归属。“重复”“多次”要写出可核对次数，状态清空、内容覆盖或架构不匹配必须引用直接输出。若材料没有支持额外细节，在新评分阶段应把该项改评 5 分；已完成记录的锁分修复则应停止并转人工，不能推测、编造或删除真实不足。直接写发生的动作和结果，不要出现“用户”这类泛化主语，也不要出现 AI、AI 浏览器、AI Agent、AI 模型、Codex、GPT、Claude Code 等身份、工具或模型名称，或用“模型认为”“模型完成了”一类主语。不要写评分工具或内部校验过程，也不要抄写原始数字数组；把数组表达的含义改成容易理解的业务结果。
+
+如果本次未通过原因是与历史点评重复或使用通用轮次开头，只能重新组织措辞，score 必须保持为 {int(item.get('score') or 0)}；要更换开头主体、句序和证据组织，不能只做同义词替换。
+{novelty_instruction}
+{score_lock_instruction}
+
+{full_score_consistency_instruction}
+{score_stage_instruction}
 
 环境、网络、权限、系统解释器、包管理器和系统运行库问题不能作为任何维度的扣分依据，也不要在非满分描述里重复这些环境现象。确有执行不足时，只写材料中真实存在的错误命令、错误修改、冗余调用或遗漏步骤及其后果；找不到这类证据时，不得用环境问题替代。
 
-同类检查后出现的结果覆盖早期结果。如果下方最后结果已经通过，只能把早期失败写成已经恢复的过程，不能再写成最终仍失败、未复验或缺少通过记录。
+{EVALUATION_FACT_ATTRIBUTION_GUIDANCE}
+
+同类检查后出现的结果只覆盖最终状态。如果下方最后结果已经通过，只能把早期失败写成已经恢复的过程，不能再写成最终仍失败、未复验或缺少通过记录；原作业真实发生的失败调用、返工和虚假完成声明仍须保留并按所属维度评价。
 
 本次未通过原因：{validation_error}
 
 现有描述：
 {str(item.get('description') or '')}
+{score_stage_context}
 
 本轮 User Prompt：
 {current_prompt}
@@ -10524,12 +13372,16 @@ def run_codex_evaluation_dimension_repair(
 本轮最后一次检查结果：
 {final_verification_summary}
 
+{review_evidence_context}
+{history_context}
+
 本轮操作轨迹：
 {trajectory or '未取得轨迹内容'}
 """
-    result = run_codex_structured(
-        prompt,
-        {
+    repair_schema = (
+        evaluation_split_dimension_schema(dimension_key)
+        if score_stage_v2
+        else {
             "type": "object",
             "properties": {
                 "score": {"type": "integer", "minimum": 1, "maximum": 5},
@@ -10537,12 +13389,17 @@ def run_codex_evaluation_dimension_repair(
             },
             "required": ["score", "description"],
             "additionalProperties": False,
-        },
-        repo_path,
-        f"{dimension_key}-description-repair",
-        20 * 60,
-        sandbox="read-only",
+        }
     )
+    with evaluation_split_slot(current_job_key()):
+        result = run_codex_structured(
+            prompt,
+            repair_schema,
+            repo_path,
+            f"{dimension_key}-description-repair",
+            20 * 60,
+            sandbox="read-only",
+        )
     description = re.sub(r"\s+", " ", str(result.get("description") or "")).strip()
     if not description:
         raise WorkflowError(f"{dimension_label}定向修正没有返回描述")
@@ -10552,7 +13409,118 @@ def run_codex_evaluation_dimension_repair(
         raise WorkflowError(f"{dimension_label}定向修正返回了无效分数") from exc
     if score not in range(1, 6):
         raise WorkflowError(f"{dimension_label}定向修正返回了无效分数")
-    return {"score": score, "description": description}
+    if novelty_repair and score != int(item.get("score") or 0):
+        raise WorkflowError(
+            f"{dimension_label}避重修正只能改写描述，不能改变分数"
+        )
+    if preserve_score and score != int(item.get("score") or 0):
+        raise WorkflowError(
+            f"{dimension_label}资料文字自动修复不能改变原分数"
+        )
+    repaired: Dict[str, Any] = {"score": score, "description": description}
+    if score_stage_v2:
+        for field in EVALUATION_SCORE_STAGE_DETAIL_FIELDS:
+            field_value = re.sub(r"\s+", " ", str(result.get(field) or "")).strip()
+            if not field_value:
+                raise WorkflowError(
+                    f"评分描述定向修正未能同步评分版本 2 的 {field}"
+                )
+            repaired[field] = field_value
+        process_finding = re.sub(
+            r"\s+", " ", str(result.get("processFinding") or "")
+        ).strip(" ；;")
+        if not re.match(
+            rf"^{re.escape(dimension_label)}\s*=\s*{score}\s*分(?:\s*[；;]|$)",
+            process_finding,
+        ):
+            raise WorkflowError(
+                "评分描述定向修正未能同步评分版本 2 的 processFinding 分数"
+            )
+        repaired["processFinding"] = process_finding
+    return repaired
+
+
+def replace_evaluation_process_finding(
+    value: Any,
+    dimension_key: str,
+    replacement: str,
+) -> str:
+    """Replace one dimension section in the combined v2 process ledger."""
+    source = str(value or "")
+    section_starts: Dict[str, int] = {}
+    for key in EVALUATION_DIMENSION_KEYS:
+        label = EVALUATION_DIMENSION_LABELS[key]
+        match = re.search(
+            rf"(?:^|[；;]){re.escape(label)}\s*=\s*[1-5]\s*分",
+            source,
+        )
+        if match:
+            section_starts[key] = match.start() + (
+                1 if source[match.start():match.start() + 1] in {"；", ";"} else 0
+            )
+    if dimension_key not in section_starts:
+        raise WorkflowError(
+            "评分描述定向修正未能同步评分版本 2 的 processFindings"
+        )
+    start = section_starts[dimension_key]
+    later_starts = [position for position in section_starts.values() if position > start]
+    end = min(later_starts) - 1 if later_starts else len(source)
+    return f"{source[:start]}{replacement}{source[end:]}"
+
+
+def apply_evaluation_dimension_repair(
+    evaluation: Dict[str, Any],
+    dimension_key: str,
+    repaired: Dict[str, Any],
+) -> None:
+    """Apply one repair while keeping every v2 dimension mirror consistent."""
+    score = int(repaired["score"])
+    description = str(repaired.get("description") or "")
+    if evaluation.get("score_stage_version") != 2:
+        evaluation[dimension_key]["score"] = score
+        evaluation[dimension_key]["description"] = description
+        return
+
+    dimension_index = EVALUATION_DIMENSION_KEYS.index(dimension_key)
+    mirrors: Dict[str, List[Any]] = {}
+    for field in ("scores", "descriptions", *EVALUATION_SCORE_STAGE_DETAIL_FIELDS):
+        values = evaluation.get(field)
+        if not isinstance(values, list) or len(values) != len(EVALUATION_DIMENSION_KEYS):
+            raise WorkflowError(
+                f"评分描述定向修正未能同步评分版本 2 的 {field}"
+            )
+        mirrors[field] = values
+    for field in EVALUATION_SCORE_STAGE_DETAIL_FIELDS:
+        if not str(repaired.get(field) or "").strip():
+            raise WorkflowError(
+                f"评分描述定向修正未能同步评分版本 2 的 {field}"
+            )
+    process_finding = str(repaired.get("processFinding") or "").strip()
+    updated_process_findings = replace_evaluation_process_finding(
+        evaluation.get("processFindings"),
+        dimension_key,
+        process_finding,
+    )
+
+    evaluation[dimension_key]["score"] = score
+    evaluation[dimension_key]["description"] = description
+    mirrors["scores"][dimension_index] = score
+    mirrors["descriptions"][dimension_index] = description
+    for field in EVALUATION_SCORE_STAGE_DETAIL_FIELDS:
+        mirrors[field][dimension_index] = str(repaired[field])
+    evaluation["processFindings"] = updated_process_findings
+
+
+def synchronize_evaluation_public_mirrors(evaluation: Dict[str, Any]) -> None:
+    """Keep v2 public score arrays identical to normalized dimension objects."""
+    if evaluation.get("score_stage_version") != 2:
+        return
+    evaluation["scores"] = [
+        int(evaluation[key]["score"]) for key in EVALUATION_DIMENSION_KEYS
+    ]
+    evaluation["descriptions"] = [
+        str(evaluation[key]["description"]) for key in EVALUATION_DIMENSION_KEYS
+    ]
 
 
 def normalize_evaluation_with_targeted_repairs(
@@ -10563,26 +13531,43 @@ def normalize_evaluation_with_targeted_repairs(
     verification: List[Dict[str, Any]],
     trajectory: str,
     repair_notifier: Optional[Callable[[str, str], None]] = None,
+    *,
+    supplemental_evidence: str = "",
+    history_exclude_turn_key: str = "",
+    history_exclude_remote_id: str = "",
+    preserve_scores: bool = False,
+    initial_repair_issues: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Validate an evaluation and regenerate only a rejected description."""
     if not isinstance(evaluation, dict):
         raise WorkflowError("自动检查没有生成逐轮评分")
     working = json.loads(json.dumps(evaluation, ensure_ascii=False))
-    remove_unverified_evaluation_command_references(working, trajectory)
+    history_by_dimension = {
+        key: historical_evaluation_descriptions(
+            key,
+            exclude_turn_key=history_exclude_turn_key,
+            exclude_remote_id=history_exclude_remote_id,
+        )
+        for key in EVALUATION_DIMENSION_KEYS
+    }
     attempts_by_dimension: Dict[str, int] = {}
-    # Each of the five dimensions may need three focused rewrites. Keep one
+    forced_issues = list(dict.fromkeys(initial_repair_issues or []))
+    # Each of the five dimensions may need five focused rewrites. Keep one
     # additional pass for validating the final rewrite; otherwise the old
     # four-pass loop could rewrite the fourth rejected description and then
     # fail without ever checking the repaired text.
-    repairs_per_dimension = 3
-    validation_passes = 1 + (
+    repairs_per_dimension = 5
+    validation_passes = 1 + len(forced_issues) + (
         repairs_per_dimension * len(EVALUATION_DIMENSION_KEYS)
     )
     for _ in range(validation_passes):
         try:
+            if forced_issues:
+                raise WorkflowError(forced_issues.pop(0))
             normalized = normalize_evaluation(working, expected_turn_number)
             validate_evaluation_final_verification_consistency(normalized, trajectory)
-            validate_evaluation_trace_commands(normalized, trajectory)
+            validate_evaluation_trace_commands(normalized, trajectory, verification)
+            validate_false_success_claim(normalized, trajectory)
             validate_evaluation_trace_grounding(
                 normalized,
                 trajectory,
@@ -10590,7 +13575,15 @@ def normalize_evaluation_with_targeted_repairs(
                     "prompt": current_prompt,
                     "verification": verification,
                 },
+                supplemental_evidence=supplemental_evidence,
             )
+            validate_evaluation_description_novelty(
+                normalized,
+                history_by_dimension,
+                require_distinct_opening=True,
+            )
+            normalized["_description_novelty_version"] = 1
+            synchronize_evaluation_public_mirrors(normalized)
             return normalized
         except WorkflowError as exc:
             detail = str(exc)
@@ -10615,17 +13608,24 @@ def normalize_evaluation_with_targeted_repairs(
                 dimension_label,
                 expected_turn_number,
                 detail,
+                supplemental_evidence=supplemental_evidence,
+                history_exclude_turn_key=history_exclude_turn_key,
+                history_exclude_remote_id=history_exclude_remote_id,
+                preserve_score=preserve_scores,
             )
             if isinstance(repaired, dict):
-                working[dimension_key]["score"] = int(
-                    repaired.get("score", working[dimension_key]["score"])
-                )
-                working[dimension_key]["description"] = str(
-                    repaired.get("description") or ""
+                apply_evaluation_dimension_repair(
+                    working,
+                    dimension_key,
+                    {
+                        **repaired,
+                        "score": int(
+                            repaired.get("score", working[dimension_key]["score"])
+                        ),
+                    },
                 )
             else:  # Compatibility with older test doubles and saved workers.
                 working[dimension_key]["description"] = str(repaired)
-            remove_unverified_evaluation_command_references(working, trajectory)
     raise EvaluationRepairExhausted("评分描述定向修正未能收敛", working)
 
 
@@ -10658,7 +13658,10 @@ def review_evaluation_with_manual_fallback(
     verification: List[Dict[str, Any]],
     trajectory: str,
     repair_notifier: Optional[Callable[[str, str], None]] = None,
+    *,
+    review_findings: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], str]:
+    supplemental_evidence = review_findings_grounding_evidence(review_findings)
     try:
         return (
             normalize_evaluation_with_targeted_repairs(
@@ -10669,6 +13672,7 @@ def review_evaluation_with_manual_fallback(
                 verification,
                 trajectory,
                 repair_notifier,
+                supplemental_evidence=supplemental_evidence,
             ),
             "",
         )
@@ -10686,57 +13690,494 @@ def review_evaluation_with_manual_fallback(
         return preserve_evaluation_for_manual_edit(latest), str(exc)
 
 
-def run_codex_regrade(
+def evaluation_split_metadata_schema() -> Dict[str, Any]:
+    """Return the shared fields that do not belong to one score dimension."""
+    properties = evaluation_schema()["properties"]
+    fields = (
+        "task_type",
+        "task_difficulty",
+        "language_framework",
+        "environment_reproducibility",
+        "other_issues",
+        "artifactFindings",
+    )
+    return {
+        "type": "object",
+        "properties": {field: properties[field] for field in fields},
+        "required": list(fields),
+        "additionalProperties": False,
+    }
+
+
+def evaluation_split_dimension_schema(dimension_key: str) -> Dict[str, Any]:
+    """Limit one parallel call to one independently judged dimension."""
+    if dimension_key not in EVALUATION_DIMENSION_KEYS:
+        raise ValueError("unsupported evaluation dimension")
+    label = EVALUATION_DIMENSION_LABELS[dimension_key]
+    return {
+        "type": "object",
+        "properties": {
+            "score": {"type": "integer", "minimum": 1, "maximum": 5},
+            "description": {"type": "string", "minLength": 1, "maxLength": 600},
+            "when": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": EVALUATION_SCORE_STAGE_PROSE_LIMITS["when"],
+            },
+            "behavior": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": EVALUATION_SCORE_STAGE_PROSE_LIMITS["behavior"],
+            },
+            "impact": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": EVALUATION_SCORE_STAGE_PROSE_LIMITS["impact"],
+            },
+            "expected": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": EVALUATION_SCORE_STAGE_PROSE_LIMITS["expected"],
+            },
+            "evidenceRefs": {"type": "string", "minLength": 1, "maxLength": 2000},
+            "processFinding": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 1200,
+                "pattern": rf"^{re.escape(label)}\s*=\s*[1-5]\s*分",
+            },
+        },
+        "required": [
+            "score",
+            "description",
+            "when",
+            "behavior",
+            "impact",
+            "expected",
+            "evidenceRefs",
+            "processFinding",
+        ],
+        "additionalProperties": False,
+    }
+
+
+def run_codex_split_regrade(
     repo_path: Path,
     current_prompt: str,
     verification: List[Dict[str, Any]],
-    trajectory: str = "",
-    turn_number: int = 1,
+    trajectory: str,
+    turn_number: int,
+    *,
+    original_prompt: str = "",
+    review_findings: Optional[Dict[str, Any]] = None,
+    call_prefix: str = "turn-regrade",
 ) -> Dict[str, Any]:
+    """Score five dimensions independently and assemble them in fixed order."""
     verification_text = json.dumps(verification, ensure_ascii=False)
     if len(verification_text) > 24000:
         verification_text = verification_text[-24000:]
     final_verification_summary = trajectory_final_verification_summary(trajectory)
-    prompt = f"""只读检查下面这个已完成轮次，仅重新填写本轮 evaluation，不修改仓库、不生成修复题面，也不沿用旧分数。检查本轮 User Prompt、代码产物、验收结果和完整操作轨迹，以本轮实际表现为唯一依据。本次评分对应第 {turn_number} 轮；所有非满分描述都必须明确写出“第 {turn_number} 轮”。
-
-{EVALUATION_SCORE_GUIDANCE}
-{EVALUATION_DESCRIPTION_GUIDANCE}
-{TASK_DIFFICULTY_GUIDANCE}
-
-本轮必须遵循的五维评分表：
-{evaluation_rubric_text()}
-
-任务类型按本轮 User Prompt 的主要意图判断。语言和框架用英文逗号分隔。环境可复现等级必须根据仓库实际提供的运行方式判断。每个描述都要同时检查过程和产物：有不足时写清发生步骤、具体文件、函数、命令输出或遗漏路径及其影响；没有不足时写明实际核对过的约束和验证结果。不要提及旧评分、评分工具、内部提示或重新评分过程。
-
-本轮 User Prompt：
+    original_context = (
+        f"\n第一轮原始需求：\n{original_prompt}\n"
+        if original_prompt and original_prompt != current_prompt
+        else ""
+    )
+    findings_context = ""
+    if isinstance(review_findings, dict):
+        compact_findings = {
+            key: review_findings.get(key)
+            for key in (
+                "summary", "next_action", "bugs", "remaining_bugs", "quality_gaps"
+            )
+            if key in review_findings
+        }
+        findings_context = (
+            "\n已经保存的独立代码复核结论如下；评分不得改变其中的 Bug 决策：\n"
+            + json.dumps(compact_findings, ensure_ascii=False)
+            + "\n"
+        )
+    material = f"""本轮 User Prompt：
 {current_prompt}
+{original_context}{findings_context}
 
 本轮验收结果：
 {verification_text}
 
 本轮最后一次检查结果：
 {final_verification_summary}
-同类检查以后出现的结果为准；已经被后续成功覆盖的失败，只能描述为已恢复的过程，不能据此声称最终仍失败或没有复验。
 
 本轮操作轨迹：
-{trajectory or '未取得轨迹内容'}
-"""
-    result = run_codex_structured(
-        prompt,
-        evaluation_schema(),
-        repo_path,
-        "turn-regrade",
-        45 * 60,
-        sandbox="workspace-write",
+{trajectory or '未取得轨迹内容'}"""
+    direct_output = (
+        "材料已经备齐；不得调用 shell、浏览器、网络、文件读取或其他工具，"
+        "不得再次检查仓库，直接按 schema 返回 JSON。"
     )
-    return normalize_evaluation_with_targeted_repairs(
+    metadata_prompt = f"""只生成第 {turn_number} 轮五维评分共用的元数据，不生成任何维度分数或点评。{direct_output}
+
+{EVALUATION_FACT_ATTRIBUTION_GUIDANCE}
+{TASK_DIFFICULTY_GUIDANCE}
+
+task_type 只按本轮题面主要意图判断；language_framework 使用英文逗号分隔；environment_reproducibility 按仓库实际运行方式判断；other_issues 只写五维之外的真实问题，没有则写“无”。artifactFindings 写明当前产物、实际运行条件、检查覆盖、真实通过/失败/跳过统计和未验证范围。
+
+{material}"""
+    rubric = evaluation_rubric_text()
+    parent_job_key = current_job_key()
+    abort_calls = threading.Event()
+    split_processes = LocalCodexProcessGroup()
+
+    def run_split_call(
+        prompt: str,
+        schema: Dict[str, Any],
+        prefix: str,
+    ) -> Dict[str, Any]:
+        previous_job_key = current_job_key()
+        CODEX_JOB_CONTEXT.key = parent_job_key
+        try:
+            with evaluation_split_slot(parent_job_key, abort_calls):
+                return run_codex_structured(
+                    prompt,
+                    schema,
+                    repo_path,
+                    prefix,
+                    20 * 60,
+                    sandbox="read-only",
+                    reasoning_effort="low",
+                    process_group=split_processes,
+                )
+        finally:
+            CODEX_JOB_CONTEXT.key = previous_job_key
+
+    def score_dimension(dimension_key: str) -> Dict[str, Any]:
+        label = EVALUATION_DIMENSION_LABELS[dimension_key]
+        history_context = evaluation_description_history_context(dimension_key)
+        prompt = f"""只独立评定第 {turn_number} 轮的“{label}”一个维度，不输出其他维度或共用元数据。{direct_output}
+
+{EVALUATION_SCORE_GUIDANCE}
+{EVALUATION_DESCRIPTION_GUIDANCE}
+{EVALUATION_FACT_ATTRIBUTION_GUIDANCE}
+
+本轮评分表：
+{rubric}
+
+公开 description 写一小段自然点评；低于 5 分必须明确第 {turn_number} 轮的具体不足、证据和已经发生的影响，5 分只能保留有核验依据的正向事实。description 必须从本项目独有业务对象或真实动作切入，不能以“第 {turn_number} 轮”“本轮”“本次”“此次”起句；轮次放到后文即可。when 必须从“第 {turn_number} 轮第 N 步操作”或“第 {turn_number} 轮第 N 步调用”开始；behavior、impact、expected 分别写实际行为、已发生后果和正确做法；evidenceRefs 写 1～8 个真实“文件路径:行号”，多个用英文分号分隔。processFinding 必须写成“{label}=N分；事实=具体依据；相邻M分差别=具体依据”，2～4 分同时写高低两个相邻档，1 分或 5 分只写存在的一侧。
+
+{history_context}
+
+{material}"""
+        return run_split_call(
+            prompt,
+            evaluation_split_dimension_schema(dimension_key),
+            f"{call_prefix}-{dimension_key}",
+        )
+
+    dimension_results: Dict[str, Dict[str, Any]] = {}
+    metadata: Optional[Dict[str, Any]] = None
+    with ThreadPoolExecutor(
+        max_workers=len(EVALUATION_DIMENSION_KEYS) + 1,
+        thread_name_prefix="evaluation-score",
+    ) as executor:
+        futures = {
+            executor.submit(score_dimension, dimension_key): dimension_key
+            for dimension_key in EVALUATION_DIMENSION_KEYS
+        }
+        futures[
+            executor.submit(
+                run_split_call,
+                metadata_prompt,
+                evaluation_split_metadata_schema(),
+                f"{call_prefix}-metadata",
+            )
+        ] = None
+        try:
+            for future in as_completed(futures):
+                dimension_key = futures[future]
+                item = future.result()
+                if dimension_key is None:
+                    metadata = item
+                else:
+                    dimension_results[dimension_key] = item
+        except BaseException:
+            abort_calls.set()
+            split_processes.terminate_all()
+            for future in futures:
+                future.cancel()
+            raise
+
+    if metadata is None:
+        raise WorkflowError("评分共用元数据没有返回有效结果")
+    evaluation: Dict[str, Any] = dict(metadata)
+    evaluation["score_stage_version"] = 2
+    evaluation["scores"] = []
+    evaluation["descriptions"] = []
+    evaluation["other"] = str(evaluation.get("other_issues") or "无")
+    for field in EVALUATION_SCORE_STAGE_DETAIL_FIELDS:
+        evaluation[field] = []
+    process_findings: List[str] = []
+    for dimension_key in EVALUATION_DIMENSION_KEYS:
+        item = dimension_results.get(dimension_key)
+        if not isinstance(item, dict):
+            raise WorkflowError(
+                f"{EVALUATION_DIMENSION_LABELS[dimension_key]}没有返回有效评分"
+            )
+        evaluation[dimension_key] = {
+            "score": int(item["score"]),
+            "description": str(item["description"]),
+        }
+        evaluation["scores"].append(int(item["score"]))
+        evaluation["descriptions"].append(str(item["description"]))
+        for field in EVALUATION_SCORE_STAGE_DETAIL_FIELDS:
+            evaluation[field].append(str(item[field]))
+        process_findings.append(
+            re.sub(r"\s+", " ", str(item["processFinding"])).strip(" ；;")
+        )
+    evaluation["processFindings"] = "评分版本 2；" + "；".join(process_findings)
+    return evaluation
+
+
+def run_codex_regrade(
+    repo_path: Path,
+    current_prompt: str,
+    verification: List[Dict[str, Any]],
+    trajectory: str = "",
+    turn_number: int = 1,
+    *,
+    original_prompt: str = "",
+    review_findings: Optional[Dict[str, Any]] = None,
+    call_prefix: str = "turn-regrade",
+) -> Dict[str, Any]:
+    result = run_codex_split_regrade(
+        repo_path,
+        current_prompt,
+        verification,
+        trajectory,
+        turn_number,
+        original_prompt=original_prompt,
+        review_findings=review_findings,
+        call_prefix=call_prefix,
+    )
+    normalized, warning = review_evaluation_with_manual_fallback(
         result,
         turn_number,
         repo_path,
         current_prompt,
         verification,
         trajectory,
+        review_findings=review_findings,
     )
+    normalized["scores"] = [
+        int(normalized[key]["score"]) for key in EVALUATION_DIMENSION_KEYS
+    ]
+    normalized["descriptions"] = [
+        str(normalized[key]["description"]) for key in EVALUATION_DIMENSION_KEYS
+    ]
+    normalized["other"] = str(normalized.get("other_issues") or "无")
+    if warning:
+        normalized["_evaluation_warning"] = warning
+    return normalized
+
+
+def review_findings_schema(bug_field: str) -> Dict[str, Any]:
+    """Return the product-review schema without the slower score stage."""
+    if bug_field not in {"bugs", "remaining_bugs"}:
+        raise ValueError("unsupported review bug field")
+    return {
+        "type": "object",
+        "properties": {
+            "summary": {"type": "string"},
+            "next_action": {"type": "string", "enum": ["bugfix", "complete"]},
+            bug_field: bug_schema(),
+            "quality_gaps": quality_gap_schema(),
+        },
+        "required": ["summary", "next_action", bug_field, "quality_gaps"],
+        "additionalProperties": False,
+    }
+
+
+def normalize_review_findings(
+    raw_result: Any,
+    bug_field: str,
+    repair_prompt_key: str,
+    *,
+    previous_prompt: str = "",
+) -> Tuple[Dict[str, Any], Optional[Dict[str, Any]]]:
+    """Normalize Bug facts before they are durably checkpointed and scored."""
+    if not isinstance(raw_result, dict):
+        raise WorkflowError("代码复核没有返回有效结果")
+    result = dict(raw_result)
+    legacy_evaluation = result.pop("evaluation", None)
+    result.pop("evaluation_blocker", None)
+    result["summary"] = re.sub(
+        r"\s+", " ", str(result.get("summary") or "")
+    ).strip()
+    result[bug_field] = normalize_bugs(result.get(bug_field))
+    result["quality_gaps"] = normalize_quality_gaps(result.get("quality_gaps"))
+    if result.get("next_action") == "bugfix":
+        if not result[bug_field]:
+            raise WorkflowError("代码复核要求继续修复，但没有提供可核验问题")
+        result["repair_prompt"] = bug_repair_prompt(
+            result[bug_field],
+            repair_prompt_key,
+            previous_prompt=previous_prompt,
+        )
+    else:
+        if result[bug_field]:
+            raise WorkflowError("代码复核结果矛盾：已发现问题但标记为完成")
+        result["next_action"] = "complete"
+        result["repair_prompt"] = ""
+    return (
+        result,
+        legacy_evaluation if isinstance(legacy_evaluation, dict) else None,
+    )
+
+
+def pending_review_evaluation_result(findings: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the durable checkpoint stored between Bug review and scoring."""
+    result = dict(findings)
+    result.pop("evaluation", None)
+    result["evaluation_blocker"] = "五维评分进行中"
+    return result
+
+
+def resumable_review_findings(
+    raw_result: Any,
+    bug_field: str,
+) -> Optional[Dict[str, Any]]:
+    """Return saved Bug findings when only their score stage is unfinished."""
+    if isinstance(raw_result, str):
+        try:
+            raw_result = json.loads(raw_result or "{}")
+        except json.JSONDecodeError:
+            return None
+    if not isinstance(raw_result, dict):
+        return None
+    if not str(raw_result.get("evaluation_blocker") or "").strip():
+        return None
+    if (
+        raw_result.get("next_action") not in {"bugfix", "complete"}
+        or not isinstance(raw_result.get(bug_field), list)
+        or not isinstance(raw_result.get("quality_gaps"), list)
+    ):
+        return None
+    resumed = dict(raw_result)
+    resumed.pop("evaluation_blocker", None)
+    resumed.pop("evaluation", None)
+    return resumed
+
+
+def persist_review_findings_before_scoring(
+    run_id: str,
+    turn_number: int,
+    expected_phase: str,
+    run_result_field: str,
+    findings: Dict[str, Any],
+) -> bool:
+    """Atomically save Bug findings in both turn and run mirrors before scoring."""
+    if run_result_field not in {"review_result", "final_review_result"}:
+        raise ValueError("unsupported run review result field")
+    encoded = json.dumps(
+        pending_review_evaluation_result(findings), ensure_ascii=False
+    )
+    timestamp = now_text()
+    with db_connection() as database:
+        database.execute("BEGIN IMMEDIATE")
+        active = database.execute(
+            """SELECT 1 FROM runs
+                 WHERE id = ? AND phase = ? AND deleted_at IS NULL""",
+            (run_id, expected_phase),
+        ).fetchone()
+        if not active:
+            database.rollback()
+            return False
+        changed = database.execute(
+            """UPDATE run_turns
+                  SET review_result = ?, updated_at = ?
+                WHERE run_id = ? AND turn_number = ?""",
+            (encoded, timestamp, run_id, turn_number),
+        )
+        if changed.rowcount != 1:
+            database.rollback()
+            return False
+        mirrored = database.execute(
+            f"""UPDATE runs
+                   SET {run_result_field} = ?,
+                       status_detail = 'Bug 复核结论已保存，正在进行五维评分',
+                       updated_at = ?
+                 WHERE id = ? AND phase = ?""",
+            (encoded, timestamp, run_id, expected_phase),
+        )
+        if mirrored.rowcount != 1:
+            raise WorkflowError("运行状态已变化，Bug 复核结论没有写入评分检查点")
+    return True
+
+
+def attach_findings_to_evaluation_error(
+    findings: Dict[str, Any],
+    exc: BaseException,
+) -> Exception:
+    """Carry completed Bug facts through a score-only failure or retry."""
+    retry_exc: Exception
+    if isinstance(exc, Exception):
+        retry_exc = exc
+    else:
+        retry_exc = WorkflowError(str(exc).strip() or "五维评分暂时失败")
+    blocked_result = pending_review_evaluation_result(findings)
+    blocked_result["evaluation_blocker"] = (
+        str(exc).strip() or "五维评分没有返回有效结果"
+    )
+    setattr(retry_exc, "review_result", blocked_result)
+    return retry_exc
+
+
+def score_review_findings(
+    findings: Dict[str, Any],
+    legacy_evaluation: Optional[Dict[str, Any]],
+    repo_path: Path,
+    current_prompt: str,
+    verification: List[Dict[str, Any]],
+    trajectory: str,
+    turn_number: int,
+    evaluation_repair_notifier: Optional[Callable[[str, str], None]],
+    *,
+    original_prompt: str = "",
+    call_prefix: str,
+) -> Dict[str, Any]:
+    """Score only after Bug facts have been normalized and checkpointed."""
+    try:
+        if legacy_evaluation is not None:
+            evaluation, warning = review_evaluation_with_manual_fallback(
+                legacy_evaluation,
+                turn_number,
+                repo_path,
+                current_prompt,
+                verification,
+                trajectory,
+                evaluation_repair_notifier,
+                review_findings=findings,
+            )
+        else:
+            evaluation = run_codex_regrade(
+                repo_path,
+                current_prompt,
+                verification,
+                trajectory,
+                turn_number,
+                original_prompt=original_prompt,
+                review_findings=findings,
+                call_prefix=call_prefix,
+            )
+            warning = str(evaluation.pop("_evaluation_warning", ""))
+    except JobCancelled:
+        raise
+    except BaseException as exc:
+        wrapped = attach_findings_to_evaluation_error(findings, exc)
+        if wrapped is exc:
+            raise
+        raise wrapped from exc
+    result = dict(findings)
+    result["evaluation"] = evaluation
+    if warning:
+        result["evaluation_warning"] = warning
+    return result
 
 
 def run_codex_review(
@@ -10746,29 +14187,19 @@ def run_codex_review(
     trajectory: str = "",
     repair_prompt_key: str = "",
     evaluation_repair_notifier: Optional[Callable[[str, str], None]] = None,
+    commit_sha: str = "",
+    existing_findings: Optional[Dict[str, Any]] = None,
+    findings_notifier: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
-    schema = {
-        "type": "object",
-        "properties": {
-            "summary": {"type": "string"},
-            "next_action": {"type": "string", "enum": ["bugfix", "complete"]},
-            "bugs": bug_schema(),
-            "quality_gaps": quality_gap_schema(),
-            "evaluation": evaluation_schema(),
-        },
-        "required": [
-            "summary", "next_action", "bugs", "quality_gaps", "evaluation",
-        ],
-        "additionalProperties": False,
-    }
+    schema = review_findings_schema("bugs")
+    evaluation_rubric = evaluation_rubric_text()
     verification_text = json.dumps(verification, ensure_ascii=False)
     if len(verification_text) > 24000:
         verification_text = verification_text[-24000:]
     final_verification_summary = trajectory_final_verification_summary(trajectory)
-    evaluation_rubric = evaluation_rubric_text()
     prompt = f"""只读检查这个项目的第一轮交付，不得修改文件。完整对照原始需求、仓库实现、Docker 验收结果和 Claude Code 本轮轨迹，检查功能正确性、遗漏、异常路径、持久化、并发、界面交互和 Docker 配置，并在隔离环境中实际执行必要的复现命令。本次评分对应第 1 轮；所有非满分描述都必须明确写出“第 1 轮”。验收项中的 failure_kind=environment 表示端口占用、Docker 守护进程或临时网络等环境失败，不能当成产品 Bug 或模型能力扣分证据；应从仓库和可重复命令继续判断。bugs 只允许记录已经稳定复现且与本轮 User Prompt 验收范围直接相关的业务错误，包括本轮功能自身错误和本轮改动造成的相关回归；仓库中与本轮范围无关的历史问题只能写入 quality_gaps，也不得要求修改相应代码。每条 Bug 都必须分别填写 reproduction、actual、expected、evidence、fix 和 customer_summary，evidence 要包含实际命令、响应、日志或数据库状态。未实际复现的风险、缺少测试、覆盖不足、文档不足和代码结构问题只能写入 quality_gaps，不能进入 bugs，也不能触发修复轮。只有 bugs 非空时 next_action 才能是 bugfix。{BUG_REPAIR_PROMPT_STYLE_GUIDANCE}没有已复现 Bug 时 next_action 必须是 complete 且 bugs 为空；quality_gaps 可以非空，但不得为了增加轮次虚构 Bug。
 
-同时按交付文档对这一轮单独评分。{EVALUATION_SCORE_GUIDANCE} 五个描述都必须结合本轮轨迹和代码给出可核验依据：指出具体步骤、文件、函数或遗漏需求；只有本轮操作轨迹里真实执行过的检查才能作为依据，满分也要说明已核对哪些约束。{EVALUATION_DESCRIPTION_GUIDANCE} {TASK_DIFFICULTY_GUIDANCE} 不提及评分工具、生成过程或内部提示。任务类型按本轮主要意图填写，第一轮从空仓库开发通常是“0-1 代码生成”。语言和框架用英文逗号分隔。环境可复现等级要根据仓库是否真的提供可一键执行的容器环境判断。
+同时按交付文档对这一轮单独评分。{EVALUATION_SCORE_GUIDANCE} 五个描述都必须结合本轮轨迹和代码给出可核验依据：指出具体步骤、工具调用动作、文件、函数、命令或遗漏需求；原作业检查和后续独立验收必须分别归因，满分也要说明已核对哪些约束。{EVALUATION_DESCRIPTION_GUIDANCE} {EVALUATION_FACT_ATTRIBUTION_GUIDANCE} {TASK_DIFFICULTY_GUIDANCE} 不提及评分工具、生成过程或内部提示。任务类型按本轮主要意图填写，第一轮从空仓库开发通常是“0-1 代码生成”。语言和框架用英文逗号分隔。环境可复现等级要根据仓库是否真的提供可一键执行的容器环境判断。
 
 本轮必须遵循的五维评分表：
 {evaluation_rubric}
@@ -10781,45 +14212,55 @@ def run_codex_review(
 
 第一轮最后一次检查结果：
 {final_verification_summary}
-同类检查以后出现的结果为准；已经被后续成功覆盖的失败，只能描述为已恢复的过程，不能据此声称最终仍失败或没有复验。
+同类检查以后出现的结果只覆盖最终状态；已经被后续成功覆盖的失败只能描述为已恢复的过程，不能据此声称最终仍失败或没有复验，但原作业真实发生的失败调用、返工和虚假完成声明仍须保留并按所属维度评价。
 
 第一轮操作轨迹：
 {trajectory or '未取得轨迹内容'}
 """
-    result = run_codex_structured(
-        prompt,
-        schema,
-        repo_path,
-        "first-review",
-        45 * 60,
-        sandbox="workspace-write",
+    prompt = f"""只读检查这个项目的第一轮交付，不得修改文件。完整对照原始需求、仓库实现、Docker 验收结果和本轮轨迹，检查功能正确性、遗漏、异常路径、持久化、并发和页面交互，并实际执行必要的复现命令。本次只返回代码复核结论、Bug 和质量缺口；五维评分由后续五个独立并行调用完成，本次不能输出 evaluation。bugs 只记录已经稳定复现且与本轮需求直接相关的业务错误；未复现风险和覆盖不足只能写入 quality_gaps，不能触发修复轮。与本轮范围无关的历史问题也只能写入 quality_gaps，不得要求修改相应代码。只有 bugs 非空时 next_action 才能是 bugfix。{BUG_REPAIR_PROMPT_STYLE_GUIDANCE}
+
+本轮当前产物 commit：{commit_sha}
+
+原始 User Prompt：
+{original_prompt}
+
+第一轮 Docker 验收结果：
+{verification_text}
+
+第一轮最后一次检查结果：
+{final_verification_summary}
+
+第一轮操作轨迹：
+{trajectory or '未取得轨迹内容'}
+"""
+    raw_result = existing_findings
+    if raw_result is None:
+        raw_result = run_codex_structured(
+            prompt,
+            schema,
+            repo_path,
+            "first-review",
+            45 * 60,
+            sandbox="workspace-write",
+        )
+    findings, legacy_evaluation = normalize_review_findings(
+        raw_result,
+        "bugs",
+        repair_prompt_key or original_prompt,
     )
-    result["summary"] = re.sub(r"\s+", " ", str(result.get("summary") or "")).strip()
-    result["bugs"] = normalize_bugs(result.get("bugs"))
-    result["quality_gaps"] = normalize_quality_gaps(result.get("quality_gaps"))
-    result["evaluation"], evaluation_warning = review_evaluation_with_manual_fallback(
-        result.get("evaluation"),
-        1,
+    if findings_notifier is not None:
+        findings_notifier(findings)
+    return score_review_findings(
+        findings,
+        legacy_evaluation,
         repo_path,
         original_prompt,
         verification,
         trajectory,
+        1,
         evaluation_repair_notifier,
+        call_prefix="first-review-evaluation",
     )
-    if evaluation_warning:
-        result["evaluation_warning"] = evaluation_warning
-    if result.get("next_action") == "bugfix":
-        if not result["bugs"]:
-            raise WorkflowError("自动检查要求进入第二轮，但没有提供可核验问题")
-        result["repair_prompt"] = bug_repair_prompt(
-            result["bugs"], repair_prompt_key or original_prompt
-        )
-    else:
-        if result["bugs"]:
-            raise WorkflowError("自动检查结果矛盾：已发现问题但标记为完成")
-        result["next_action"] = "complete"
-        result["repair_prompt"] = ""
-    return result
 
 
 def run_codex_final_review(
@@ -10831,27 +14272,17 @@ def run_codex_final_review(
     repair_prompt_key: str = "",
     turn_number: int = 2,
     evaluation_repair_notifier: Optional[Callable[[str, str], None]] = None,
+    commit_sha: str = "",
+    existing_findings: Optional[Dict[str, Any]] = None,
+    findings_notifier: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
-    schema = {
-        "type": "object",
-        "properties": {
-            "summary": {"type": "string"},
-            "next_action": {"type": "string", "enum": ["bugfix", "complete"]},
-            "remaining_bugs": bug_schema(),
-            "quality_gaps": quality_gap_schema(),
-            "evaluation": evaluation_schema(),
-        },
-        "required": [
-            "summary", "next_action", "remaining_bugs", "quality_gaps", "evaluation",
-        ],
-        "additionalProperties": False,
-    }
+    schema = review_findings_schema("remaining_bugs")
     verification_text = json.dumps(verification, ensure_ascii=False)
     if len(verification_text) > 24000:
         verification_text = verification_text[-24000:]
     final_verification_summary = trajectory_final_verification_summary(trajectory)
     evaluation_rubric = evaluation_rubric_text()
-    prompt = f"""只读验收这个项目当前轮次的交付，不得修改文件。当前轮次是一条独立数据，请以本轮 User Prompt 为主要目标，同时结合第一轮原始需求判断回归，并在隔离环境中实际执行必要的复现命令。本次评分对应第 {turn_number} 轮；所有非满分描述都必须明确写出“第 {turn_number} 轮”。验收项中的 failure_kind=environment 表示环境故障，不能当成产品 Bug 或模型能力扣分依据。remaining_bugs 只允许记录已经稳定复现且与当前迭代或修复范围直接相关的业务错误；仓库中与本次范围无关的历史问题只能写入 quality_gaps，也不得要求修改相应代码。每条 Bug 必须分别填写 reproduction、actual、expected、evidence、fix 和 customer_summary，证据包含实际命令、响应、日志或数据库状态。未复现风险、缺少测试、覆盖不足、文档不足和代码结构问题只能写入 quality_gaps，不能触发下一轮。只有 remaining_bugs 非空时 next_action 才能为 bugfix。{BUG_REPAIR_PROMPT_STYLE_GUIDANCE}没有已复现 Bug 时 next_action 必须为 complete 且 remaining_bugs 为空，quality_gaps 可以非空。不得为了延长轮次虚构问题。按交付文档对当前轮次单独填写五维评分，每个描述必须同时关注过程和产物并给出具体依据。{EVALUATION_DESCRIPTION_GUIDANCE} {TASK_DIFFICULTY_GUIDANCE} 若题面主要修复实际问题，任务类型填“Bug 修复”，若题面主要增加新能力，填“Feature 迭代”。语言和框架使用英文逗号分隔，不要在任何描述里提及检查工具或自动生成。
+    prompt = f"""只读验收这个项目当前轮次的交付，不得修改文件。当前轮次是一条独立数据，请以本轮 User Prompt 为主要目标，同时结合第一轮原始需求判断回归，并在隔离环境中实际执行必要的复现命令。本次评分对应第 {turn_number} 轮；所有非满分描述都必须明确写出“第 {turn_number} 轮”。验收项中的 failure_kind=environment 表示环境故障，不能当成产品 Bug 或模型能力扣分依据。remaining_bugs 只允许记录已经稳定复现且与当前迭代或修复范围直接相关的业务错误；仓库中与本次范围无关的历史问题只能写入 quality_gaps，也不得要求修改相应代码。每条 Bug 必须分别填写 reproduction、actual、expected、evidence、fix 和 customer_summary，证据包含实际命令、响应、日志或数据库状态。未复现风险、缺少测试、覆盖不足、文档不足和代码结构问题只能写入 quality_gaps，不能触发下一轮。只有 remaining_bugs 非空时 next_action 才能为 bugfix。{BUG_REPAIR_PROMPT_STYLE_GUIDANCE}没有已复现 Bug 时 next_action 必须为 complete 且 remaining_bugs 为空，quality_gaps 可以非空。不得为了延长轮次虚构问题。按交付文档对当前轮次单独填写五维评分，每个描述必须同时关注过程和产物并给出具体步骤、工具调用动作、文件、函数、命令或报错依据。{EVALUATION_DESCRIPTION_GUIDANCE} {EVALUATION_FACT_ATTRIBUTION_GUIDANCE} {TASK_DIFFICULTY_GUIDANCE} 若题面主要修复实际问题，任务类型填“Bug 修复”，若题面主要增加新能力，填“Feature 迭代”。语言和框架使用英文逗号分隔，不要在任何描述里提及检查工具或自动生成。
 
 严格按以下要求定档：{EVALUATION_SCORE_GUIDANCE}
 
@@ -10869,47 +14300,60 @@ def run_codex_final_review(
 
 当前轮次最后一次检查结果：
 {final_verification_summary}
-同类检查以后出现的结果为准；已经被后续成功覆盖的失败，只能描述为已恢复的过程，不能据此声称最终仍失败或没有复验。
+同类检查以后出现的结果只覆盖最终状态；已经被后续成功覆盖的失败只能描述为已恢复的过程，不能据此声称最终仍失败或没有复验，但原作业真实发生的失败调用、返工和虚假完成声明仍须保留并按所属维度评价。
 
 当前轮次操作轨迹：
 {trajectory or '未取得轨迹内容'}
 """
-    result = run_codex_structured(
-        prompt,
-        schema,
-        repo_path,
-        "final-review",
-        45 * 60,
-        sandbox="workspace-write",
+    prompt = f"""只读验收这个项目当前轮次的交付，不得修改文件。以本轮 User Prompt 为主要目标，同时结合第一轮原始需求判断回归，并实际执行必要的复现命令。本次只返回代码复核结论、remaining_bugs 和质量缺口；五维评分由后续五个独立并行调用完成，本次不能输出 evaluation。remaining_bugs 只记录已经稳定复现且与当前修复范围直接相关的业务错误；未复现风险和覆盖不足只能写入 quality_gaps，不能触发修复轮。与本轮范围无关的历史问题也只能写入 quality_gaps，不得要求修改相应代码。只有 remaining_bugs 非空时 next_action 才能是 bugfix。{BUG_REPAIR_PROMPT_STYLE_GUIDANCE}
+
+本轮当前产物 commit：{commit_sha}
+
+第一轮原始需求：
+{original_prompt}
+
+当前轮次 User Prompt：
+{second_prompt}
+
+当前轮次 Docker 验收结果：
+{verification_text}
+
+当前轮次最后一次检查结果：
+{final_verification_summary}
+
+当前轮次操作轨迹：
+{trajectory or '未取得轨迹内容'}
+"""
+    raw_result = existing_findings
+    if raw_result is None:
+        raw_result = run_codex_structured(
+            prompt,
+            schema,
+            repo_path,
+            "final-review",
+            45 * 60,
+            sandbox="workspace-write",
+        )
+    findings, legacy_evaluation = normalize_review_findings(
+        raw_result,
+        "remaining_bugs",
+        repair_prompt_key or f"{original_prompt}\x1e{second_prompt}",
+        previous_prompt=second_prompt,
     )
-    result["summary"] = re.sub(r"\s+", " ", str(result.get("summary") or "")).strip()
-    result["remaining_bugs"] = normalize_bugs(result.get("remaining_bugs"))
-    result["quality_gaps"] = normalize_quality_gaps(result.get("quality_gaps"))
-    result["evaluation"], evaluation_warning = review_evaluation_with_manual_fallback(
-        result.get("evaluation"),
-        turn_number,
+    if findings_notifier is not None:
+        findings_notifier(findings)
+    return score_review_findings(
+        findings,
+        legacy_evaluation,
         repo_path,
         second_prompt,
         verification,
         trajectory,
+        turn_number,
         evaluation_repair_notifier,
+        original_prompt=original_prompt,
+        call_prefix=f"final-review-{turn_number}-evaluation",
     )
-    if evaluation_warning:
-        result["evaluation_warning"] = evaluation_warning
-    if result.get("next_action") == "bugfix":
-        if not result["remaining_bugs"]:
-            raise WorkflowError("本轮检查要求继续修复，但没有提供可核验问题")
-        result["repair_prompt"] = bug_repair_prompt(
-            result["remaining_bugs"],
-            repair_prompt_key or f"{original_prompt}\x1e{second_prompt}",
-            previous_prompt=second_prompt,
-        )
-    else:
-        if result["remaining_bugs"]:
-            raise WorkflowError("本轮检查结果矛盾：已发现问题但标记为完成")
-        result["next_action"] = "complete"
-        result["repair_prompt"] = ""
-    return result
 
 
 def monitor_claude(run_id: str, turn: int, agent_id: str, expected_session: Optional[str]) -> None:
@@ -11181,6 +14625,11 @@ def continue_first_turn_after_terminal(run_id: str) -> None:
         agent_id=str(row["screen_name"] or ""),
         status="running",
     )
+    terminal_asset_paths(run_id)["startup_owner"].unlink(missing_ok=True)
+    if int(row["auto_refill"] or 0):
+        # A generated prompt is not a successful refill until the isolated
+        # conversation has actually accepted that prompt.
+        record_auto_refill_success()
     monitor_docker_turn(run_id, 1)
 
 
@@ -11197,19 +14646,62 @@ def first_turn_worker(run_id: str) -> None:
         )
         row = run_row(run_id)
         repo_path = Path(row["repo_path"])
+        add_event(run_id, "正在进行本题容器启动预检")
+        ensure_docker_engine_ready()
         update_run(run_id, phase="first_starting", status_detail="正在打开独立容器终端")
-        add_event(run_id, f"正在为本题启动独立容器 {row['container_name']}")
         screen_name = launch_docker_terminal(row)
+        terminal_opened = terminal_asset_paths(run_id)["terminal_tty"].is_file()
         update_run(
             run_id,
             first_agent_id=screen_name,
             workspace_path=str(repo_path),
-            status_detail="终端已打开，等待容器就绪",
+            status_detail=(
+                "终端已打开，等待容器就绪"
+                if terminal_opened
+                else "Terminal 标签页未打开，容器正在后台等待就绪"
+            ),
         )
         continue_first_turn_after_terminal(run_id)
     except Exception as exc:  # worker boundary
-        update_run(run_id, phase="failed", status_detail="流程执行失败", error=str(exc))
+        cleanup: Optional[Dict[str, Any]] = None
+        unstarted = False
+        try:
+            current = run_row(run_id)
+            unstarted = not unstarted_run_has_prompt_or_trace(current)
+            if unstarted:
+                cleanup = rollback_unstarted_run_resources(run_id)
+                update_turn(run_id, 1, status="failed")
+        except Exception as cleanup_exc:
+            cleanup = {
+                "eligible": True,
+                "cleaned": False,
+                "detail": f"启动资源回滚失败：{cleanup_exc}",
+            }
+        cleanup_detail = str((cleanup or {}).get("detail") or "")
+        status_detail = (
+            "启动失败，未发送题面；资源已回滚"
+            if unstarted and (cleanup or {}).get("cleaned")
+            else "启动失败，未发送题面；残留资源需要清理"
+            if unstarted
+            else "流程执行失败；已保留存在题面或轨迹的会话"
+        )
+        update_run(run_id, phase="failed", status_detail=status_detail, error=str(exc))
         add_event(run_id, str(exc), "error")
+        if cleanup_detail:
+            add_event(
+                run_id,
+                cleanup_detail,
+                "success" if (cleanup or {}).get("cleaned") else "warning",
+            )
+        try:
+            current = run_row(run_id)
+            if unstarted and int(current["auto_refill"] or 0):
+                record_auto_refill_failure(
+                    f"{run_id} 的容器启动失败：{exc}",
+                    systemic=isinstance(exc, SystemicStartupError),
+                )
+        except Exception:
+            pass
         log_workflow_exception(run_id, "first-turn", exc)
 
 
@@ -11249,6 +14741,27 @@ def review_worker(run_id: str) -> None:
                 "warning",
             )
 
+        def persist_findings(findings: Dict[str, Any]) -> None:
+            if not persist_review_findings_before_scoring(
+                run_id,
+                1,
+                "review_running",
+                "review_result",
+                findings,
+            ):
+                raise JobCancelled()
+
+        existing_findings = resumable_review_findings(
+            turn["review_result"] or row["review_result"],
+            "bugs",
+        )
+        if existing_findings is not None:
+            add_event(
+                run_id,
+                "已恢复上次完成的 Bug 复核结论，本次只重试五维评分",
+                "warning",
+            )
+
         commit_sha = str(turn["commit_sha"] or "")
         if commit_sha:
             add_event(run_id, f"从第 1 轮 commit {commit_sha[:8]} 创建隔离找 Bug 工作区")
@@ -11260,6 +14773,9 @@ def review_worker(run_id: str) -> None:
                     trajectory,
                     repair_prompt_key=f"{run_id}:2",
                     evaluation_repair_notifier=note_evaluation_repair,
+                    commit_sha=commit_sha,
+                    existing_findings=existing_findings,
+                    findings_notifier=persist_findings,
                 )
         else:
             result = run_codex_review(
@@ -11269,6 +14785,9 @@ def review_worker(run_id: str) -> None:
                 trajectory,
                 repair_prompt_key=f"{run_id}:2",
                 evaluation_repair_notifier=note_evaluation_repair,
+                commit_sha=commit_sha,
+                existing_findings=existing_findings,
+                findings_notifier=persist_findings,
             )
         if str(run_row(run_id)["phase"] or "") != "review_running":
             return
@@ -11324,6 +14843,11 @@ def review_worker(run_id: str) -> None:
         return
     except Exception as exc:  # worker boundary
         if retryable_control_error(str(exc)) or retryable_review_output_error(str(exc)):
+            retry_result = getattr(exc, "review_result", None)
+            if isinstance(retry_result, dict):
+                encoded_retry_result = json.dumps(retry_result, ensure_ascii=False)
+                update_turn(run_id, 1, review_result=encoded_retry_result)
+                update_run(run_id, review_result=encoded_retry_result)
             queue_control_stage_retry(
                 run_id,
                 "首轮复核",
@@ -11435,6 +14959,27 @@ def final_review_worker(run_id: str) -> None:
                 "warning",
             )
 
+        def persist_findings(findings: Dict[str, Any]) -> None:
+            if not persist_review_findings_before_scoring(
+                run_id,
+                turn_number,
+                "final_review_running",
+                "final_review_result",
+                findings,
+            ):
+                raise JobCancelled()
+
+        existing_findings = resumable_review_findings(
+            turn["review_result"] or row["final_review_result"],
+            "remaining_bugs",
+        )
+        if existing_findings is not None:
+            add_event(
+                run_id,
+                f"已恢复第 {turn_number} 轮的 Bug 复核结论，本次只重试五维评分",
+                "warning",
+            )
+
         commit_sha = str(turn["commit_sha"] or "")
         if commit_sha:
             add_event(
@@ -11451,6 +14996,9 @@ def final_review_worker(run_id: str) -> None:
                     repair_prompt_key=f"{run_id}:{turn_number + 1}",
                     turn_number=turn_number,
                     evaluation_repair_notifier=note_evaluation_repair,
+                    commit_sha=commit_sha,
+                    existing_findings=existing_findings,
+                    findings_notifier=persist_findings,
                 )
         else:
             result = run_codex_final_review(
@@ -11462,6 +15010,9 @@ def final_review_worker(run_id: str) -> None:
                 repair_prompt_key=f"{run_id}:{turn_number + 1}",
                 turn_number=turn_number,
                 evaluation_repair_notifier=note_evaluation_repair,
+                commit_sha=commit_sha,
+                existing_findings=existing_findings,
+                findings_notifier=persist_findings,
             )
         if str(run_row(run_id)["phase"] or "") != "final_review_running":
             return
@@ -11562,6 +15113,15 @@ def final_review_worker(run_id: str) -> None:
             )
             add_event(run_id, message, "warning")
         elif retryable_control_error(message) or retryable_review_output_error(message):
+            retry_result = getattr(exc, "review_result", None)
+            if isinstance(retry_result, dict):
+                encoded_retry_result = json.dumps(retry_result, ensure_ascii=False)
+                update_turn(
+                    run_id,
+                    turn_number,
+                    review_result=encoded_retry_result,
+                )
+                update_run(run_id, final_review_result=encoded_retry_result)
             queue_control_stage_retry(
                 run_id,
                 "逐轮复核",
@@ -11924,8 +15484,6 @@ def automatic_generation_worker(run_id: str) -> None:
             f"题目生成并复核完成，用时 {round(generation_elapsed)} 秒",
             "success",
         )
-        if int(row["auto_refill"] or 0):
-            record_auto_refill_success()
         schedule_worker(run_id, "queued", first_turn_worker)
     except JobCancelled:
         try:
@@ -12022,7 +15580,9 @@ def retry_automatic_generation(run_id: str) -> Dict[str, Any]:
     return serialize_run(run_row(run_id))
 
 
-def create_automatic_run(payload: Dict[str, Any]) -> Dict[str, Any]:
+def create_automatic_run(
+    payload: Dict[str, Any], *, allow_parallel_generation: bool = False
+) -> Dict[str, Any]:
     """Create a visible numbered row immediately and generate its brief in background."""
     requested_directory = str(payload.get("project_directory") or "")
     model = validate_model(current_model())
@@ -12033,7 +15593,7 @@ def create_automatic_run(payload: Dict[str, Any]) -> Dict[str, Any]:
                    WHERE deleted_at IS NULL AND phase IN ('generation_queued', 'generation_running')
                    ORDER BY created_at LIMIT 1"""
             ).fetchone()
-        if existing:
+        if existing and not allow_parallel_generation:
             return serialize_run(existing)
 
         project_directory, target_directory = resolve_project_directory(
@@ -12311,6 +15871,90 @@ def create_first_turn_retry(run_id: str, automatic: bool = False) -> Dict[str, A
     return serialize_run(run_row(created["id"]))
 
 
+def retry_failed_startup(run_id: str) -> Dict[str, Any]:
+    """Reuse a failed run only when no task prompt, trace, or workspace output exists."""
+    with STARTUP_RESOURCE_ROLLBACK_LOCK:
+        row = run_row(run_id)
+        if str(row["phase"] or "") != "failed":
+            raise WorkflowError("只有启动失败的任务才能沿用原任务重试")
+        if str(row["repo_name"] or "") == "题目生成中":
+            raise WorkflowError("题面生成失败的占位任务只能重新生成题面")
+        if not run_has_startup_attempt_evidence(run_id):
+            raise WorkflowError("没有容器启动记录，不能按启动故障沿用原任务重试")
+        if unstarted_run_has_prompt_or_trace(row):
+            raise WorkflowError("任务已经存在题面发送或轨迹记录，不能覆盖原会话重试")
+        workspace = Path(str(row["repo_path"] or ""))
+        if workspace.exists() and (
+            not workspace.is_dir() or any(workspace.iterdir())
+        ):
+            raise WorkflowError("任务工作区不是空目录，不能沿用原任务重试")
+
+        ensure_docker_engine_ready(force=True)
+        cleanup = rollback_unstarted_run_resources(run_id)
+        if not cleanup.get("eligible") or not cleanup.get("cleaned"):
+            raise WorkflowError(
+                f"启动残留资源没有清理完成：{cleanup.get('detail') or '状态未知'}"
+            )
+        paths = terminal_asset_paths(run_id)
+        if paths["terminal_tty"].exists():
+            raise WorkflowError("原任务 Terminal 标签页仍在占用，请关闭后再重试")
+        for marker in (
+            paths["exit_status"],
+            paths["screen_log"],
+            paths["screen_snapshot"],
+            paths["prompt"],
+            paths["prompt_submitted"],
+            paths["permission_status"],
+            paths["startup_owner"],
+        ):
+            marker.unlink(missing_ok=True)
+        if workspace.exists() and any(workspace.iterdir()):
+            raise WorkflowError("清理过程中工作区出现内容，已停止重试")
+
+        timestamp = now_text()
+        model = current_model()
+        with db_connection() as database:
+            database.execute("BEGIN IMMEDIATE")
+            current = database.execute(
+                "SELECT * FROM runs WHERE id = ? AND deleted_at IS NULL", (run_id,)
+            ).fetchone()
+            if not current or str(current["phase"] or "") != "failed":
+                raise WorkflowError("任务状态已经变化，请刷新后重试")
+            if any(
+                str(current[field] or "").strip()
+                for field in ("first_prompt_id", "session_id", "trajectory_path")
+            ):
+                raise WorkflowError("任务已经生成会话记录，不能覆盖原会话重试")
+            transition_stage_timing(
+                database, run_id, "failed", "queued", timestamp
+            )
+            database.execute(
+                """UPDATE runs
+                   SET phase = 'queued', status_detail = '启动残留已清理，等待重新打开终端',
+                       model = ?, first_agent_id = NULL, workspace_path = NULL,
+                       container_cleaned = 0, error = NULL,
+                       stage_retry_name = NULL, stage_retry_count = 0,
+                       retry_not_before_epoch = NULL, updated_at = ?
+                   WHERE id = ?""",
+                (model, timestamp, run_id),
+            )
+            database.execute(
+                """UPDATE run_turns
+                   SET model = ?, agent_id = NULL, prompt_id = NULL, result = NULL,
+                       trajectory_path = NULL, trajectory_sha256 = NULL,
+                       checkpointed_at = NULL, status = 'queued', updated_at = ?
+                   WHERE run_id = ? AND turn_number = 1""",
+                (model, timestamp, run_id),
+            )
+            database.execute(
+                """INSERT INTO events(run_id, level, message, created_at)
+                   VALUES (?, 'warning', '启动故障资源已清理，沿用原任务重新进入队列', ?)""",
+                (run_id, timestamp),
+            )
+    schedule_worker(run_id, "queued", first_turn_worker)
+    return serialize_run(run_row(run_id))
+
+
 def retry_first_turn(run_id: str) -> Dict[str, Any]:
     return create_first_turn_retry(run_id, automatic=False)
 
@@ -12427,12 +16071,7 @@ def dependency_status() -> Dict[str, Any]:
                     account = result.stdout.strip()
             docker_ready = False
             if docker_path:
-                docker_result = run_command(
-                    ["docker", "info", "--format", "{{.ServerVersion}}"],
-                    timeout=20,
-                    check=False,
-                )
-                docker_ready = docker_result.returncode == 0
+                docker_ready, _ = docker_engine_health()
             codex_version = None
             if codex_path:
                 result = run_command(["codex", "--version"], timeout=20, check=False)
@@ -12709,6 +16348,11 @@ class ApiHandler(BaseHTTPRequestHandler):
             if path == "/api/exports/preflight":
                 self.send_json(preflight_completed_turns(payload.get("turn_keys")))
                 return
+            if path == "/api/exports/evaluation-repairs":
+                self.send_json(
+                    queue_completed_turn_evaluation_repairs(payload), 202
+                )
+                return
             if path == "/api/exports/turns/evaluation":
                 self.send_json(save_completed_turn_evaluation(payload))
                 return
@@ -12764,6 +16408,12 @@ class ApiHandler(BaseHTTPRequestHandler):
             retry_first = re.fullmatch(r"/api/runs/([a-f0-9]{12})/retry-first", path)
             if retry_first:
                 self.send_json(retry_first_turn(retry_first.group(1)), 202)
+                return
+            retry_startup = re.fullmatch(
+                r"/api/runs/([a-f0-9]{12})/retry-startup", path
+            )
+            if retry_startup:
+                self.send_json(retry_failed_startup(retry_startup.group(1)), 202)
                 return
             retry_generation = re.fullmatch(
                 r"/api/runs/([a-f0-9]{12})/retry-generation", path
@@ -13112,6 +16762,7 @@ def main() -> None:
             migrate_completed_legacy_iterations()
             recover_iteration_jobs()
             recover_monitors()
+            recover_evaluation_repair_jobs()
             start_automatic_refill_coordinator()
             signal.signal(signal.SIGTERM, request_shutdown)
             url = f"http://{args.host}:{args.port}"
