@@ -1072,7 +1072,7 @@ function renderSoloQaControls() {
     bridgeStatus.textContent = "提交助手未连接";
   }
   detail.textContent = state.soloQaLastMessage || (state.soloQaBridgeReady
-    ? "同步会读取最新质检结论；可由本轮材料修复的退回项会自动重写、复检并提交返修。"
+    ? "同步只读取北京时间今天的提交；可由本轮材料修复的退回项会自动重写、复检并提交返修。"
     : "安装一次 Chrome 提交助手后，可同步历史提交并自动上传轨迹。");
   const selected = state.completedTurns.filter((turn) =>
     state.selectedExportTurns.has(turn.key) && soloQaSubmittable(turn)

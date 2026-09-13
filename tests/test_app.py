@@ -1449,7 +1449,7 @@ class ValidationTests(unittest.TestCase):
         )[0]
 
         self.assertNotIn("syncSoloQa", bridge_ready)
-        self.assertIn("同步会读取最新质检结论", source)
+        self.assertIn("同步只读取北京时间今天的提交", source)
         self.assertIn("autoRepairSyncedSoloQaReturns", source)
         self.assertIn("retry_failed: true", source)
         self.assertIn("的远端提交", source)
