@@ -40,6 +40,22 @@ let createdCount = 0;
 let transientRepairFailures = 0;
 let uploadValidationFailures = 0;
 
+function shanghaiDayKey(value = new Date()) {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(value);
+  const fields = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${fields.year}-${fields.month}-${fields.day}`;
+}
+
+const todayKey = shanghaiDayKey();
+const yesterdayKey = shanghaiDayKey(
+  new Date(new Date(`${todayKey}T12:00:00+08:00`).getTime() - 24 * 60 * 60 * 1000),
+);
+
 function jsonResponse(value, status = 200) {
   return new Response(JSON.stringify(value), {
     status,
@@ -102,14 +118,18 @@ globalThis.fetch = async (url, options = {}) => {
   }
   if (href.endsWith("/api/v1/submissions?page=1&page_size=20")) {
     return jsonResponse({
-      items: [{ id: 901 }],
-      meta: { total: 1 },
+      items: [
+        { id: 901, submitted_at: `${todayKey}T09:15:00+08:00` },
+        { id: 900, submitted_at: `${yesterdayKey}T23:59:00+08:00` },
+      ],
+      meta: { total: 146 },
     });
   }
   if (href.endsWith("/api/v1/submissions/901")) {
     return jsonResponse({
       id: 901,
       status: "QC_PASSED",
+      submitted_at: `${todayKey}T09:15:00+08:00`,
       session_id: "session-history",
       turn_id: "turn-history",
       round_no: 2,
@@ -297,12 +317,22 @@ const syncResponse = await new Promise((resolve) => {
 
 assert.equal(syncResponse.ok, true);
 assert.equal(syncResponse.data.matched, 1);
-assert.equal(localSyncs.length, 2);
+assert.equal(syncResponse.data.remote_total, 1);
+assert.equal(syncResponse.data.account_total, 146);
+assert.equal(syncResponse.data.scope_date, todayKey);
+assert.equal(syncResponse.data.partial, false);
+assert.equal(localSyncs.length, 1);
 assert.equal(localSyncs[0].complete, false);
 assert.equal(localSyncs[0].items.length, 1);
-assert.equal(localSyncs[1].complete, true);
-assert.deepEqual(localSyncs[1].items, []);
-assert.deepEqual(localSyncs[1].remote_ids, ["901"]);
+assert.equal("remote_ids" in localSyncs[0], false);
+assert.equal(
+  requests.some((item) => item.href.endsWith("/api/v1/submissions/900")),
+  false,
+);
+assert.equal(
+  requests.some((item) => item.href.includes("/api/v1/submissions?page=2")),
+  false,
+);
 const synced = localSyncs[0].items[0];
 assert.deepEqual(synced.delivery, {
   score: 5,

@@ -1,4 +1,4 @@
-const UI_VERSION = "20260913.14";
+const UI_VERSION = "20260913.15";
 const EXPORT_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 const TABLE_PAGE_SIZE = 20;
 const SOLO_QA_AUTO_REPAIR_POLL_MS = 3000;
@@ -1231,7 +1231,8 @@ async function syncSoloQa({ silent = false, autoRepair = true } = {}) {
   renderSoloQaControls();
   try {
     const result = await requestSoloQaBridge("SOLO_QA_SYNC", {}, 3 * 60 * 1000);
-    const syncMessage = `已同步远端 ${result.remote_total || 0} 条；匹配本地 ${result.matched || 0} 条${result.unmatched ? `，${result.unmatched} 条在本地未找到` : ""}${result.remote_missing ? `，${result.remote_missing} 条远端已不存在` : ""}${result.partial ? "；远端超过 500 条，本次仅同步最近 500 条" : ""}`;
+    const syncDate = String(result.scope_date || "今天");
+    const syncMessage = `已同步 ${syncDate} 的远端提交 ${result.remote_total || 0} 条；匹配本地 ${result.matched || 0} 条${result.unmatched ? `，${result.unmatched} 条在本地未找到` : ""}${result.partial ? "；当天数据超过 500 条，本次仅同步最近 500 条" : ""}`;
     await loadCompletedTurns({ autoRepair: false });
     const repair = autoRepair
       ? await autoRepairSyncedSoloQaReturns()

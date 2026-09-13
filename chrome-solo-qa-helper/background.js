@@ -30,6 +30,7 @@ const REMOTE_DEDUP_MAX_HITS = 20;
 const REMOTE_DEDUP_MAX_CHARS = 12000;
 const TRANSIENT_REMOTE_STATUSES = new Set([0, 408, 425, 429, 500, 502, 503, 504]);
 const REMOTE_RETRY_DELAYS_MS = [500, 1500, 3500];
+const SOLO_QA_SYNC_TIME_ZONE = "Asia/Shanghai";
 const FIELD_KEY_LABELS = {
   question_type: "任务类型",
   task_type: "任务类型",
@@ -449,7 +450,7 @@ function compactRemote(item) {
     turn_id: String(item.turn_id || "").slice(0, 128),
     round_no: item.round_no || 0,
     qc_summary: String(item.qc_summary || item.message || "").slice(0, 1000),
-    submitted_at: String(item.submitted_at || "").slice(0, 128),
+    submitted_at: String(item.submitted_at || item.created_at || "").slice(0, 128),
     updated_at: String(item.updated_at || item.qc_finished_at || "").slice(0, 128),
   };
   for (const dimension of REMOTE_REVIEW_DIMENSIONS) {
@@ -458,6 +459,28 @@ function compactRemote(item) {
   const dedupHits = compactRemoteDedupHits(item);
   if (dedupHits !== undefined) result.dedup_hits = dedupHits;
   return result;
+}
+
+function shanghaiDayKey(value = new Date()) {
+  const date = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(date.getTime())) return "";
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: SOLO_QA_SYNC_TIME_ZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(date);
+  const values = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${values.year}-${values.month}-${values.day}`;
+}
+
+function remoteSubmittedDay(item) {
+  const text = String(item?.submitted_at || item?.created_at || "").trim();
+  if (!text) return "";
+  const calendarMatch = text.match(/^(\d{4}-\d{2}-\d{2})(?:[T\s]|$)/);
+  const hasExplicitZone = /(?:Z|[+-]\d{2}:?\d{2})$/i.test(text);
+  if (calendarMatch && !hasExplicitZone) return calendarMatch[1];
+  return shanghaiDayKey(text);
 }
 
 async function remoteDetails(items) {
@@ -478,26 +501,49 @@ async function remoteDetails(items) {
   return details;
 }
 
-async function listAllRemote() {
+async function listTodayRemote() {
   const items = [];
   const pageSize = 20;
-  let remoteTotal = 0;
+  const scopeDate = shanghaiDayKey();
+  let accountTotal = 0;
+  let inspected = 0;
+  let reachedEarlierDay = false;
   for (let page = 1; page <= 25; page += 1) {
     const response = await remoteJson(`/submissions?page=${page}&page_size=${pageSize}`);
     const pageItems = Array.isArray(response.items) ? response.items : [];
-    items.push(...pageItems);
-    remoteTotal = Number(response.meta?.total ?? items.length);
-    if (!pageItems.length || items.length >= remoteTotal || items.length >= 500) break;
+    accountTotal = Number(response.meta?.total ?? inspected + pageItems.length);
+    inspected += pageItems.length;
+
+    const candidates = [];
+    for (const item of pageItems) {
+      const day = remoteSubmittedDay(item);
+      if (!day || day === scopeDate) candidates.push(item);
+      else if (day < scopeDate) reachedEarlierDay = true;
+    }
+    const details = await remoteDetails(candidates);
+    for (const detail of details) {
+      const day = remoteSubmittedDay(detail);
+      if (!day || day === scopeDate) items.push(detail);
+      else if (day < scopeDate) reachedEarlierDay = true;
+    }
+    if (
+      !pageItems.length
+      || reachedEarlierDay
+      || inspected >= accountTotal
+      || inspected >= 500
+    ) break;
   }
   return {
-    items: await remoteDetails(items.slice(0, 500)),
-    total: remoteTotal,
-    complete: items.length >= remoteTotal,
+    items: items.slice(0, 500),
+    total: Math.min(items.length, 500),
+    account_total: accountTotal,
+    scope_date: scopeDate,
+    complete: reachedEarlierDay || inspected >= accountTotal,
   };
 }
 
 async function syncAllRemote() {
-  const remote = await listAllRemote();
+  const remote = await listTodayRemote();
   const local = {
     matched: 0,
     unmatched: 0,
@@ -516,15 +562,7 @@ async function syncAllRemote() {
     }
     local.synced_at = result.synced_at || local.synced_at;
   }
-  if (remote.complete) {
-    const completed = await localJson("/sync", jsonOptions({
-      items: [],
-      complete: true,
-      remote_ids: remote.items.map((item) => String(item.id || "")).filter(Boolean),
-    }));
-    local.remote_missing = Number(completed.remote_missing || 0);
-    local.synced_at = completed.synced_at || local.synced_at;
-  } else if (!remote.items.length) {
+  if (!remote.items.length) {
     const empty = await localJson("/sync", jsonOptions({
       items: [],
       complete: false,
@@ -534,6 +572,8 @@ async function syncAllRemote() {
   return {
     ...local,
     remote_total: remote.total,
+    account_total: remote.account_total,
+    scope_date: remote.scope_date,
     partial: !remote.complete,
   };
 }
