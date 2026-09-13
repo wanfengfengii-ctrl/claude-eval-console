@@ -1,5 +1,6 @@
 import json
 import hashlib
+import os
 import re
 import subprocess
 import tempfile
@@ -2411,6 +2412,53 @@ class ParsingTests(unittest.TestCase):
         self.assertEqual(state["result"], "实现和测试均已完成。")
         self.assertTrue(state["complete"])
 
+    def test_container_trace_tolerates_terminal_outer_prompt_whitespace(self):
+        with tempfile.TemporaryDirectory() as directory:
+            trace_root = Path(directory)
+            transcript = trace_root / "project" / "session-spaced.jsonl"
+            transcript.parent.mkdir()
+            events = [
+                {
+                    "type": "user",
+                    "promptId": "prompt-spaced",
+                    "message": {"content": " 完成这个项目\n"},
+                },
+                {
+                    "type": "assistant",
+                    "message": {
+                        "stop_reason": "end_turn",
+                        "content": [{"type": "text", "text": "项目已经完成。"}],
+                    },
+                },
+                {"type": "system", "subtype": "turn_duration"},
+            ]
+            transcript.write_text(
+                "\n".join(json.dumps(event, ensure_ascii=False) for event in events),
+                encoding="utf-8",
+            )
+
+            state = app.trace_turn_state(trace_root, "完成这个项目")
+
+        self.assertIsNotNone(state)
+        self.assertEqual(state["session_id"], "session-spaced")
+        self.assertEqual(state["prompt_id"], "prompt-spaced")
+        self.assertTrue(state["complete"])
+
+    def test_trace_activity_ignores_mtime_only_changes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            transcript = Path(directory) / "session.jsonl"
+            transcript.write_text('{"type":"user"}\n', encoding="utf-8")
+            initial = app.trace_activity_signature(Path(directory))
+            stat = transcript.stat()
+            os.utime(
+                transcript,
+                ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000),
+            )
+
+            touched = app.trace_activity_signature(Path(directory))
+
+        self.assertEqual(touched, initial)
+
     def test_container_trace_detects_incomplete_end_and_waits_during_resume(self):
         with tempfile.TemporaryDirectory() as directory:
             trace_root = Path(directory)
@@ -3205,7 +3253,7 @@ class ParsingTests(unittest.TestCase):
         sound.assert_called_once_with()
         send_prompt.assert_not_called()
 
-    def test_six_hour_notice_keeps_read_only_monitor_running(self):
+    def test_six_hour_idle_container_is_archived_and_closed_after_restart(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             with mock.patch.object(app, "DB_PATH", root / "test.db"), mock.patch.object(
@@ -3221,9 +3269,14 @@ class ParsingTests(unittest.TestCase):
                     "_defer_start": True,
                 })
                 app.update_run(created["id"], phase="first_running")
-
-                def finish_monitor(_seconds):
-                    app.update_run(created["id"], phase="stopped")
+                old_started_at = app.datetime.fromtimestamp(
+                    time.time() - app.RUN_TIMEOUT_SECONDS - 60
+                ).astimezone().strftime("%Y-%m-%d %H:%M:%S %z")
+                with app.db_connection() as database:
+                    database.execute(
+                        "UPDATE run_turns SET created_at = ? WHERE run_id = ? AND turn_number = 1",
+                        (old_started_at, created["id"]),
+                    )
 
                 with mock.patch.object(
                     app, "refresh_trace_snapshot", return_value=(root, None)
@@ -3232,18 +3285,22 @@ class ParsingTests(unittest.TestCase):
                 ), mock.patch.object(
                     app, "trace_activity_signature", return_value=None
                 ), mock.patch.object(
-                    app.time, "monotonic", side_effect=[0, app.RUN_TIMEOUT_SECONDS + 1]
-                ), mock.patch.object(
-                    app.time, "sleep", side_effect=finish_monitor
+                    app.time,
+                    "monotonic",
+                    side_effect=[0, app.INACTIVITY_WARNING_SECONDS + 1],
                 ), mock.patch.object(app, "add_event") as event, mock.patch.object(
                     app, "send_prompt_to_screen"
                 ) as send_prompt, mock.patch.object(app, "export_and_remove_container") as export:
                     app.monitor_docker_turn(created["id"], 1)
 
+                stored = app.serialize_run(app.run_row(created["id"]))
+
         messages = [call.args[1] for call in event.call_args_list]
-        self.assertTrue(any("超过 6 小时" in message for message in messages))
+        self.assertTrue(any("超过 6 小时且连续 30 分钟" in message for message in messages))
+        self.assertEqual(stored["phase"], "interrupted")
+        self.assertIn("代码和轨迹已保留", stored["status_detail"])
         send_prompt.assert_not_called()
-        export.assert_not_called()
+        export.assert_called_once_with(created["id"], force=True)
 
 
 class ReviewTests(unittest.TestCase):

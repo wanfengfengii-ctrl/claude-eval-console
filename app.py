@@ -129,7 +129,7 @@ SOLO_QA_PROJECT_REJECTION_MARKERS = (
     "题材不合格",
 )
 SUBMITTER_NAME = os.environ.get("CLAUDE_EVAL_SUBMITTER", "牛宇航").strip() or "牛宇航"
-APP_VERSION = "20260913.15"
+APP_VERSION = "20260914.1"
 EVALUATION_REPAIR_POLICY_VERSION = 2
 REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/\[\]-]{0,127}$")
@@ -5997,7 +5997,10 @@ def trace_prompt_matches(
     events: List[Dict[str, Any]], prompt: str
 ) -> List[Tuple[int, str]]:
     """Locate a prompt, including legacy multiline pastes split by Claude's TUI."""
-    comparable_prompt = prompt.rstrip("\r\n")
+    # Claude's terminal UI can add one outer space when a long prompt is pasted.
+    # Ignore only outer whitespace; keep all wording and internal line layout
+    # exact so another user message cannot be mistaken for this turn.
+    comparable_prompt = prompt.strip(" \t\r\n")
     prompt_lines = comparable_prompt.splitlines()
     matches: List[Tuple[int, str]] = []
     for index, event in enumerate(events):
@@ -6008,10 +6011,11 @@ def trace_prompt_matches(
         prompt_id = str(event.get("promptId") or "")
         if not isinstance(content, str) or not prompt_id:
             continue
-        if content.rstrip("\r\n") == comparable_prompt:
+        recorded_content = content.strip(" \t\r\n")
+        if recorded_content == comparable_prompt:
             matches.append((index, prompt_id))
             continue
-        if len(prompt_lines) < 2 or content.rstrip("\r\n") != prompt_lines[0]:
+        if len(prompt_lines) < 2 or recorded_content != prompt_lines[0].strip(" \t"):
             continue
 
         session_id = str(event.get("sessionId") or "")
@@ -10650,10 +10654,9 @@ def refresh_trace_snapshot(row: sqlite3.Row) -> Tuple[Path, Optional[Dict[str, A
     return snapshot, trace_turn_state(snapshot, str(turn["prompt"] or ""))
 
 
-def trace_activity_signature(trace_root: Path) -> Optional[Tuple[int, int, int]]:
+def trace_activity_signature(trace_root: Path) -> Optional[Tuple[int, int]]:
     count = 0
     total_size = 0
-    latest_mtime = 0
     try:
         paths = trace_root.rglob("*.jsonl")
         for path in paths:
@@ -10663,10 +10666,11 @@ def trace_activity_signature(trace_root: Path) -> Optional[Tuple[int, int, int]]
                 continue
             count += 1
             total_size += stat.st_size
-            latest_mtime = max(latest_mtime, stat.st_mtime_ns)
     except OSError:
         return None
-    return (count, total_size, latest_mtime) if count else None
+    # Claude may touch an idle transcript without appending an event. Counting
+    # files and bytes avoids treating those mtime-only changes as real work.
+    return (count, total_size) if count else None
 
 
 def preserve_interrupted_docker_turn(run_id: str, turn_number: int, reason: str) -> None:
@@ -10847,10 +10851,10 @@ def checkpoint_resume_worker(run_id: str) -> None:
 
 def monitor_docker_turn(run_id: str, turn_number: int) -> None:
     started = time.monotonic()
+    turn_started_at = str(turn_row(run_id, turn_number)["created_at"] or "")
     last_activity_at = started
-    last_activity_signature: Optional[Tuple[int, int, int]] = None
+    last_activity_signature: Optional[Tuple[int, int]] = None
     inactivity_reported = False
-    long_running_reported = False
     last_prompt_id = ""
     attention_reason = ""
     last_attention_alert_at = 0.0
@@ -11110,13 +11114,23 @@ def monitor_docker_turn(run_id: str, turn_number: int) -> None:
         else:
             detail = f"第 {turn_number} 轮正在容器终端中运行"
 
-        if not long_running_reported and now - started >= RUN_TIMEOUT_SECONDS:
+        persisted_runtime = seconds_between(turn_started_at, now_text())
+        running_seconds = max(now - started, persisted_runtime)
+        if (
+            running_seconds >= RUN_TIMEOUT_SECONDS
+            and inactive_seconds >= INACTIVITY_WARNING_SECONDS
+        ):
+            reason = (
+                "本轮累计运行超过 6 小时且连续 30 分钟没有真实轨迹增长，"
+                "系统已自动保存代码和轨迹并关闭容器"
+            )
             add_event(
                 run_id,
-                "本轮已运行超过 6 小时；未向 Claude 发送消息，也未停止容器，将继续监控",
+                reason,
                 "warning",
             )
-            long_running_reported = True
+            preserve_interrupted_docker_turn(run_id, turn_number, reason)
+            return
         update_run(run_id, status_detail=detail)
         time.sleep(POLL_SECONDS)
 
