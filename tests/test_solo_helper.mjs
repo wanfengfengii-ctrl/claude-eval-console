@@ -37,6 +37,8 @@ const localStates = [];
 const localSyncs = [];
 const requests = [];
 let createdCount = 0;
+let transientRepairFailures = 0;
+let uploadValidationFailures = 0;
 
 function jsonResponse(value, status = 200) {
   return new Response(JSON.stringify(value), {
@@ -162,6 +164,10 @@ globalThis.fetch = async (url, options = {}) => {
   if (href.endsWith("/api/v1/submissions/upload")) {
     assert.equal(options.method, "POST");
     assert.ok(options.body instanceof FormData);
+    if (uploadValidationFailures > 0) {
+      uploadValidationFailures -= 1;
+      return jsonResponse({ detail: "轨迹上传暂不可用" }, 422);
+    }
     return jsonResponse({ name: "trace.jsonl", path: "uploads/trace.jsonl", size: trace.size });
   }
   if (href.endsWith("/api/v1/submissions") && options.method === "POST") {
@@ -173,6 +179,10 @@ globalThis.fetch = async (url, options = {}) => {
     return jsonResponse({ id: 122 + createdCount, status: "SUBMITTED", message: "提交成功" });
   }
   if (href.endsWith("/api/v1/submissions/555") && options.method === "PUT") {
+    if (transientRepairFailures > 0) {
+      transientRepairFailures -= 1;
+      return jsonResponse({ detail: "502 Bad Gateway" }, 502);
+    }
     const body = JSON.parse(options.body);
     assert.equal(body.schema_fingerprint, "schema-test");
     assert.equal(body.data.user_prompt, "完成真实提交链路 fix");
@@ -239,6 +249,42 @@ assert.equal(
   1,
 );
 assert.equal(localStates.at(-1).state, "qc_pending");
+
+transientRepairFailures = 1;
+const retriedRepairResponse = await new Promise((resolve) => {
+  listener(
+    {
+      type: "SOLO_QA_REPAIR",
+      payload: { turn_keys: ["fed789fed789:1"] },
+    },
+    { url: "http://127.0.0.1:8765/#exports" },
+    resolve,
+  );
+});
+assert.equal(retriedRepairResponse.ok, true);
+assert.equal(retriedRepairResponse.data.results[0].outcome, "resubmitted");
+assert.equal(
+  requests.filter((item) => item.href.endsWith("/submissions/555") && item.method === "PUT").length,
+  3,
+);
+
+uploadValidationFailures = 1;
+const continuedBatchResponse = await new Promise((resolve) => {
+  listener(
+    {
+      type: "SOLO_QA_SUBMIT",
+      payload: { turn_keys: ["abc123abc123:1", "def456def456:1"] },
+    },
+    { url: "http://127.0.0.1:8765/#exports" },
+    resolve,
+  );
+});
+assert.equal(continuedBatchResponse.ok, true);
+assert.equal(continuedBatchResponse.data.results.length, 2);
+assert.equal(continuedBatchResponse.data.results[0].outcome, "failed");
+assert.equal(continuedBatchResponse.data.results[1].outcome, "submitted");
+assert.equal(continuedBatchResponse.data.failed, 1);
+assert.equal(continuedBatchResponse.data.stopped, false);
 
 const syncResponse = await new Promise((resolve) => {
   const asynchronous = listener(

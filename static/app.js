@@ -1,6 +1,8 @@
-const UI_VERSION = "20260913.13";
+const UI_VERSION = "20260913.14";
 const EXPORT_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 const TABLE_PAGE_SIZE = 20;
+const SOLO_QA_AUTO_REPAIR_POLL_MS = 3000;
+const SOLO_QA_AUTO_REPAIR_TIMEOUT_MS = 20 * 60 * 1000;
 
 const state = {
   runs: [],
@@ -1039,7 +1041,10 @@ function soloQaRepairable(turn) {
     turn.export_ready
     && soloQa.remote_id
     && soloQa.remote_status === "PENDING_FIX"
-    && soloQa.payload_changed
+    && (
+      soloQa.payload_changed
+      || turn.evaluation_repair?.status === "succeeded"
+    )
     && !evaluationRepairIsActive(turn)
   );
 }
@@ -1067,7 +1072,7 @@ function renderSoloQaControls() {
     bridgeStatus.textContent = "提交助手未连接";
   }
   detail.textContent = state.soloQaLastMessage || (state.soloQaBridgeReady
-    ? "历史状态按需手动同步；提交时只核对所选轮次，并自动上传对应轨迹。"
+    ? "同步会读取最新质检结论；可由本轮材料修复的退回项会自动重写、复检并提交返修。"
     : "安装一次 Chrome 提交助手后，可同步历史提交并自动上传轨迹。");
   const selected = state.completedTurns.filter((turn) =>
     state.selectedExportTurns.has(turn.key) && soloQaSubmittable(turn)
@@ -1108,15 +1113,132 @@ function requestSoloQaBridge(type, payload = {}, timeoutMs = 10 * 60 * 1000) {
   });
 }
 
-async function syncSoloQa({ silent = false } = {}) {
+function pendingSoloQaFixTurns(turnKeys = null) {
+  const allowed = turnKeys ? new Set(turnKeys) : null;
+  return state.completedTurns.filter((turn) =>
+    (!allowed || allowed.has(turn.key))
+    && turn.solo_qa?.remote_id
+    && turn.solo_qa?.remote_status === "PENDING_FIX"
+  );
+}
+
+function soloQaBatchOutcome(result, successOutcome) {
+  const results = Array.isArray(result?.results) ? result.results : [];
+  return {
+    succeeded: results.filter((item) => item.outcome === successOutcome).length,
+    recovered: results.filter((item) => item.outcome === "recovered").length,
+    skipped: results.filter((item) => item.outcome === "skipped").length,
+    failed: results.filter((item) => item.outcome === "failed").length,
+  };
+}
+
+async function autoRepairSyncedSoloQaReturns() {
+  const initial = pendingSoloQaFixTurns();
+  if (!initial.length) {
+    return { detected: 0, message: "没有发现需要返修的数据" };
+  }
+  const turnKeys = initial.map((turn) => turn.key);
+  const queuedRevisions = new Map();
+  const deadline = Date.now() + SOLO_QA_AUTO_REPAIR_TIMEOUT_MS;
+  let queued = 0;
+
+  while (Date.now() < deadline) {
+    await loadCompletedTurns({ autoRepair: false });
+    const targets = pendingSoloQaFixTurns(turnKeys);
+    const active = targets.filter(evaluationRepairIsActive);
+    const needed = targets.filter((turn) =>
+      turn.evaluation_repair?.status === "needed"
+      && turn.evaluation_repair?.can_start
+      && queuedRevisions.get(turn.key) !== turn.evaluation_repair?.revision
+    );
+    if (needed.length) {
+      for (const turn of needed) {
+        queuedRevisions.set(turn.key, turn.evaluation_repair?.revision || "");
+      }
+      state.soloQaLastMessage = `同步发现 ${turnKeys.length} 条待返修，正在根据质检原因修复 ${needed.length} 条评分文字…`;
+      renderSoloQaControls();
+      const result = await api("/api/exports/evaluation-repairs", {
+        method: "POST",
+        body: JSON.stringify({
+          turn_keys: needed.map((turn) => turn.key),
+          retry_failed: true,
+        }),
+      });
+      queued += Number(result.queued || 0);
+    }
+    if (!active.length && !needed.length) break;
+    state.soloQaLastMessage = `同步发现 ${turnKeys.length} 条待返修，正在等待评分文字自动修复完成…`;
+    renderSoloQaControls();
+    await new Promise((resolve) => window.setTimeout(resolve, SOLO_QA_AUTO_REPAIR_POLL_MS));
+  }
+
+  await loadCompletedTurns({ autoRepair: false });
+  const stillActive = pendingSoloQaFixTurns(turnKeys).filter(evaluationRepairIsActive);
+  if (stillActive.length) {
+    return {
+      detected: turnKeys.length,
+      queued,
+      message: `发现 ${turnKeys.length} 条待返修；${stillActive.length} 条自动修复等待超时，已保留供人工处理`,
+    };
+  }
+
+  state.soloQaLastMessage = `评分文字修复完成，正在检查 ${turnKeys.length} 条返修数据…`;
+  renderSoloQaControls();
+  const preflight = await runExportPreflight(turnKeys, { announce: false });
+  const eligible = new Set(
+    (preflight?.results || [])
+      .filter((item) => item.eligible)
+      .map((item) => item.key)
+  );
+  const repairable = pendingSoloQaFixTurns(turnKeys)
+    .filter((turn) => eligible.has(turn.key) && soloQaRepairable(turn))
+    .sort((left, right) => Number(left.turn_number || 0) - Number(right.turn_number || 0));
+  const blocked = turnKeys.length - repairable.length;
+  if (!repairable.length) {
+    return {
+      detected: turnKeys.length,
+      queued,
+      blocked,
+      message: `发现 ${turnKeys.length} 条待返修，但都没有形成可安全提交的修复；已保留原因供人工处理`,
+    };
+  }
+
+  state.soloQaLastMessage = `检查通过，正在自动提交 ${repairable.length} 条返修…`;
+  renderSoloQaControls();
+  const result = await requestSoloQaBridge(
+    "SOLO_QA_REPAIR",
+    { turn_keys: repairable.map((turn) => turn.key) },
+  );
+  const outcome = soloQaBatchOutcome(result, "resubmitted");
+  await loadCompletedTurns({ autoRepair: false });
+  const parts = [`发现 ${turnKeys.length} 条待返修`, `自动提交 ${outcome.succeeded} 条`];
+  if (outcome.failed) parts.push(`${outcome.failed} 条提交失败`);
+  if (outcome.skipped) parts.push(`${outcome.skipped} 条状态已变化`);
+  if (blocked) parts.push(`${blocked} 条需人工处理`);
+  return {
+    detected: turnKeys.length,
+    queued,
+    blocked,
+    ...outcome,
+    message: parts.join("，"),
+  };
+}
+
+async function syncSoloQa({ silent = false, autoRepair = true } = {}) {
   if (!state.soloQaBridgeReady || state.soloQaBusy) return;
   state.soloQaBusy = true;
   state.soloQaLastMessage = "正在读取 SOLO-QA 的我的提交…";
   renderSoloQaControls();
   try {
     const result = await requestSoloQaBridge("SOLO_QA_SYNC", {}, 3 * 60 * 1000);
-    state.soloQaLastMessage = `已同步远端 ${result.remote_total || 0} 条；匹配本地 ${result.matched || 0} 条${result.unmatched ? `，${result.unmatched} 条在本地未找到` : ""}${result.remote_missing ? `，${result.remote_missing} 条远端已不存在` : ""}${result.partial ? "；远端超过 500 条，本次仅同步最近 500 条" : ""}`;
-    await loadCompletedTurns();
+    const syncMessage = `已同步远端 ${result.remote_total || 0} 条；匹配本地 ${result.matched || 0} 条${result.unmatched ? `，${result.unmatched} 条在本地未找到` : ""}${result.remote_missing ? `，${result.remote_missing} 条远端已不存在` : ""}${result.partial ? "；远端超过 500 条，本次仅同步最近 500 条" : ""}`;
+    await loadCompletedTurns({ autoRepair: false });
+    const repair = autoRepair
+      ? await autoRepairSyncedSoloQaReturns()
+      : { message: "" };
+    state.soloQaLastMessage = repair.message
+      ? `${syncMessage}；${repair.message}`
+      : syncMessage;
     if (!silent) showNotice(state.soloQaLastMessage);
   } catch (error) {
     state.soloQaLastMessage = error.message;
@@ -1156,10 +1278,8 @@ async function submitSelectedToSoloQa() {
     const submitted = (result.results || []).filter((item) => item.outcome === "submitted").length;
     const recovered = (result.results || []).filter((item) => item.outcome === "recovered").length;
     const skipped = (result.results || []).filter((item) => item.outcome === "skipped").length;
-    const failed = (result.results || []).find((item) => item.outcome === "failed");
-    state.soloQaLastMessage = failed
-      ? `已提交 ${submitted} 条、找回 ${recovered} 条；在 ${failed.turn_key} 停止：${failed.error}${result.remaining ? `，剩余 ${result.remaining} 条未处理` : ""}`
-      : `提交完成：新增 ${submitted} 条${recovered ? `，找回已有 ${recovered} 条` : ""}${skipped ? `，跳过 ${skipped} 条` : ""}`;
+    const failed = (result.results || []).filter((item) => item.outcome === "failed");
+    state.soloQaLastMessage = `提交完成：新增 ${submitted} 条${recovered ? `，找回已有 ${recovered} 条` : ""}${skipped ? `，跳过 ${skipped} 条` : ""}${failed.length ? `，失败 ${failed.length} 条（${failed[0].turn_key}：${failed[0].error}）` : ""}`;
     await loadCompletedTurns();
     showNotice(state.soloQaLastMessage);
   } catch (error) {
@@ -1199,10 +1319,8 @@ async function repairSelectedInSoloQa() {
       (item) => item.outcome === "resubmitted"
     ).length;
     const skipped = (result.results || []).filter((item) => item.outcome === "skipped").length;
-    const failed = (result.results || []).find((item) => item.outcome === "failed");
-    state.soloQaLastMessage = failed
-      ? `已提交返修 ${resubmitted} 条；在 ${failed.turn_key} 停止：${failed.error}${result.remaining ? `，剩余 ${result.remaining} 条未处理` : ""}`
-      : `返修提交完成：${resubmitted} 条已重新质检${skipped ? `，跳过 ${skipped} 条` : ""}`;
+    const failed = (result.results || []).filter((item) => item.outcome === "failed");
+    state.soloQaLastMessage = `返修提交完成：${resubmitted} 条已重新质检${skipped ? `，跳过 ${skipped} 条` : ""}${failed.length ? `，失败 ${failed.length} 条（${failed[0].turn_key}：${failed[0].error}）` : ""}`;
     await loadCompletedTurns();
     showNotice(state.soloQaLastMessage);
   } catch (error) {

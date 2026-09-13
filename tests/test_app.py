@@ -137,6 +137,14 @@ class ValidationTests(unittest.TestCase):
             'ConfigDict(extra="ignore") 没有修改。',
         )
 
+    def test_plain_wording_does_not_duplicate_a_nested_negation(self):
+        self.assertEqual(
+            app.naturalize_evaluation_description(
+                "代码复核确认没有未提交改动，也没有没有提交改动。"
+            ),
+            "代码复核确认没有未提交改动，也没有未提交改动。",
+        )
+
     def test_manual_evaluation_keeps_the_users_wording(self):
         evaluation = sample_evaluation()
         evaluation["delivery"]["description"] = "三个场景均已验证，尚未发现问题。"
@@ -1441,7 +1449,9 @@ class ValidationTests(unittest.TestCase):
         )[0]
 
         self.assertNotIn("syncSoloQa", bridge_ready)
-        self.assertIn("历史状态按需手动同步", source)
+        self.assertIn("同步会读取最新质检结论", source)
+        self.assertIn("autoRepairSyncedSoloQaReturns", source)
+        self.assertIn("retry_failed: true", source)
 
     def test_run_list_exposes_filters_delete_and_export_routes(self):
         html = (app.STATIC_DIR / "index.html").read_text(encoding="utf-8")
@@ -1620,6 +1630,7 @@ class ValidationTests(unittest.TestCase):
             self.assertIn(control, html)
         self.assertIn("SOLO_QA_BRIDGE_READY", javascript)
         self.assertIn("submitSelectedToSoloQa", javascript)
+        self.assertIn("同步并自动返修", html)
         self.assertIn(
             ".sort((left, right) => Number(left.turn_number || 0) - Number(right.turn_number || 0))",
             javascript,
@@ -8809,6 +8820,22 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(len(issues), 5)
         self.assertTrue(all("描述与历史点评高度重复" in issue for issue in issues))
 
+    def test_solo_qa_spelling_return_rewrites_all_five_descriptions(self):
+        row = {
+            "solo_qa_state": "needs_fix",
+            "solo_qa_remote_submission_id": "9250",
+            "solo_qa_remote_status": "PENDING_FIX",
+            "solo_qa_remote_updated_at": "2026-09-13T22:43:13",
+            "solo_qa_qc_summary": "五段描述中检出 1 个错别字",
+        }
+
+        issues = app.solo_qa_returned_evaluation_repair_issues(
+            row, sample_evaluation()
+        )
+
+        self.assertEqual(len(issues), 5)
+        self.assertTrue(all("描述包含错别字" in issue for issue in issues))
+
     def test_solo_qa_return_marker_suppresses_only_the_same_rejection(self):
         row = {
             "solo_qa_state": "needs_fix",
@@ -9676,6 +9703,49 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(saved["remote_id"], "42")
         self.assertEqual(changed["state"], "local_changed")
         self.assertTrue(changed["payload_changed"])
+
+    def test_failed_solo_qa_repair_keeps_previous_remote_payload_digest(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.object(app, "DB_PATH", root / "test.db"), mock.patch.object(
+                app, "DATA_DIR", root
+            ):
+                app.initialize_database()
+                self.insert_completed_turn(root)
+                original = app.solo_qa_turn_payload("abc123abc123:1")
+                app.record_solo_qa_state({
+                    "turn_key": "abc123abc123:1",
+                    "state": "qc_pending",
+                    "remote_id": "42",
+                    "remote_status": "SUBMITTED",
+                    "payload_sha256": original["payload_sha256"],
+                })
+                changed_evaluation = sample_evaluation()
+                changed_evaluation["delivery"]["description"] = (
+                    "本轮逐项核对了题面约束并完成项目验收，库存卡片交付结果已有对应记录。"
+                )
+                app.update_turn(
+                    "abc123abc123",
+                    1,
+                    review_result=json.dumps(
+                        {"evaluation": changed_evaluation}, ensure_ascii=False
+                    ),
+                )
+                changed_payload = app.solo_qa_turn_payload("abc123abc123:1")
+                app.record_solo_qa_state({
+                    "turn_key": "abc123abc123:1",
+                    "state": "needs_fix",
+                    "remote_id": "42",
+                    "remote_status": "PENDING_FIX",
+                    "payload_sha256": changed_payload["payload_sha256"],
+                    "error": "502 Bad Gateway",
+                })
+                row = app.completed_turn_rows()[0]
+                summary = app.completed_turns()[0]["solo_qa"]
+
+        self.assertEqual(row["solo_qa_payload_sha256"], original["payload_sha256"])
+        self.assertEqual(summary["state"], "local_changed")
+        self.assertTrue(summary["payload_changed"])
 
     def test_solo_qa_sync_matches_session_and_turn_and_marks_remote_missing(self):
         with tempfile.TemporaryDirectory() as directory:

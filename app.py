@@ -129,7 +129,7 @@ SOLO_QA_PROJECT_REJECTION_MARKERS = (
     "题材不合格",
 )
 SUBMITTER_NAME = os.environ.get("CLAUDE_EVAL_SUBMITTER", "牛宇航").strip() or "牛宇航"
-APP_VERSION = "20260913.13"
+APP_VERSION = "20260913.14"
 EVALUATION_REPAIR_POLICY_VERSION = 2
 REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/\[\]-]{0,127}$")
@@ -7228,6 +7228,7 @@ def solo_qa_returned_evaluation_fingerprint(row: Dict[str, Any]) -> str:
         "具体依据无法",
         "数量或状态码无法",
         "反引号",
+        "错别字",
     )
     if "描述" not in summary or not any(
         marker in summary for marker in actionable_markers
@@ -7267,6 +7268,11 @@ def solo_qa_returned_evaluation_repair_issues(
     multi_match = re.search(r"等\s*([2-5])\s*个维度", summary)
     if multi_match and int(multi_match.group(1)) > len(selected):
         selected = list(EVALUATION_DIMENSION_KEYS)
+    if not selected and ("五段描述" in summary or "错别字" in summary):
+        # The spelling checker reports one aggregate result without naming the
+        # affected dimension. Rewriting all five is safer than guessing and
+        # mirrors SOLO-QA's own five-description validation scope.
+        selected = list(EVALUATION_DIMENSION_KEYS)
     if not selected:
         return []
 
@@ -7278,6 +7284,8 @@ def solo_qa_returned_evaluation_repair_issues(
             for marker in ("重复", "公共长片段", "套模板", "分段复读")
         ):
             reason = f"自动检查的{label}描述与历史点评高度重复"
+        elif "错别字" in summary:
+            reason = f"自动检查的{label}描述包含错别字"
         elif "满分" in summary:
             reason = f"自动检查的{label}满分描述包含扣分点"
         else:
@@ -8396,7 +8404,12 @@ def record_solo_qa_state(payload: Dict[str, Any]) -> Dict[str, Any]:
         raise WorkflowError("提交数据摘要格式不正确")
     if reported_digest and current_digest and reported_digest != current_digest:
         raise WorkflowError("本地轮次数据已变化，请刷新后重新提交")
-    digest = reported_digest or current_digest or None
+    # Only advance the saved remote payload fingerprint after a request has
+    # entered a submitted state. A failed new submission or failed PENDING_FIX
+    # update must keep the previous fingerprint so the UI still knows that the
+    # repaired local prose has not reached SOLO-QA yet.
+    submitted_state = state in {"submitting", "qc_pending", "qc_passed", "discarded"}
+    digest = (reported_digest or current_digest or None) if submitted_state else None
     timestamp = now_text()
     error = str(payload.get("error") or "").strip()[:4000]
     qc_summary = str(payload.get("qc_summary") or "").strip()[:4000]
@@ -12221,6 +12234,10 @@ def naturalize_evaluation_description(value: Any) -> str:
     )
 
     def rewrite_prose(text: str) -> str:
+        # “没有未提交改动” is already plain Chinese. Rewriting its inner “未提交”
+        # again produced the spelling error “没有没有提交改动”. Repair legacy
+        # text and keep the negation pair stable on future generations.
+        text = text.replace("没有没有提交改动", "没有未提交改动")
         text = text.replace("尚未包含", "还没有").replace("还未包含", "还没有")
         text = text.replace("仍未包含", "仍然没有").replace("均未包含", "都没有")
         text = text.replace("不包含", "没有").replace("未包含", "没有")
@@ -12233,7 +12250,7 @@ def naturalize_evaluation_description(value: Any) -> str:
             lambda match: match.group(0)[:-1] + "还没",
             text,
         )
-        text = re.sub(r"未(?=(?:" + negative_verbs + r"))", "没有", text)
+        text = re.sub(r"(?<!没有)未(?=(?:" + negative_verbs + r"))", "没有", text)
         text = text.replace("均已", "都已经")
         text = re.sub(r"均(?=(?:" + uniform_verbs + r"))", "都", text)
         return text

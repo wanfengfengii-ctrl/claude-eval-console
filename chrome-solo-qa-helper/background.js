@@ -28,6 +28,8 @@ const REMOTE_DETAIL_CONTAINERS = [
 const REMOTE_DESCRIPTION_MAX_CHARS = 2000;
 const REMOTE_DEDUP_MAX_HITS = 20;
 const REMOTE_DEDUP_MAX_CHARS = 12000;
+const TRANSIENT_REMOTE_STATUSES = new Set([0, 408, 425, 429, 500, 502, 503, 504]);
+const REMOTE_RETRY_DELAYS_MS = [500, 1500, 3500];
 const FIELD_KEY_LABELS = {
   question_type: "任务类型",
   task_type: "任务类型",
@@ -123,7 +125,11 @@ function bytesToBase64(bytes) {
   return btoa(chunks.join(""));
 }
 
-async function requestInSoloQaPage(path, options = {}, pageBody = null) {
+function wait(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+async function requestInSoloQaPage(path, options = {}, pageBody = null, maxAttempts = 1) {
   const tab = await soloQaTab();
   const method = String(options.method || "GET").toUpperCase();
   const headers = {};
@@ -133,9 +139,11 @@ async function requestInSoloQaPage(path, options = {}, pageBody = null) {
       ? { kind: "text", value: options.body }
       : { kind: "none" }
   );
-  let injected;
-  try {
-    injected = await chrome.scripting.executeScript({
+  let lastError = null;
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    let injected;
+    try {
+      injected = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       world: "MAIN",
       func: async (request) => {
@@ -199,25 +207,42 @@ async function requestInSoloQaPage(path, options = {}, pageBody = null) {
         return { ok: response.ok, status: response.status, body: responseBody };
       },
       args: [{ path, method, headers, body }],
-    });
-  } catch (error) {
-    throw new Error(`无法调用已登录的 SOLO-QA 页面：${error instanceof Error ? error.message : String(error)}`);
-  }
-  const result = injected?.[0]?.result;
-  if (!result || typeof result.status !== "number") {
-    throw new Error("SOLO-QA 页面没有返回有效结果，请刷新页面后重试");
-  }
-  if (!result.ok) {
-    if (result.status === 401) {
-      throw new Error("SOLO-QA 页面登录状态无效，请在该页面重新登录后刷新");
+      });
+    } catch (error) {
+      lastError = new Error(`无法调用已登录的 SOLO-QA 页面：${error instanceof Error ? error.message : String(error)}`);
+      if (attempt < maxAttempts) {
+        await wait(REMOTE_RETRY_DELAYS_MS[Math.min(attempt - 1, REMOTE_RETRY_DELAYS_MS.length - 1)]);
+        continue;
+      }
+      throw lastError;
     }
-    throw new Error(errorMessage(result.body, `SOLO-QA 请求失败 (${result.status || "网络错误"})`));
+    const result = injected?.[0]?.result;
+    if (!result || typeof result.status !== "number") {
+      lastError = new Error("SOLO-QA 页面没有返回有效结果，请刷新页面后重试");
+    } else if (result.ok) {
+      return result.body;
+    } else if (result.status === 401) {
+      throw new Error("SOLO-QA 页面登录状态无效，请在该页面重新登录后刷新");
+    } else {
+      lastError = new Error(errorMessage(
+        result.body,
+        `SOLO-QA 请求失败 (${result.status || "网络错误"})`,
+      ));
+      if (!TRANSIENT_REMOTE_STATUSES.has(result.status)) throw lastError;
+    }
+    if (attempt < maxAttempts) {
+      await wait(REMOTE_RETRY_DELAYS_MS[Math.min(attempt - 1, REMOTE_RETRY_DELAYS_MS.length - 1)]);
+      continue;
+    }
+    throw lastError;
   }
-  return result.body;
+  throw lastError || new Error("SOLO-QA 请求失败");
 }
 
 function remoteJson(path, options = {}) {
-  return requestInSoloQaPage(path, options);
+  const method = String(options.method || "GET").toUpperCase();
+  const maxAttempts = ["GET", "PUT"].includes(method) ? 4 : 1;
+  return requestInSoloQaPage(path, options, null, maxAttempts);
 }
 
 async function remoteFile(path, blob, filename) {
@@ -227,7 +252,7 @@ async function remoteFile(path, blob, filename) {
     base64: bytesToBase64(bytes),
     filename,
     contentType: blob.type || "application/x-ndjson",
-  });
+  }, 4);
 }
 
 function jsonOptions(body, method = "POST") {
@@ -637,10 +662,15 @@ async function submitBatch(payload) {
         outcome: "failed",
         error: error instanceof Error ? error.message : String(error),
       });
-      return { results, stopped: true, remaining: keys.length - index - 1 };
+      schemaPromise = null;
     }
   }
-  return { results, stopped: false, remaining: 0 };
+  return {
+    results,
+    stopped: false,
+    remaining: 0,
+    failed: results.filter((item) => item.outcome === "failed").length,
+  };
 }
 
 async function repairOne(turnKey, loadFormSchema) {
@@ -730,10 +760,15 @@ async function repairBatch(payload) {
         outcome: "failed",
         error: error instanceof Error ? error.message : String(error),
       });
-      return { results, stopped: true, remaining: keys.length - index - 1 };
+      schemaPromise = null;
     }
   }
-  return { results, stopped: false, remaining: 0 };
+  return {
+    results,
+    stopped: false,
+    remaining: 0,
+    failed: results.filter((item) => item.outcome === "failed").length,
+  };
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
