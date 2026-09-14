@@ -11988,6 +11988,7 @@ class ResilienceTests(unittest.TestCase):
                     "task_type": "Feature 迭代",
                     "status": "generating",
                     "stage": "独立复核中",
+                    "target_sequence": 2,
                     "started_at": timestamp,
                 })
                 with app.ITERATION_JOB_LOCK:
@@ -11997,6 +11998,7 @@ class ResilienceTests(unittest.TestCase):
 
         self.assertEqual(recovered["status"], "generating")
         self.assertEqual(recovered["stage"], "独立复核中")
+        self.assertEqual(recovered["target_sequence"], 2)
 
     def test_compose_verification_uses_per_run_project_and_numeric_ports(self):
         first = app.verification_environment("aaa111aaa111")
@@ -12183,6 +12185,260 @@ class ConcurrencyTests(unittest.TestCase):
                 self.assertFalse(second_started.is_set())
                 release_first.set()
                 self.assertTrue(second_started.wait(1))
+
+
+class NiuBugWorkflowMergeTests(unittest.TestCase):
+    def test_bounded_review_trajectory_keeps_tool_ledger_and_boundaries(self):
+        trajectory = (
+            "TRACE-HEAD\n"
+            + "a" * 30000
+            + "\nTOOL Bash: test-command\nTOOL RESULT: test-result\n"
+            + "b" * 30000
+            + "\nTRACE-TAIL"
+        )
+
+        compact = app.bounded_review_trajectory(trajectory, 24000)
+
+        self.assertLessEqual(len(compact), 24000)
+        self.assertIn("TRACE-HEAD", compact)
+        self.assertIn("TOOL Bash: test-command", compact)
+        self.assertIn("TRACE-TAIL", compact)
+
+    def test_review_compacts_findings_but_scores_with_full_trajectory(self):
+        trajectory = "TRACE-HEAD\n" + "x" * 80000 + "\nTRACE-TAIL"
+        findings = {
+            "summary": "没有发现问题",
+            "next_action": "complete",
+            "bugs": [],
+            "quality_gaps": [],
+        }
+        scored = {**findings, "evaluation": sample_evaluation()}
+        with mock.patch.object(
+            app, "run_codex_structured", return_value=findings
+        ) as structured, mock.patch.object(
+            app, "score_review_findings", return_value=scored
+        ) as score:
+            result = app.run_codex_review(
+                Path("/tmp/review"),
+                "原始需求",
+                [],
+                trajectory,
+                findings_reasoning_effort="low",
+                evaluation_trajectory=trajectory,
+            )
+
+        findings_prompt = structured.call_args.args[0]
+        self.assertLess(len(findings_prompt), 35000)
+        self.assertIn("找 Bug 轨迹中段已压缩", findings_prompt)
+        self.assertEqual(structured.call_args.kwargs["reasoning_effort"], "low")
+        self.assertEqual(score.call_args.args[5], trajectory)
+        self.assertEqual(result, scored)
+
+    def test_candidate_quality_blocks_only_bugfix_auto_refill(self):
+        detail = (
+            f"连续 {app.ITERATION_GENERATION_ATTEMPTS} 次未生成合规迭代需求："
+            "代码基线中没有三个可以稳定复现的真实问题"
+        )
+        current_job = {
+            "status": "generating",
+            "source_run_id": "source111111",
+            "baseline_run_id": "base11111111",
+            "lineage_origin_run_id": "source111111",
+            "task_type": "Bug 修复",
+            "auto_refill": True,
+            "target_sequence": 2,
+        }
+        saved = {}
+
+        def save_job(job):
+            saved.clear()
+            saved.update(job)
+            return dict(job)
+
+        with mock.patch.object(
+            app, "generate_and_start_iteration", side_effect=app.WorkflowError(detail)
+        ), mock.patch.object(
+            app, "get_iteration_job", return_value=current_job
+        ), mock.patch.object(
+            app, "put_iteration_job", side_effect=save_job
+        ), mock.patch.object(app, "add_event"), mock.patch.object(
+            app, "record_auto_refill_candidate_skip"
+        ) as skipped, mock.patch.object(
+            app, "record_auto_refill_failure"
+        ) as failed:
+            app.automatic_iteration_worker(
+                "source111111", "Bug 修复", False, True
+            )
+
+        self.assertEqual(saved["status"], "blocked")
+        self.assertEqual(saved["baseline_run_id"], "base11111111")
+        self.assertEqual(saved["target_sequence"], 2)
+        self.assertIsNone(saved["cooldown_until_epoch"])
+        skipped.assert_called_once()
+        failed.assert_not_called()
+
+    def test_transient_bugfix_generation_failure_is_not_blocked(self):
+        for detail in (
+            "API Error: Request rejected (429)",
+            "504 Gateway Time-out",
+            "certificate_verification_error",
+            "连接失败",
+        ):
+            with self.subTest(detail=detail):
+                self.assertTrue(
+                    app.iteration_generation_infrastructure_failure(detail)
+                )
+
+    def test_blocked_bugfix_is_scoped_to_the_current_lineage_sequence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            timestamp = app.now_text()
+            with mock.patch.object(app, "DB_PATH", root / "test.db"), mock.patch.object(
+                app, "DATA_DIR", root
+            ), mock.patch.object(app, "PROJECTS_ROOT", root):
+                app.initialize_database()
+                with app.db_connection() as database:
+                    database.execute(
+                        """INSERT INTO runs(
+                             id, repo_name, repo_path, run_directory, repo_url, phase,
+                             first_prompt, first_prompt_id, container_cleaned, task_type,
+                             source_run_id, verification_commands, created_at, updated_at
+                           ) VALUES (?, ?, ?, ?, ?, 'complete', '原始需求', 'prompt-1',
+                                     1, ?, ?, '[]', ?, ?)""",
+                        (
+                            "root11111111", "root", str(root / "root"), str(root),
+                            "https://example.invalid/root", "0-1 代码生成", None,
+                            timestamp, timestamp,
+                        ),
+                    )
+                    database.execute(
+                        """INSERT INTO runs(
+                             id, repo_name, repo_path, run_directory, repo_url, phase,
+                             first_prompt, first_prompt_id, container_cleaned, task_type,
+                             source_run_id, verification_commands, created_at, updated_at
+                           ) VALUES (?, ?, ?, ?, ?, 'complete', '功能迭代', 'prompt-2',
+                                     1, ?, ?, '[]', ?, ?)""",
+                        (
+                            "feature11111", "feature", str(root / "feature"), str(root),
+                            "https://example.invalid/root", "Feature 迭代", "root11111111",
+                            timestamp, timestamp,
+                        ),
+                    )
+                blocked = app.put_iteration_job(
+                    {
+                        "source_run_id": "root11111111",
+                        "baseline_run_id": "feature11111",
+                        "lineage_origin_run_id": "root11111111",
+                        "task_type": "Bug 修复",
+                        "auto_refill": True,
+                        "status": "blocked",
+                        "target_sequence": 2,
+                    }
+                )
+                self.assertIsNone(app.auto_refill_iteration_candidate())
+
+                blocked["target_sequence"] = 1
+                app.put_iteration_job(blocked)
+                candidate = app.auto_refill_iteration_candidate()
+                app.remove_iteration_job("root11111111")
+
+        self.assertEqual(candidate["id"], "root11111111")
+        self.assertEqual(candidate["next_iteration_task_type"], "Bug 修复")
+
+    def test_terminal_idle_detection_uses_latest_state_marker(self):
+        idle = "Bypass Permissions On\nEsc to interrupt\nDone\nNew task?"
+        active = "Bypass Permissions On\nDone\nNew task?\nEsc to interrupt"
+
+        self.assertTrue(app.terminal_idle_prompt_visible(idle))
+        self.assertFalse(app.terminal_idle_prompt_visible(active))
+
+    def test_terminal_screen_capture_falls_back_to_log_when_hardcopy_is_empty(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = app.terminal_asset_paths("fallback-demo")
+            with mock.patch.object(app, "TERMINAL_ASSETS_DIR", root):
+                paths = app.terminal_asset_paths("fallback-demo")
+                paths["root"].mkdir(parents=True)
+                paths["screen_log"].write_text("Done\nNew task?\n", encoding="utf-8")
+
+                def empty_hardcopy(args, **_kwargs):
+                    Path(args[-1]).write_text("", encoding="utf-8")
+                    return subprocess.CompletedProcess(args, 0, "", "")
+
+                with mock.patch.object(
+                    app, "screen_session_running", return_value=True
+                ), mock.patch.object(app, "run_command", side_effect=empty_hardcopy):
+                    output = app.terminal_screen_text(
+                        "fallback-demo", "screen-fallback"
+                    )
+
+        self.assertIn("New task?", output)
+
+    def test_business_code_probe_ignores_lockfile_and_accepts_runtime_config(self):
+        with tempfile.TemporaryDirectory() as directory:
+            workspace = Path(directory)
+            app.run_command(["git", "init"], cwd=workspace)
+            app.run_command(["git", "config", "user.name", "Test User"], cwd=workspace)
+            app.run_command(
+                ["git", "config", "user.email", "test@example.com"], cwd=workspace
+            )
+            (workspace / "README.md").write_text("baseline\n", encoding="utf-8")
+            app.run_command(["git", "add", "README.md"], cwd=workspace)
+            app.run_command(["git", "commit", "-m", "baseline"], cwd=workspace)
+            base_sha = app.run_command(
+                ["git", "rev-parse", "HEAD"], cwd=workspace
+            ).stdout.strip()
+            row = {"repo_path": str(workspace), "base_sha": base_sha}
+
+            (workspace / "package-lock.json").write_text("{}\n", encoding="utf-8")
+            self.assertEqual(app.workspace_business_code_output_paths(row), [])
+
+            (workspace / "docker-compose.yml").write_text(
+                "services: {}\n", encoding="utf-8"
+            )
+            self.assertEqual(
+                app.workspace_business_code_output_paths(row),
+                ["docker-compose.yml"],
+            )
+
+    def test_no_code_watchdog_stops_an_inactive_first_turn(self):
+        row = {
+            "phase": "first_running",
+            "container_name": "container-demo",
+            "screen_name": "screen-demo",
+            "retry_not_before_epoch": 0,
+        }
+        with mock.patch.object(app, "run_row", return_value=row), mock.patch.object(
+            app, "turn_row", return_value={"created_at": app.now_text()}
+        ), mock.patch.object(
+            app, "refresh_trace_snapshot", return_value=(None, None)
+        ), mock.patch.object(
+            app, "docker_container_running", return_value=True
+        ), mock.patch.object(
+            app, "terminal_screen_text", return_value=""
+        ), mock.patch.object(
+            app, "trace_activity_signature", return_value=None
+        ), mock.patch.object(
+            app, "completion_recovery_sent_epoch", return_value=None
+        ), mock.patch.object(
+            app, "final_summary_recovery_sent_epoch", return_value=None
+        ), mock.patch.object(
+            app, "seconds_between", return_value=2000
+        ), mock.patch.object(
+            app, "workspace_business_code_output_paths", return_value=[]
+        ), mock.patch.object(
+            app, "add_event"
+        ), mock.patch.object(
+            app.time, "monotonic", side_effect=[0, 2000]
+        ), mock.patch.object(
+            app, "NO_CODE_OUTPUT_PROBE_INTERVAL_SECONDS", 0
+        ), mock.patch.object(
+            app, "stop_run_for_no_code_output"
+        ) as stop:
+            app.monitor_docker_turn("watch1111111", 1)
+
+        stop.assert_called_once()
+        self.assertIn("30 分钟", stop.call_args.args[1])
 
 
 if __name__ == "__main__":

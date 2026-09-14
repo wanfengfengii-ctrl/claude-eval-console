@@ -89,7 +89,16 @@ MAX_BODY_BYTES = 1_000_000
 POLL_SECONDS = 3
 RUN_TIMEOUT_SECONDS = 6 * 60 * 60
 INACTIVITY_WARNING_SECONDS = 30 * 60
+NO_CODE_OUTPUT_GRACE_SECONDS = 30 * 60
+NO_CODE_OUTPUT_INACTIVITY_SECONDS = 15 * 60
+NO_CODE_OUTPUT_HARD_TIMEOUT_SECONDS = 2 * 60 * 60
+NO_CODE_OUTPUT_PROBE_INTERVAL_SECONDS = 5 * 60
 TERMINAL_ATTENTION_ALERT_INTERVAL_SECONDS = 60
+TERMINAL_IDLE_STABLE_SECONDS = 5 * 60
+TERMINAL_RECOVERY_IDLE_STABLE_SECONDS = 15
+TERMINAL_COMPLETION_RECOVERY_GRACE_SECONDS = 10 * 60
+TERMINAL_FINAL_SUMMARY_RECOVERY_GRACE_SECONDS = 2 * 60
+COMPLETION_RECOVERY_PROMPT_PREFIX = "[CLAUDE-EVAL-COMPLETE-TURN]"
 TERMINAL_ATTENTION_SOUND_PATH = Path(
     os.environ.get(
         "CLAUDE_EVAL_ATTENTION_SOUND",
@@ -130,7 +139,7 @@ SOLO_QA_PROJECT_REJECTION_MARKERS = (
     "题材不合格",
 )
 SUBMITTER_NAME = os.environ.get("CLAUDE_EVAL_SUBMITTER", "牛宇航").strip() or "牛宇航"
-APP_VERSION = "20260915.1"
+APP_VERSION = "20260915.2"
 EVALUATION_REPAIR_POLICY_VERSION = 5
 REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/\[\]-]{0,127}$")
@@ -220,7 +229,9 @@ DOCKER_STARTUP_HEALTH_CACHE_SECONDS = 10
 CONTROL_STAGE_RETRY_LIMIT = 2
 CONTROL_STAGE_RETRY_BASE_SECONDS = 15
 EVALUATION_SPLIT_MAX_CONCURRENCY = 5
+REVIEW_FINDINGS_TRAJECTORY_MAX_CHARS = 60_000
 EVALUATION_SCORING_TRAJECTORY_MAX_CHARS = 60_000
+EVALUATION_SCORING_FALLBACK_TRAJECTORY_MAX_CHARS = 24_000
 EVALUATION_PUBLIC_HISTORY_LIMIT = 20
 EVALUATION_PUBLIC_HISTORY_MAX_CHARS = 6_000
 UNASSESSED_TASK_DIFFICULTY = "待评估"
@@ -1235,6 +1246,7 @@ def initialize_database() -> None:
               last_error TEXT,
               created_run_id TEXT,
               cooldown_until_epoch INTEGER,
+              target_sequence INTEGER,
               started_at TEXT,
               updated_at TEXT NOT NULL
             );
@@ -1388,6 +1400,10 @@ def initialize_database() -> None:
         }
         if "stage" not in iteration_job_columns:
             database.execute("ALTER TABLE iteration_jobs ADD COLUMN stage TEXT")
+        if "target_sequence" not in iteration_job_columns:
+            database.execute(
+                "ALTER TABLE iteration_jobs ADD COLUMN target_sequence INTEGER"
+            )
         turn_columns = {
             row["name"] for row in database.execute("PRAGMA table_info(run_turns)")
         }
@@ -1551,8 +1567,8 @@ def put_iteration_job(job: Dict[str, Any]) -> Dict[str, Any]:
                 """INSERT INTO iteration_jobs(
                  source_run_id, baseline_run_id, lineage_origin_run_id, task_type,
                  auto_refill, status, stage, recovery_count, last_error, created_run_id,
-                 cooldown_until_epoch, started_at, updated_at
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 cooldown_until_epoch, target_sequence, started_at, updated_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
               ON CONFLICT(source_run_id) DO UPDATE SET
                  baseline_run_id = excluded.baseline_run_id,
                  lineage_origin_run_id = excluded.lineage_origin_run_id,
@@ -1564,6 +1580,7 @@ def put_iteration_job(job: Dict[str, Any]) -> Dict[str, Any]:
                  last_error = excluded.last_error,
                  created_run_id = excluded.created_run_id,
                  cooldown_until_epoch = excluded.cooldown_until_epoch,
+                 target_sequence = excluded.target_sequence,
                  started_at = excluded.started_at,
                  updated_at = excluded.updated_at""",
                 (
@@ -1578,6 +1595,7 @@ def put_iteration_job(job: Dict[str, Any]) -> Dict[str, Any]:
                     str(normalized.get("error") or normalized.get("last_error") or "") or None,
                     normalized.get("created_run_id"),
                     normalized.get("cooldown_until_epoch"),
+                    normalized.get("target_sequence"),
                     normalized.get("started_at"),
                     normalized["updated_at"],
                 ),
@@ -6133,6 +6151,30 @@ def automatic_iteration_status(
     return job
 
 
+def iteration_generation_infrastructure_failure(detail: str) -> bool:
+    """Keep transient service failures retryable instead of blocking a baseline."""
+    text = str(detail or "").casefold()
+    if retryable_control_error(detail):
+        return True
+    if any(marker in text for marker in GENERATION_TRANSIENT_ERROR_MARKERS):
+        return True
+    return any(
+        marker in text
+        for marker in (
+            "认证",
+            "鉴权",
+            "连接失败",
+            "请求失败",
+            "模型调用失败",
+            "无响应",
+            "限流",
+            "certificate",
+            "ssl",
+            "找不到 codex 命令",
+        )
+    )
+
+
 @cancellable_worker("iteration")
 def automatic_iteration_worker(
     source_run_id: str,
@@ -6160,6 +6202,8 @@ def automatic_iteration_worker(
             "updated_at": now_text(),
         }
     except JobCancelled:
+        if str(get_iteration_job(source_run_id).get("status") or "") == "blocked":
+            return
         if SERVER_SHUTTING_DOWN.is_set():
             return
         result = {
@@ -6176,6 +6220,12 @@ def automatic_iteration_worker(
             pass
     except Exception as exc:  # background boundary
         detail = str(exc).strip() or "自动生成迭代需求失败"
+        current_job = get_iteration_job(source_run_id)
+        baseline_run_id = str(current_job.get("baseline_run_id") or "") or None
+        lineage_origin_run_id = str(
+            current_job.get("lineage_origin_run_id") or source_run_id
+        )
+        target_sequence = current_job.get("target_sequence")
         generation_exhausted = (
             isinstance(exc, WorkflowError)
             and detail.startswith(
@@ -6186,10 +6236,12 @@ def automatic_iteration_worker(
             fallback_job = {
                 "status": "generating",
                 "source_run_id": source_run_id,
-                "lineage_origin_run_id": source_run_id,
+                "baseline_run_id": baseline_run_id,
+                "lineage_origin_run_id": lineage_origin_run_id,
                 "task_type": "Feature 迭代",
                 "auto_refill": True,
                 "recovery_count": 0,
+                "target_sequence": target_sequence,
                 "last_error": detail,
                 "stage": "完整模块未通过，改写为 Feature",
                 "updated_at": now_text(),
@@ -6222,10 +6274,12 @@ def automatic_iteration_worker(
             retry_job = {
                 "status": "generating",
                 "source_run_id": source_run_id,
-                "lineage_origin_run_id": source_run_id,
+                "baseline_run_id": baseline_run_id,
+                "lineage_origin_run_id": lineage_origin_run_id,
                 "task_type": target_task_type,
                 "auto_refill": True,
                 "recovery_count": next_recovery,
+                "target_sequence": target_sequence,
                 "last_error": detail,
                 "stage": "定向修订中",
                 "updated_at": now_text(),
@@ -6258,17 +6312,32 @@ def automatic_iteration_worker(
                 daemon=True,
             ).start()
             return
+        candidate_quality_failure = bool(
+            generation_exhausted
+            and not iteration_generation_infrastructure_failure(detail)
+        )
+        block_bugfix_retry = bool(
+            auto_refill
+            and target_task_type == "Bug 修复"
+            and candidate_quality_failure
+        )
         result = {
-            "status": "failed",
+            "status": "blocked" if block_bugfix_retry else "failed",
             "source_run_id": source_run_id,
             "error": detail,
             "task_type": target_task_type,
-            "stage": "生成失败",
+            "stage": (
+                "当前代码基线无合规 Bug，已禁止自动重试"
+                if block_bugfix_retry
+                else "生成失败"
+            ),
             "auto_refill": auto_refill,
-            "lineage_origin_run_id": source_run_id,
+            "lineage_origin_run_id": lineage_origin_run_id,
+            "baseline_run_id": baseline_run_id,
+            "target_sequence": target_sequence,
             "cooldown_until_epoch": (
                 int(time.time()) + AUTO_REFILL_SOURCE_COOLDOWN_SECONDS
-                if auto_refill else None
+                if auto_refill and not block_bugfix_retry else None
             ),
             "updated_at": now_text(),
         }
@@ -6277,14 +6346,8 @@ def automatic_iteration_worker(
         except Exception as event_exc:
             log_workflow_exception(source_run_id, "iteration-failed-event", event_exc)
         if auto_refill:
-            failure_detail = f"{source_run_id} 的{target_task_type}暂时跳过：{detail}"
-            infrastructure_markers = (
-                "超时", "api error", "认证", "鉴权", "连接失败", "请求失败",
-                "模型调用失败", "无响应", "限流",
-            )
-            candidate_quality_failure = generation_exhausted and not any(
-                marker in detail.casefold() for marker in infrastructure_markers
-            )
+            skip_wording = "当前代码基线已禁止重试" if block_bugfix_retry else "暂时跳过"
+            failure_detail = f"{source_run_id} 的{target_task_type}{skip_wording}：{detail}"
             if candidate_quality_failure:
                 record_auto_refill_candidate_skip(failure_detail)
             else:
@@ -6323,7 +6386,7 @@ def queue_automatic_iteration_locked(
         }
     if automatic_refill_occupancy() >= MAX_PARALLEL_RUNS:
         raise WorkflowError(f"当前并行任务已达到 {MAX_PARALLEL_RUNS} 个，请等待空闲槽")
-    validate_iteration_lineage_type(source_run_id, target_task_type)
+    lineage_state = validate_iteration_lineage_type(source_run_id, target_task_type)
     row = run_row(source_run_id)
     # Resolve the lineage below before accepting the workspace; stopped runs
     # are valid inputs only when the resolver can prove a completed, clean
@@ -6355,6 +6418,7 @@ def queue_automatic_iteration_locked(
         "baseline_run_id": baseline_run_id,
         "lineage_origin_run_id": lineage_origin_run_id,
         "task_type": target_task_type,
+        "target_sequence": int(lineage_state.get("iteration_count") or 0) + 1,
         "stage": "生成候选 1/2",
         "started_at": now_text(),
         "last_error": generation_feedback,
@@ -6380,23 +6444,51 @@ def queue_automatic_iteration_locked(
     return dict(job)
 
 
-def cancel_automatic_iteration(source_run_id: str) -> Dict[str, Any]:
+def cancel_automatic_iteration(
+    source_run_id: str,
+    block_current_baseline: bool = False,
+) -> Dict[str, Any]:
     run_row(source_run_id)
     job = get_iteration_job(source_run_id)
-    if not job or job.get("status") != "generating":
+    if not job:
+        raise WorkflowError("当前没有可处理的迭代需求")
+    was_generating = job.get("status") == "generating"
+    if not was_generating and not block_current_baseline:
         raise WorkflowError("当前没有正在生成的迭代需求")
-    cancel_background_job(f"iteration:{source_run_id}")
+    if block_current_baseline and str(job.get("task_type") or "") != "Bug 修复":
+        raise WorkflowError("只有 Bug 修复题生成可以禁止当前代码基线重试")
+    if block_current_baseline and not job.get("target_sequence"):
+        state = iteration_lineage_state(source_run_id)
+        job["target_sequence"] = int(state["iteration_count"]) + 1
     job.update(
         {
-            "status": "stopped",
-            "stage": "已取消",
-            "error": "迭代题面生成已由用户取消",
+            "status": "blocked" if block_current_baseline else "stopped",
+            "stage": (
+                "当前代码基线已禁止 Bug 修复重试"
+                if block_current_baseline
+                else "已取消"
+            ),
+            "error": (
+                "当前代码基线已由用户禁止再次生成 Bug 修复题"
+                if block_current_baseline
+                else "迭代题面生成已由用户取消"
+            ),
             "cooldown_until_epoch": None,
             "updated_at": now_text(),
         }
     )
     put_iteration_job(job)
-    add_event(source_run_id, "用户取消了迭代题面生成", "warning")
+    if was_generating:
+        cancel_background_job(f"iteration:{source_run_id}")
+    add_event(
+        source_run_id,
+        (
+            "当前代码基线已禁止再次自动生成 Bug 修复题"
+            if block_current_baseline
+            else "用户取消了迭代题面生成"
+        ),
+        "warning",
+    )
     AUTO_REFILL_WAKE.set()
     return job
 
@@ -6524,11 +6616,29 @@ def auto_refill_iteration_candidate() -> Optional[Dict[str, Any]]:
         if job.get("status") == "failed"
         and int(job.get("cooldown_until_epoch") or 0) > now_epoch
     }
+    blocked_jobs = {
+        str(job.get("lineage_origin_run_id") or job.get("source_run_id") or ""): job
+        for job in jobs
+        if job.get("status") == "blocked"
+    }
+
+    def blocked_for_current_target(candidate: Dict[str, Any]) -> bool:
+        job = blocked_jobs.get(str(candidate["id"]))
+        if not job:
+            return False
+        return bool(
+            str(job.get("task_type") or "")
+            == str(candidate.get("next_iteration_task_type") or "")
+            and int(job.get("target_sequence") or 0)
+            == int(candidate.get("iteration_count") or 0) + 1
+        )
+
     candidates = [
         candidate
         for candidate in candidates
         if str(candidate["id"]) not in generating_origins
         and str(candidate["id"]) not in cooling_origins
+        and not blocked_for_current_target(candidate)
     ]
     candidates.sort(
         key=lambda candidate: (
@@ -6593,6 +6703,7 @@ def queue_refill_iteration_locked(source_run_id: str) -> Dict[str, Any]:
         "lineage_origin_run_id": source_run_id,
         "task_type": target_task_type,
         "auto_refill": True,
+        "target_sequence": int(candidate["iteration_count"]) + 1,
         "stage": "生成候选 1/2",
         "started_at": now_text(),
         "last_error": generation_feedback,
@@ -7140,6 +7251,35 @@ def transcript_excerpt_from_path(
         f"{ledger}\n"
         "...原始叙述尾部...\n"
         f"{text[-tail_size:] if tail_size else ''}"
+    )[:max_chars]
+
+
+def bounded_review_trajectory(trajectory: str, max_chars: int) -> str:
+    """Compact a review-only copy while keeping tool calls and both boundaries."""
+    source = str(trajectory or "")
+    if len(source) <= max_chars:
+        return source
+    ledger_lines = [
+        line
+        for line in source.splitlines()
+        if line.startswith(("TOOL ", "TOOL RESULT:", "CALL ", "RESULT:"))
+    ]
+    ledger = "\n".join(ledger_lines)
+    ledger_budget = min(max_chars // 2, len(ledger))
+    if len(ledger) > ledger_budget:
+        ledger_head = ledger_budget // 2
+        ledger = (
+            ledger[:ledger_head]
+            + "\n...工具时间线中段已压缩...\n"
+            + ledger[-(ledger_budget - ledger_head):]
+        )
+    separator = "\n...找 Bug 轨迹中段已压缩...\n"
+    available = max(0, max_chars - len(ledger) - len(separator) - 2)
+    head_size = available // 2
+    tail_size = available - head_size
+    return (
+        f"{source[:head_size]}{separator}{ledger}\n"
+        f"{source[-tail_size:] if tail_size else ''}"
     )[:max_chars]
 
 
@@ -10481,6 +10621,18 @@ def export_readiness(
     return not issues, issues
 
 
+def trace_is_automatic_continuation_prompt(text: str) -> bool:
+    """Recognize controller prompts that continue the current logical turn."""
+    stripped = str(text or "").lstrip()
+    if stripped.startswith(COMPLETION_RECOVERY_PROMPT_PREFIX):
+        return True
+    return bool(
+        stripped.startswith(
+            "[Your previous response had no visible output. Please continue and produce a user-visible response.]"
+        )
+    )
+
+
 def trace_human_prompt_text(
     event: Dict[str, Any], *, automatic_api_resume: bool = False
 ) -> Optional[str]:
@@ -10489,7 +10641,7 @@ def trace_human_prompt_text(
     message = event.get("message") if isinstance(event.get("message"), dict) else {}
     content = message.get("content")
     if isinstance(content, str):
-        if content.lstrip().startswith("<task-notification>"):
+        if content.lstrip().startswith("<task-notification>") or trace_is_automatic_continuation_prompt(content):
             return None
         if content.strip().casefold() in {
             "[request interrupted by user]",
@@ -10510,6 +10662,8 @@ def trace_human_prompt_text(
         if isinstance(block, dict) and block.get("type") == "text"
     ]
     text = "\n".join(text_blocks) if text_blocks else ""
+    if trace_is_automatic_continuation_prompt(text):
+        return None
     if text.strip().casefold() in {
         "[request interrupted by user]",
         "[request interrupted by user for tool use]",
@@ -11392,6 +11546,24 @@ def terminal_attention_reason_from_text(value: Any) -> str:
     return ""
 
 
+def terminal_idle_prompt_visible(value: Any) -> bool:
+    """Recognize a settled prompt without mistaking earlier idle text for work."""
+    visible = TERMINAL_ANSI_ESCAPE_RE.sub("", str(value or "")).replace("\x00", " ")
+    tail = "\n".join(visible.splitlines()[-80:]).casefold()
+    compact_tail = re.sub(r"\s+", "", tail)
+    idle_markers = [tail.rfind("new task?")]
+    idle_markers.extend(match.start() for match in re.finditer(r"\bdone\b", tail))
+    latest_idle_marker = max(idle_markers, default=-1)
+    latest_active_marker = tail.rfind("esc to interrupt")
+    current_state_tail = tail[latest_idle_marker:] if latest_idle_marker >= 0 else tail
+    return bool(
+        "bypasspermissionson" in compact_tail
+        and latest_idle_marker >= 0
+        and latest_active_marker < latest_idle_marker
+        and not terminal_attention_reason_from_text(current_state_tail)
+    )
+
+
 def terminal_screen_text(run_id: str, screen_name: str) -> str:
     """Read the current screen without sending keys to the running conversation."""
     try:
@@ -11410,9 +11582,17 @@ def terminal_screen_text(run_id: str, screen_name: str) -> str:
             timeout=10,
             check=False,
         )
-        if result.returncode != 0 or not snapshot.is_file():
+        if result.returncode == 0 and snapshot.is_file():
+            captured = snapshot.read_text(encoding="utf-8", errors="ignore")[-12000:]
+            if captured.strip("\x00\r\n \t"):
+                return captured
+        try:
+            with paths["screen_log"].open("rb") as source:
+                source.seek(0, os.SEEK_END)
+                source.seek(max(0, source.tell() - 64 * 1024), os.SEEK_SET)
+                return source.read().decode("utf-8", errors="ignore")[-12000:]
+        except OSError:
             return ""
-        return snapshot.read_text(encoding="utf-8", errors="ignore")[-12000:]
     except OSError:
         return ""
     finally:
@@ -11976,6 +12156,47 @@ def send_api_resume_to_screen(run_id: str, screen_name: str) -> None:
     run_command(["screen", "-S", screen_name, "-p", "0", "-X", "stuff", "\r"])
 
 
+def send_completion_recovery_to_screen(run_id: str, screen_name: str) -> None:
+    """Ask one idle session to emit a durable final response for this turn."""
+    if not screen_session_running(screen_name):
+        raise WorkflowError("对话终端已关闭，无法自动催收最终回复")
+    paths = terminal_asset_paths(run_id)
+    paths["root"].mkdir(parents=True, exist_ok=True)
+    recovery_prompt = paths["root"] / "completion-recovery-prompt.txt"
+    recovery_prompt.write_text(
+        f"{COMPLETION_RECOVERY_PROMPT_PREFIX} "
+        "当前任务终端已回到空闲界面，但轨迹没有记录可归档的最终回复。"
+        "请检查当前工作，必要时完成剩余操作，然后直接给出本轮最终结果并结束回复。",
+        encoding="utf-8",
+    )
+    run_command(
+        ["screen", "-S", screen_name, "-p", "0", "-X", "readbuf", str(recovery_prompt)]
+    )
+    run_command(["screen", "-S", screen_name, "-p", "0", "-X", "paste", "."])
+    time.sleep(0.5)
+    run_command(["screen", "-S", screen_name, "-p", "0", "-X", "stuff", "\r"])
+
+
+def send_final_summary_recovery_to_screen(run_id: str, screen_name: str) -> None:
+    """Ask a recovered idle session to stop editing and emit only its final reply."""
+    if not screen_session_running(screen_name):
+        raise WorkflowError("对话终端已关闭，无法自动催收交付摘要")
+    paths = terminal_asset_paths(run_id)
+    paths["root"].mkdir(parents=True, exist_ok=True)
+    recovery_prompt = paths["root"] / "final-summary-recovery-prompt.txt"
+    recovery_prompt.write_text(
+        f"{COMPLETION_RECOVERY_PROMPT_PREFIX} "
+        "现有实现与测试已经完成。请不要再修改代码，立即输出一段简洁、非空的最终交付摘要并结束回复。",
+        encoding="utf-8",
+    )
+    run_command(
+        ["screen", "-S", screen_name, "-p", "0", "-X", "readbuf", str(recovery_prompt)]
+    )
+    run_command(["screen", "-S", screen_name, "-p", "0", "-X", "paste", "."])
+    time.sleep(0.5)
+    run_command(["screen", "-S", screen_name, "-p", "0", "-X", "stuff", "\r"])
+
+
 def copy_container_traces(row: sqlite3.Row, destination: Path) -> Path:
     container_name = str(row["container_name"] or "")
     if not container_name:
@@ -12188,6 +12409,112 @@ def trace_activity_signature(trace_root: Path) -> Optional[Tuple[int, int]]:
     return (count, total_size) if count else None
 
 
+BUSINESS_CODE_SUFFIXES = {
+    ".astro", ".c", ".cc", ".cjs", ".clj", ".cljs", ".cpp", ".cs",
+    ".css", ".cts", ".dart", ".elm", ".erl", ".ex", ".exs", ".fs",
+    ".fsx", ".go", ".gql", ".graphql", ".h", ".hpp", ".hrl", ".html",
+    ".java", ".js", ".json", ".jsx", ".kt", ".kts", ".lua", ".mjs",
+    ".move", ".mts", ".php", ".pl", ".proto", ".py", ".r", ".rb",
+    ".rs", ".sass", ".scala", ".scss", ".sh", ".sol", ".sql", ".svelte",
+    ".swift", ".tf", ".toml", ".tsx", ".ts", ".vb", ".vue", ".xml",
+    ".yaml", ".yml",
+}
+BUSINESS_CODE_FILENAMES = {
+    "dockerfile", "makefile", "procfile", "compose.yaml", "compose.yml",
+    "docker-compose.yaml", "docker-compose.yml",
+}
+DEPENDENCY_LOCK_FILENAMES = {
+    "bun.lock", "bun.lockb", "cargo.lock", "composer.lock", "gemfile.lock",
+    "go.sum", "package-lock.json", "pipfile.lock", "pnpm-lock.yaml",
+    "poetry.lock", "uv.lock", "yarn.lock",
+}
+GENERATED_CODE_DIRECTORIES = {
+    ".git", ".next", ".venv", "build", "coverage", "dist", "node_modules",
+    "target", "vendor",
+}
+
+
+def is_business_code_path(value: str) -> bool:
+    """Exclude documentation, lockfiles and generated trees from progress."""
+    normalized = str(value or "").strip().replace("\\", "/").strip("/")
+    if not normalized:
+        return False
+    parts = tuple(part.casefold() for part in normalized.split("/") if part)
+    if not parts or any(part in GENERATED_CODE_DIRECTORIES for part in parts[:-1]):
+        return False
+    name = parts[-1]
+    if name in DEPENDENCY_LOCK_FILENAMES:
+        return False
+    return name in BUSINESS_CODE_FILENAMES or Path(name).suffix.casefold() in BUSINESS_CODE_SUFFIXES
+
+
+def workspace_business_code_output_paths(row: sqlite3.Row) -> Optional[List[str]]:
+    """Return code paths changed from this run's baseline, or None if unknown."""
+    data = dict(row)
+    workspace = Path(str(data.get("repo_path") or "")).expanduser()
+    base_sha = str(data.get("base_sha") or "").strip()
+    if not workspace.is_dir() or not (workspace / ".git").is_dir() or not base_sha:
+        return None
+    try:
+        tracked = run_command(
+            [
+                "git", "diff", "--name-only", "-z", "--diff-filter=ACDMRTUXB",
+                base_sha, "--",
+            ],
+            cwd=workspace,
+            timeout=30,
+        ).stdout
+        untracked = run_command(
+            ["git", "ls-files", "--others", "--exclude-standard", "-z"],
+            cwd=workspace,
+            timeout=30,
+        ).stdout
+    except (OSError, subprocess.SubprocessError, WorkflowError):
+        return None
+    return sorted(
+        {
+            path
+            for path in (*tracked.split("\0"), *untracked.split("\0"))
+            if is_business_code_path(path)
+        }
+    )
+
+
+def stop_run_for_no_code_output(run_id: str, reason: str) -> Dict[str, Any]:
+    """Stop one stalled first turn without recording a false user cancellation."""
+    row = run_row(run_id)
+    cancel_background_job(f"run:{run_id}")
+    update_run(
+        run_id,
+        phase="stopped",
+        status_detail="长时间没有源码产出，正在自动终止并清理容器",
+        error=reason,
+    )
+    try:
+        turn = latest_turn_row(run_id)
+        update_turn(run_id, int(turn["turn_number"]), status="stopped")
+    except WorkflowError:
+        pass
+    cleaned = False
+    if row["container_name"]:
+        try:
+            export_and_remove_container(run_id, force=True)
+            cleaned = True
+        except WorkflowError as exc:
+            update_run(run_id, error=f"{reason}；{exc}")
+    update_run(
+        run_id,
+        status_detail=(
+            "长时间没有源码产出，已自动终止并删除容器"
+            if cleaned
+            else "长时间没有源码产出，已自动终止；容器清理未确认"
+        ),
+    )
+    add_event(run_id, f"{reason}；已自动释放并行槽并触发补题", "warning")
+    AUTO_REFILL_WAKE.set()
+    return serialize_run(run_row(run_id))
+
+
 def preserve_interrupted_docker_turn(run_id: str, turn_number: int, reason: str) -> None:
     row = run_row(run_id)
     if str(row["phase"] or "") == "interrupted":
@@ -12240,6 +12567,38 @@ def api_resume_already_attempted(run_id: str, turn_number: int) -> bool:
             (run_id, marker),
         ).fetchone()
     return bool(found)
+
+
+def completion_recovery_event_message(turn_number: int) -> str:
+    return f"第 {turn_number} 轮终端已空闲但缺少合格最终回复，已自动催收一次"
+
+
+def completion_recovery_sent_epoch(run_id: str, turn_number: int) -> Optional[float]:
+    marker = completion_recovery_event_message(turn_number)
+    with db_connection() as database:
+        row = database.execute(
+            "SELECT created_at FROM events WHERE run_id = ? AND message = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (run_id, marker),
+        ).fetchone()
+    sent_at = parse_time(str(row["created_at"] or "")) if row else None
+    return sent_at.timestamp() if sent_at else None
+
+
+def final_summary_recovery_event_message(turn_number: int) -> str:
+    return f"第 {turn_number} 轮完成催收后仍缺少合格最终回复，已再次催收交付摘要"
+
+
+def final_summary_recovery_sent_epoch(run_id: str, turn_number: int) -> Optional[float]:
+    marker = final_summary_recovery_event_message(turn_number)
+    with db_connection() as database:
+        row = database.execute(
+            "SELECT created_at FROM events WHERE run_id = ? AND message = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (run_id, marker),
+        ).fetchone()
+    sent_at = parse_time(str(row["created_at"] or "")) if row else None
+    return sent_at.timestamp() if sent_at else None
 
 
 def resume_after_api_error(
@@ -12379,6 +12738,13 @@ def monitor_docker_turn(run_id: str, turn_number: int) -> None:
     last_activity_at = started
     last_activity_signature: Optional[Tuple[int, int]] = None
     inactivity_reported = False
+    business_code_seen = False
+    last_no_code_probe_at = 0.0
+    idle_visible_since: Optional[float] = None
+    completion_recovery_epoch = completion_recovery_sent_epoch(run_id, turn_number)
+    final_summary_recovery_epoch = final_summary_recovery_sent_epoch(
+        run_id, turn_number
+    )
     last_prompt_id = ""
     attention_reason = ""
     last_attention_alert_at = 0.0
@@ -12588,9 +12954,8 @@ def monitor_docker_turn(run_id: str, turn_number: int) -> None:
             return
 
         now = time.monotonic()
-        visible_attention_reason = terminal_attention_reason_from_text(
-            terminal_screen_text(run_id, str(row["screen_name"] or ""))
-        )
+        screen_text = terminal_screen_text(run_id, str(row["screen_name"] or ""))
+        visible_attention_reason = terminal_attention_reason_from_text(screen_text)
         if visible_attention_reason:
             if visible_attention_reason != attention_reason:
                 add_event(
@@ -12617,6 +12982,88 @@ def monitor_docker_turn(run_id: str, turn_number: int) -> None:
             attention_reason = ""
             last_attention_alert_at = 0.0
 
+        if terminal_idle_prompt_visible(screen_text):
+            if idle_visible_since is None:
+                idle_visible_since = now
+            else:
+                required_idle_seconds = (
+                    TERMINAL_RECOVERY_IDLE_STABLE_SECONDS
+                    if completion_recovery_epoch is not None
+                    else TERMINAL_IDLE_STABLE_SECONDS
+                )
+                if now - idle_visible_since < required_idle_seconds:
+                    update_run(
+                        run_id,
+                        status_detail=f"第 {turn_number} 轮终端已空闲，等待确认稳定状态",
+                    )
+                elif completion_recovery_epoch is None:
+                    try:
+                        send_completion_recovery_to_screen(
+                            run_id, str(row["screen_name"] or "")
+                        )
+                    except WorkflowError as exc:
+                        preserve_interrupted_docker_turn(
+                            run_id,
+                            turn_number,
+                            f"终端已空闲但自动催收最终回复失败：{exc}",
+                        )
+                        return
+                    add_event(
+                        run_id,
+                        completion_recovery_event_message(turn_number),
+                        "warning",
+                    )
+                    completion_recovery_epoch = time.time()
+                    idle_visible_since = None
+                    update_run(
+                        run_id,
+                        status_detail=f"第 {turn_number} 轮正在自动催收最终回复",
+                    )
+                    time.sleep(POLL_SECONDS)
+                    continue
+                elif (
+                    final_summary_recovery_epoch is None
+                    and time.time() - completion_recovery_epoch
+                    >= TERMINAL_COMPLETION_RECOVERY_GRACE_SECONDS
+                ):
+                    try:
+                        send_final_summary_recovery_to_screen(
+                            run_id, str(row["screen_name"] or "")
+                        )
+                    except WorkflowError as exc:
+                        preserve_interrupted_docker_turn(
+                            run_id,
+                            turn_number,
+                            f"终端已空闲但自动催收交付摘要失败：{exc}",
+                        )
+                        return
+                    add_event(
+                        run_id,
+                        final_summary_recovery_event_message(turn_number),
+                        "warning",
+                    )
+                    final_summary_recovery_epoch = time.time()
+                    idle_visible_since = None
+                    update_run(
+                        run_id,
+                        status_detail=f"第 {turn_number} 轮正在自动催收交付摘要",
+                    )
+                    time.sleep(POLL_SECONDS)
+                    continue
+                elif (
+                    final_summary_recovery_epoch is not None
+                    and time.time() - final_summary_recovery_epoch
+                    >= TERMINAL_FINAL_SUMMARY_RECOVERY_GRACE_SECONDS
+                ):
+                    preserve_interrupted_docker_turn(
+                        run_id,
+                        turn_number,
+                        "终端在两次自动催收后仍回到空闲界面，轨迹没有合格最终回复",
+                    )
+                    return
+        else:
+            idle_visible_since = None
+
         signature = trace_activity_signature(snapshot) if snapshot else None
         if signature and signature != last_activity_signature:
             if inactivity_reported and last_activity_signature is not None:
@@ -12640,6 +13087,35 @@ def monitor_docker_turn(run_id: str, turn_number: int) -> None:
 
         persisted_runtime = seconds_between(turn_started_at, now_text())
         running_seconds = max(now - started, persisted_runtime)
+        no_code_deadline_reached = (
+            running_seconds >= NO_CODE_OUTPUT_HARD_TIMEOUT_SECONDS
+            or (
+                running_seconds >= NO_CODE_OUTPUT_GRACE_SECONDS
+                and inactive_seconds >= NO_CODE_OUTPUT_INACTIVITY_SECONDS
+            )
+        )
+        retry_waiting = int(row["retry_not_before_epoch"] or 0) > int(time.time())
+        if (
+            turn_number == 1
+            and not business_code_seen
+            and not retry_waiting
+            and no_code_deadline_reached
+            and now - last_no_code_probe_at >= NO_CODE_OUTPUT_PROBE_INTERVAL_SECONDS
+        ):
+            last_no_code_probe_at = now
+            code_paths = workspace_business_code_output_paths(row)
+            if code_paths:
+                business_code_seen = True
+            elif code_paths == []:
+                if running_seconds >= NO_CODE_OUTPUT_HARD_TIMEOUT_SECONDS:
+                    reason = "首轮已运行至少 2 小时，工作区相对基线仍没有源码或必要配置变化"
+                else:
+                    reason = (
+                        "首轮已运行至少 30 分钟且连续 15 分钟没有轨迹活动，"
+                        "工作区相对基线仍没有源码或必要配置变化"
+                    )
+                stop_run_for_no_code_output(run_id, reason)
+                return
         if (
             running_seconds >= RUN_TIMEOUT_SECONDS
             and inactive_seconds >= INACTIVITY_WARNING_SECONDS
@@ -14586,10 +15062,26 @@ def validate_false_success_claim(
             )
 
 
+def review_findings_compaction_retry_error(detail: str) -> bool:
+    """Return true only when a shorter findings prompt can help the retry."""
+    message = str(detail or "").casefold()
+    return any(
+        marker in message
+        for marker in (
+            "max_output_tokens",
+            "incomplete response",
+            "stream disconnected",
+            "没有返回有效结果",
+            "返回格式不正确",
+            "疑似在长度上限处句中截断",
+        )
+    )
+
+
 def retryable_review_output_error(detail: str) -> bool:
     """Identify a reviewer wording error that can be regenerated safely."""
     message = str(detail or "")
-    return any(
+    return review_findings_compaction_retry_error(message) or any(
         marker in message
         for marker in (
             "描述引用了本轮轨迹中未执行的命令",
@@ -15907,13 +16399,28 @@ def run_codex_review(
     commit_sha: str = "",
     existing_findings: Optional[Dict[str, Any]] = None,
     findings_notifier: Optional[Callable[[Dict[str, Any]], None]] = None,
+    findings_reasoning_effort: str = "",
+    evaluation_trajectory: Optional[str] = None,
 ) -> Dict[str, Any]:
     schema = review_findings_schema("bugs")
+    full_evaluation_trajectory = (
+        trajectory if evaluation_trajectory is None else evaluation_trajectory
+    )
+    findings_trajectory_limit = (
+        EVALUATION_SCORING_FALLBACK_TRAJECTORY_MAX_CHARS
+        if findings_reasoning_effort == "low"
+        else REVIEW_FINDINGS_TRAJECTORY_MAX_CHARS
+    )
+    findings_trajectory = bounded_review_trajectory(
+        trajectory, findings_trajectory_limit
+    )
     evaluation_rubric = evaluation_rubric_text()
     verification_text = json.dumps(verification, ensure_ascii=False)
     if len(verification_text) > 24000:
         verification_text = verification_text[-24000:]
-    final_verification_summary = trajectory_final_verification_summary(trajectory)
+    final_verification_summary = trajectory_final_verification_summary(
+        full_evaluation_trajectory
+    )
     prompt = f"""只读检查这个项目的第一轮交付，不得修改文件。完整对照原始需求、仓库实现、Docker 验收结果和 Claude Code 本轮轨迹，检查功能正确性、遗漏、异常路径、持久化、并发、界面交互和 Docker 配置，并在隔离环境中实际执行必要的复现命令。本次评分对应第 1 轮；所有非满分描述都必须明确写出“第 1 轮”。验收项中的 failure_kind=environment 表示端口占用、Docker 守护进程或临时网络等环境失败，不能当成产品 Bug 或模型能力扣分证据；应从仓库和可重复命令继续判断。bugs 只允许记录已经稳定复现且与本轮 User Prompt 验收范围直接相关的业务错误，包括本轮功能自身错误和本轮改动造成的相关回归；仓库中与本轮范围无关的历史问题只能写入 quality_gaps，也不得要求修改相应代码。每条 Bug 都必须分别填写 reproduction、actual、expected、evidence、fix 和 customer_summary，evidence 要包含实际命令、响应、日志或数据库状态。未实际复现的风险、缺少测试、覆盖不足、文档不足和代码结构问题只能写入 quality_gaps，不能进入 bugs，也不能触发修复轮。只有 bugs 非空时 next_action 才能是 bugfix。{BUG_REPAIR_PROMPT_STYLE_GUIDANCE}没有已复现 Bug 时 next_action 必须是 complete 且 bugs 为空；quality_gaps 可以非空，但不得为了增加轮次虚构 Bug。
 
 同时按交付文档对这一轮单独评分。{EVALUATION_SCORE_GUIDANCE} 五个描述都必须结合本轮轨迹和代码给出可核验依据：指出具体步骤、工具调用动作、文件、函数、命令或遗漏需求；原作业检查和后续独立验收必须分别归因，满分也要说明已核对哪些约束。{EVALUATION_DESCRIPTION_GUIDANCE} {EVALUATION_FACT_ATTRIBUTION_GUIDANCE} {TASK_DIFFICULTY_GUIDANCE} 不提及评分工具、生成过程或内部提示。任务类型按本轮主要意图填写，第一轮从空仓库开发通常是“0-1 代码生成”。语言和框架用英文逗号分隔。环境可复现等级要根据仓库是否真的提供可一键执行的容器环境判断。
@@ -15932,7 +16439,7 @@ def run_codex_review(
 同类检查以后出现的结果只覆盖最终状态；已经被后续成功覆盖的失败只能描述为已恢复的过程，不能据此声称最终仍失败或没有复验，但原作业真实发生的失败调用、返工和虚假完成声明仍须保留并按所属维度评价。
 
 第一轮操作轨迹：
-{trajectory or '未取得轨迹内容'}
+{findings_trajectory or '未取得轨迹内容'}
 """
     prompt = f"""只读检查这个项目的第一轮交付，不得修改文件。完整对照原始需求、仓库实现、Docker 验收结果和本轮轨迹，检查功能正确性、遗漏、异常路径、持久化、并发和页面交互，并实际执行必要的复现命令。本次只返回代码复核结论、Bug 和质量缺口；五维评分由后续五个独立并行调用完成，本次不能输出 evaluation。bugs 只记录已经稳定复现且与本轮需求直接相关的业务错误；未复现风险和覆盖不足只能写入 quality_gaps，不能触发修复轮。与本轮范围无关的历史问题也只能写入 quality_gaps，不得要求修改相应代码。只有 bugs 非空时 next_action 才能是 bugfix。{BUG_REPAIR_PROMPT_STYLE_GUIDANCE}
 
@@ -15948,7 +16455,7 @@ def run_codex_review(
 {final_verification_summary}
 
 第一轮操作轨迹：
-{trajectory or '未取得轨迹内容'}
+{findings_trajectory or '未取得轨迹内容'}
 """
     raw_result = existing_findings
     if raw_result is None:
@@ -15959,6 +16466,7 @@ def run_codex_review(
             "first-review",
             45 * 60,
             sandbox="workspace-write",
+            reasoning_effort=findings_reasoning_effort,
         )
     findings, legacy_evaluation = normalize_review_findings(
         raw_result,
@@ -15973,7 +16481,7 @@ def run_codex_review(
         repo_path,
         original_prompt,
         verification,
-        trajectory,
+        full_evaluation_trajectory,
         1,
         evaluation_repair_notifier,
         call_prefix="first-review-evaluation",
@@ -15992,12 +16500,27 @@ def run_codex_final_review(
     commit_sha: str = "",
     existing_findings: Optional[Dict[str, Any]] = None,
     findings_notifier: Optional[Callable[[Dict[str, Any]], None]] = None,
+    findings_reasoning_effort: str = "",
+    evaluation_trajectory: Optional[str] = None,
 ) -> Dict[str, Any]:
     schema = review_findings_schema("remaining_bugs")
+    full_evaluation_trajectory = (
+        trajectory if evaluation_trajectory is None else evaluation_trajectory
+    )
+    findings_trajectory_limit = (
+        EVALUATION_SCORING_FALLBACK_TRAJECTORY_MAX_CHARS
+        if findings_reasoning_effort == "low"
+        else REVIEW_FINDINGS_TRAJECTORY_MAX_CHARS
+    )
+    findings_trajectory = bounded_review_trajectory(
+        trajectory, findings_trajectory_limit
+    )
     verification_text = json.dumps(verification, ensure_ascii=False)
     if len(verification_text) > 24000:
         verification_text = verification_text[-24000:]
-    final_verification_summary = trajectory_final_verification_summary(trajectory)
+    final_verification_summary = trajectory_final_verification_summary(
+        full_evaluation_trajectory
+    )
     evaluation_rubric = evaluation_rubric_text()
     prompt = f"""只读验收这个项目当前轮次的交付，不得修改文件。当前轮次是一条独立数据，请以本轮 User Prompt 为主要目标，同时结合第一轮原始需求判断回归，并在隔离环境中实际执行必要的复现命令。本次评分对应第 {turn_number} 轮；所有非满分描述都必须明确写出“第 {turn_number} 轮”。验收项中的 failure_kind=environment 表示环境故障，不能当成产品 Bug 或模型能力扣分依据。remaining_bugs 只允许记录已经稳定复现且与当前迭代或修复范围直接相关的业务错误；仓库中与本次范围无关的历史问题只能写入 quality_gaps，也不得要求修改相应代码。每条 Bug 必须分别填写 reproduction、actual、expected、evidence、fix 和 customer_summary，证据包含实际命令、响应、日志或数据库状态。未复现风险、缺少测试、覆盖不足、文档不足和代码结构问题只能写入 quality_gaps，不能触发下一轮。只有 remaining_bugs 非空时 next_action 才能为 bugfix。{BUG_REPAIR_PROMPT_STYLE_GUIDANCE}没有已复现 Bug 时 next_action 必须为 complete 且 remaining_bugs 为空，quality_gaps 可以非空。不得为了延长轮次虚构问题。按交付文档对当前轮次单独填写五维评分，每个描述必须同时关注过程和产物并给出具体步骤、工具调用动作、文件、函数、命令或报错依据。{EVALUATION_DESCRIPTION_GUIDANCE} {EVALUATION_FACT_ATTRIBUTION_GUIDANCE} {TASK_DIFFICULTY_GUIDANCE} 若题面主要修复实际问题，任务类型填“Bug 修复”，若题面主要增加新能力，填“Feature 迭代”。语言和框架使用英文逗号分隔，不要在任何描述里提及检查工具或自动生成。
 
@@ -16020,7 +16543,7 @@ def run_codex_final_review(
 同类检查以后出现的结果只覆盖最终状态；已经被后续成功覆盖的失败只能描述为已恢复的过程，不能据此声称最终仍失败或没有复验，但原作业真实发生的失败调用、返工和虚假完成声明仍须保留并按所属维度评价。
 
 当前轮次操作轨迹：
-{trajectory or '未取得轨迹内容'}
+{findings_trajectory or '未取得轨迹内容'}
 """
     prompt = f"""只读验收这个项目当前轮次的交付，不得修改文件。以本轮 User Prompt 为主要目标，同时结合第一轮原始需求判断回归，并实际执行必要的复现命令。本次只返回代码复核结论、remaining_bugs 和质量缺口；五维评分由后续五个独立并行调用完成，本次不能输出 evaluation。remaining_bugs 只记录已经稳定复现且与当前修复范围直接相关的业务错误；未复现风险和覆盖不足只能写入 quality_gaps，不能触发修复轮。与本轮范围无关的历史问题也只能写入 quality_gaps，不得要求修改相应代码。只有 remaining_bugs 非空时 next_action 才能是 bugfix。{BUG_REPAIR_PROMPT_STYLE_GUIDANCE}
 
@@ -16039,7 +16562,7 @@ def run_codex_final_review(
 {final_verification_summary}
 
 当前轮次操作轨迹：
-{trajectory or '未取得轨迹内容'}
+{findings_trajectory or '未取得轨迹内容'}
 """
     raw_result = existing_findings
     if raw_result is None:
@@ -16050,6 +16573,7 @@ def run_codex_final_review(
             "final-review",
             45 * 60,
             sandbox="workspace-write",
+            reasoning_effort=findings_reasoning_effort,
         )
     findings, legacy_evaluation = normalize_review_findings(
         raw_result,
@@ -16065,7 +16589,7 @@ def run_codex_final_review(
         repo_path,
         second_prompt,
         verification,
-        trajectory,
+        full_evaluation_trajectory,
         turn_number,
         evaluation_repair_notifier,
         original_prompt=original_prompt,
@@ -16516,6 +17040,23 @@ def review_worker(run_id: str) -> None:
             turn["review_result"] or row["review_result"],
             "bugs",
         )
+        findings_reasoning_effort = ""
+        if (
+            existing_findings is None
+            and int(row["stage_retry_count"] or 0) > 0
+            and review_findings_compaction_retry_error(str(row["error"] or ""))
+        ):
+            findings_reasoning_effort = "low"
+            add_event(
+                run_id,
+                "首轮找 Bug 输出未完成，重试改用 24000 字符紧凑轨迹和较低推理强度",
+                "warning",
+            )
+        elif len(trajectory) > REVIEW_FINDINGS_TRAJECTORY_MAX_CHARS:
+            add_event(
+                run_id,
+                "找 Bug 使用 60000 字符紧凑证据副本；五维评分、归档和上传继续读取完整轨迹",
+            )
         if existing_findings is not None:
             add_event(
                 run_id,
@@ -16537,6 +17078,8 @@ def review_worker(run_id: str) -> None:
                     commit_sha=commit_sha,
                     existing_findings=existing_findings,
                     findings_notifier=persist_findings,
+                    findings_reasoning_effort=findings_reasoning_effort,
+                    evaluation_trajectory=trajectory,
                 )
         else:
             result = run_codex_review(
@@ -16549,6 +17092,8 @@ def review_worker(run_id: str) -> None:
                 commit_sha=commit_sha,
                 existing_findings=existing_findings,
                 findings_notifier=persist_findings,
+                findings_reasoning_effort=findings_reasoning_effort,
+                evaluation_trajectory=trajectory,
             )
         if str(run_row(run_id)["phase"] or "") != "review_running":
             return
@@ -16734,6 +17279,23 @@ def final_review_worker(run_id: str) -> None:
             turn["review_result"] or row["final_review_result"],
             "remaining_bugs",
         )
+        findings_reasoning_effort = ""
+        if (
+            existing_findings is None
+            and int(row["stage_retry_count"] or 0) > 0
+            and review_findings_compaction_retry_error(str(row["error"] or ""))
+        ):
+            findings_reasoning_effort = "low"
+            add_event(
+                run_id,
+                f"第 {turn_number} 轮找 Bug 输出未完成，重试改用 24000 字符紧凑轨迹和较低推理强度",
+                "warning",
+            )
+        elif len(trajectory) > REVIEW_FINDINGS_TRAJECTORY_MAX_CHARS:
+            add_event(
+                run_id,
+                f"第 {turn_number} 轮找 Bug 使用 60000 字符紧凑证据副本；五维评分、归档和上传继续读取完整轨迹",
+            )
         if existing_findings is not None:
             add_event(
                 run_id,
@@ -16760,6 +17322,8 @@ def final_review_worker(run_id: str) -> None:
                     commit_sha=commit_sha,
                     existing_findings=existing_findings,
                     findings_notifier=persist_findings,
+                    findings_reasoning_effort=findings_reasoning_effort,
+                    evaluation_trajectory=trajectory,
                 )
         else:
             result = run_codex_final_review(
@@ -16774,6 +17338,8 @@ def final_review_worker(run_id: str) -> None:
                 commit_sha=commit_sha,
                 existing_findings=existing_findings,
                 findings_notifier=persist_findings,
+                findings_reasoning_effort=findings_reasoning_effort,
+                evaluation_trajectory=trajectory,
             )
         if str(run_row(run_id)["phase"] or "") != "final_review_running":
             return
@@ -18173,7 +18739,12 @@ class ApiHandler(BaseHTTPRequestHandler):
                 r"/api/runs/([a-f0-9]{12})/auto-iteration-cancel", path
             )
             if cancel_iteration:
-                self.send_json(cancel_automatic_iteration(cancel_iteration.group(1)))
+                self.send_json(
+                    cancel_automatic_iteration(
+                        cancel_iteration.group(1),
+                        bool(payload.get("block_current_baseline")),
+                    )
+                )
                 return
             second = re.fullmatch(r"/api/runs/([a-f0-9]{12})/second-turn", path)
             if second:
