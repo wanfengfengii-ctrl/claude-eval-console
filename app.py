@@ -129,8 +129,8 @@ SOLO_QA_PROJECT_REJECTION_MARKERS = (
     "题材不合格",
 )
 SUBMITTER_NAME = os.environ.get("CLAUDE_EVAL_SUBMITTER", "牛宇航").strip() or "牛宇航"
-APP_VERSION = "20260914.3"
-EVALUATION_REPAIR_POLICY_VERSION = 3
+APP_VERSION = "20260914.4"
+EVALUATION_REPAIR_POLICY_VERSION = 4
 REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/\[\]-]{0,127}$")
 BACKGROUND_ID_RE = re.compile(r"backgrounded\s+[·•]\s+([A-Za-z0-9_-]+)", re.I)
@@ -7302,7 +7302,16 @@ def completed_turn_evaluation_policy_issues(
 ) -> List[str]:
     """Apply turn-aware description rules before export or submission."""
     issues: List[str] = []
-    if evaluation.get("score_validation_mode") == "quality_platform_review":
+    repair_output = str(row.get("evaluation_repair_output_sha256") or "")
+    legacy_description_repair_applied = bool(
+        str(row.get("evaluation_repair_job_status") or "") == "succeeded"
+        and repair_output
+        and repair_output == evaluation_repair_source_sha256(row, [])
+    )
+    if (
+        evaluation.get("score_validation_mode") == "quality_platform_review"
+        or legacy_description_repair_applied
+    ):
         # Immutable delivery evidence remains part of export_readiness. Public
         # prose is checked by the advisory repair pass and by SOLO-QA instead of
         # repeatedly blocking a completed delivery on local wording heuristics.
@@ -7617,6 +7626,15 @@ def automatic_evaluation_description_repair_issues(
             if deficiency:
                 issues.append(f"自动检查的{label}满分描述包含扣分点：{deficiency[:120]}")
     return list(dict.fromkeys(issues))
+
+
+def completed_description_repair_candidate_policy_issues(
+    row: Dict[str, Any], evaluation: Dict[str, Any]
+) -> List[str]:
+    """Check a description-only repair without reapplying legacy prose gates."""
+    candidate = json.loads(json.dumps(evaluation, ensure_ascii=False))
+    candidate["score_validation_mode"] = "quality_platform_review"
+    return completed_turn_evaluation_policy_issues(row, candidate)
 
 
 def completed_turn_repairable_evaluation_issues(
@@ -7974,7 +7992,7 @@ def persist_completed_turn_evaluation_repair(
             )
         candidate_row = dict(current)
         candidate_row["turn_review_result"] = repaired_review_text
-        candidate_policy_issues = completed_turn_evaluation_policy_issues(
+        candidate_policy_issues = completed_description_repair_candidate_policy_issues(
             candidate_row,
             repaired_evaluation,
         )
@@ -8206,7 +8224,7 @@ def evaluation_repair_worker(turn_key: str, source_sha256: str) -> None:
             candidate_row["turn_review_result"] = json.dumps(
                 candidate_review, ensure_ascii=False
             )
-            candidate_policy_issues = completed_turn_evaluation_policy_issues(
+            candidate_policy_issues = completed_description_repair_candidate_policy_issues(
                 candidate_row, repaired
             )
             if candidate_policy_issues:
