@@ -1,4 +1,4 @@
-const UI_VERSION = "20260914.5";
+const UI_VERSION = "20260914.6";
 const EXPORT_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 const TABLE_PAGE_SIZE = 20;
 const SOLO_QA_AUTO_REPAIR_POLL_MS = 3000;
@@ -1230,9 +1230,17 @@ async function syncSoloQa({ silent = false, autoRepair = true } = {}) {
   state.soloQaLastMessage = "正在读取 SOLO-QA 的我的提交…";
   renderSoloQaControls();
   try {
-    const result = await requestSoloQaBridge("SOLO_QA_SYNC", {}, 3 * 60 * 1000);
+    const result = await requestSoloQaBridge("SOLO_QA_SYNC", {}, 8 * 60 * 1000);
     const syncDate = String(result.scope_date || "今天");
-    const syncMessage = `已同步 ${syncDate} 的远端提交 ${result.remote_total || 0} 条；匹配本地 ${result.matched || 0} 条${result.unmatched ? `，${result.unmatched} 条在本地未找到` : ""}${result.partial ? "；当天数据超过 500 条，本次仅同步最近 500 条" : ""}`;
+    const historyMessage = result.full_history
+      ? `；首次历史题库已索引 ${result.prompt_history_indexed || 0} 条 Prompt，后续只同步当天数据`
+      : "";
+    const partialMessage = result.partial
+      ? (result.full_history
+        ? "；历史数据超过 500 条，本次仅建立最近 500 条索引"
+        : "；当天数据超过 500 条，本次仅同步最近 500 条")
+      : "";
+    const syncMessage = `已同步 ${syncDate} 的远端提交 ${result.remote_total || 0} 条；匹配本地 ${result.matched || 0} 条${result.unmatched ? `，${result.unmatched} 条在本地未找到` : ""}${historyMessage}${partialMessage}`;
     await loadCompletedTurns({ autoRepair: false });
     const repair = autoRepair
       ? await autoRepairSyncedSoloQaReturns()

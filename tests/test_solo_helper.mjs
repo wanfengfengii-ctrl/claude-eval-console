@@ -39,6 +39,7 @@ const requests = [];
 let createdCount = 0;
 let transientRepairFailures = 0;
 let uploadValidationFailures = 0;
+let promptHistoryBootstrapRequired = false;
 
 function shanghaiDayKey(value = new Date()) {
   const parts = new Intl.DateTimeFormat("en-US", {
@@ -108,6 +109,13 @@ globalThis.fetch = async (url, options = {}) => {
     localStates.push(JSON.parse(options.body));
     return jsonResponse({ state: localStates.at(-1).state });
   }
+  if (href.endsWith("/api/solo-qa/prompt-history-status")) {
+    return jsonResponse({
+      bootstrap_required: promptHistoryBootstrapRequired,
+      bootstrapped: !promptHistoryBootstrapRequired,
+      indexed_prompts: 120,
+    });
+  }
   if (href.endsWith("/api/solo-qa/sync")) {
     const body = JSON.parse(options.body);
     localSyncs.push(body);
@@ -122,7 +130,7 @@ globalThis.fetch = async (url, options = {}) => {
         { id: 901, submitted_at: `${todayKey}T09:15:00+08:00` },
         { id: 900, submitted_at: `${yesterdayKey}T23:59:00+08:00` },
       ],
-      meta: { total: 146 },
+      meta: { total: promptHistoryBootstrapRequired ? 2 : 146 },
     });
   }
   if (href.endsWith("/api/v1/submissions/901")) {
@@ -133,6 +141,10 @@ globalThis.fetch = async (url, options = {}) => {
       session_id: "session-history",
       turn_id: "turn-history",
       round_no: 2,
+      user_prompt: "为陶坯称重流程增加批次复核",
+      repo_url: "https://github.com/example/ceramic-review.git",
+      repo_name: "ceramic-review",
+      task_type: "Feature 迭代",
       score_delivery: 5,
       desc_delivery: "  本次交付核对了独有业务对象。  ",
       instruction_following: {
@@ -156,6 +168,22 @@ globalThis.fetch = async (url, options = {}) => {
           unsafe: { cookie: "must-not-leak" },
         }],
       },
+    });
+  }
+  if (href.endsWith("/api/v1/submissions/900")) {
+    return jsonResponse({
+      id: 900,
+      status: "DISCARDED",
+      submitted_at: `${yesterdayKey}T23:59:00+08:00`,
+      session_id: "session-old",
+      turn_id: "turn-old",
+      round_no: 1,
+      values: {
+        user_prompt: "旧的陶坯称重批次复核题面",
+        repo_url: "https://github.com/example/ceramic-review.git",
+        task_type: "Feature 迭代",
+      },
+      qc_summary: "与同仓库历史题面语义雷同",
     });
   }
   if (href.endsWith("/api/v1/submissions/555") && (options.method || "GET") === "GET") {
@@ -343,8 +371,30 @@ assert.deepEqual(synced.instruction, {
   description: "第 2 轮逐项对照了题面约束。",
 });
 assert.equal(synced.planning.description, "按三个真实阶段推进并记录状态。");
+assert.equal(synced.user_prompt, "为陶坯称重流程增加批次复核");
+assert.equal(synced.repo_url, "https://github.com/example/ceramic-review.git");
+assert.equal(synced.task_type, "Feature 迭代");
 assert.equal(synced.reasoning.score, 4);
 assert.equal(synced.execution.score, 4);
 assert.equal(synced.dedup_hits.length, 1);
 assert.equal(synced.dedup_hits[0].submission_id, 812);
 assert.equal("unsafe" in synced.dedup_hits[0], false);
+
+promptHistoryBootstrapRequired = true;
+const syncCountBeforeBootstrap = localSyncs.length;
+const bootstrapResponse = await new Promise((resolve) => {
+  listener(
+    { type: "SOLO_QA_SYNC", payload: {} },
+    { url: "http://127.0.0.1:8765/#exports" },
+    resolve,
+  );
+});
+assert.equal(bootstrapResponse.ok, true);
+assert.equal(bootstrapResponse.data.full_history, true);
+assert.equal(bootstrapResponse.data.scope_date, "全部历史");
+assert.equal(bootstrapResponse.data.remote_total, 2);
+assert.equal(localSyncs.length, syncCountBeforeBootstrap + 2);
+assert.equal(localSyncs.at(-2).items.length, 2);
+assert.equal(localSyncs.at(-1).history_bootstrap_complete, true);
+assert.equal(localSyncs.at(-2).items.find((item) => item.id === 900).user_prompt,
+  "旧的陶坯称重批次复核题面");

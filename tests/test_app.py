@@ -7749,6 +7749,34 @@ class IterationGenerationTests(unittest.TestCase):
                 candidate, iteration_history=[abandoned]
             )
 
+    def test_repository_history_blocks_cross_session_repeat(self):
+        candidate = self.candidate()
+        repository_history = [{
+            "reference": "SOLO-QA #8075",
+            "source": "solo_qa",
+            "prompt": candidate["prompt"],
+            "task_type": "Feature 迭代",
+            "dedup_required": True,
+        }]
+        with self.assertRaisesRegex(app.WorkflowError, "SOLO-QA #8075"):
+            app.validate_generated_iteration(
+                candidate,
+                iteration_history=[],
+                repository_history=repository_history,
+            )
+
+    def test_repository_key_matches_fallback_without_cross_owner_collision(self):
+        self.assertEqual(
+            app.canonical_repository_key(
+                "git@github.com:WanFeng/demo-repo.git", ""
+            ),
+            "wanfeng/demo-repo",
+        )
+        self.assertTrue(app.repository_keys_match("wanfeng/demo-repo", "demo-repo"))
+        self.assertFalse(
+            app.repository_keys_match("wanfeng/demo-repo", "someone/demo-repo")
+        )
+
     def test_iteration_generation_is_fixed_to_gpt_5_6_sol(self):
         context = {"repo_path": "/tmp/existing-project", "repo_name": "demo"}
         with mock.patch.object(
@@ -7760,6 +7788,7 @@ class IterationGenerationTests(unittest.TestCase):
         self.assertEqual(codex.call_args.args[2], Path("/tmp/existing-project"))
         self.assertEqual(codex.call_args.kwargs["model"], "gpt-5.6-sol")
         self.assertIn(app.DEVELOPER_PROMPT_STYLE_GUIDANCE, codex.call_args.args[0])
+        self.assertIn("repository_prompt_history", codex.call_args.args[0])
 
     def test_new_module_generation_schema_has_scope_caps(self):
         context = {"repo_path": "/tmp/existing-project", "repo_name": "demo"}
@@ -8765,11 +8794,12 @@ class ExportTests(unittest.TestCase):
             database.execute(
                 """INSERT INTO runs(
                      id, repo_name, model, task_type, task_difficulty,
-                     language_framework, repo_path, phase, session_id, snapshot_url,
+                     language_framework, repo_path, repo_url, phase, session_id, snapshot_url,
                      first_prompt, trajectory_path, verification_commands, harness_version,
                      created_at, updated_at
                    ) VALUES (?, 'export-demo', 'gpt-5.6-sol', '0-1 代码生成', '困难',
-                             'Python, FastAPI', ?, 'complete', 'session-export',
+                             'Python, FastAPI', ?, 'https://github.com/example/export-demo',
+                             'complete', 'session-export',
                              'https://github.com/example/export-demo/commit/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa',
                              '原始题面', ?, '[]', '2.1.263', ?, ?)""",
                 (run_id, str(repo), str(raw_trace), timestamp, timestamp),
@@ -10071,6 +10101,10 @@ class ExportTests(unittest.TestCase):
                         "session_id": "session-export",
                         "turn_id": "prompt-export",
                         "round_no": 1,
+                        "user_prompt": "完成陶坯称重核对并保留批次证据",
+                        "repo_url": "https://github.com/example/export-demo.git",
+                        "repo_name": "export-demo",
+                        "task_type": "0-1 代码生成",
                         "qc_summary": "质检通过",
                         "submitted_at": "2026-09-10 12:00:00 +0800",
                     }],
@@ -10103,6 +10137,10 @@ class ExportTests(unittest.TestCase):
                         "session_id": "session-export",
                         "turn_id": "prompt-export",
                         "round_no": 1,
+                        "user_prompt": "完成陶坯称重核对并保留批次证据",
+                        "repo_url": "https://github.com/example/export-demo.git",
+                        "repo_name": "export-demo",
+                        "task_type": "0-1 代码生成",
                         "delivery": {
                             "score": 5,
                             "description": "陶坯称重核对在第 1 轮完成并留下验收记录。",
@@ -10120,6 +10158,7 @@ class ExportTests(unittest.TestCase):
                         }],
                     }],
                     "complete": False,
+                    "history_bootstrap_complete": True,
                 })
                 completed = app.sync_solo_qa_submissions({
                     "items": [],
@@ -10131,16 +10170,27 @@ class ExportTests(unittest.TestCase):
                         "SELECT * FROM solo_qa_remote_evaluations "
                         "WHERE remote_submission_id = '91'"
                     ).fetchone())
+                    prompt_history = dict(database.execute(
+                        "SELECT * FROM solo_qa_prompt_history "
+                        "WHERE remote_submission_id = '91'"
+                    ).fetchone())
                 history = app.historical_evaluation_descriptions(
                     "delivery",
                     exclude_turn_key="abc123abc123:1",
                 )
+                prompt_status = app.solo_qa_prompt_history_status()
+                run = app.run_row("abc123abc123")
+                repo_history = app.repository_prompt_history(run)
 
         self.assertEqual(result["matched"], 1)
         self.assertEqual(completed["remote_missing"], 0)
         self.assertEqual(stored["delivery_score"], 5)
         self.assertIn("陶坯称重核对", stored["delivery_description"])
         self.assertNotIn("unsafe", stored["dedup_hits"])
+        self.assertEqual(prompt_history["repo_key"], "example/export-demo")
+        self.assertIn("陶坯称重", prompt_history["prompt"])
+        self.assertTrue(prompt_status["bootstrapped"])
+        self.assertEqual(repo_history[0]["reference"], "SOLO-QA #91")
         self.assertEqual(history[0]["reference"], "SOLO-QA #91")
         self.assertIn("陶坯称重核对", history[0]["description"])
 
