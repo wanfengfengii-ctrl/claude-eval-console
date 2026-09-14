@@ -3180,6 +3180,17 @@ class ParsingTests(unittest.TestCase):
         self.assertFalse(app.retryable_api_error("API Error: 403 model unavailable"))
         self.assertTrue(app.retryable_api_error("API Error: 504 Gateway Time-out"))
         self.assertTrue(app.retryable_api_error("API Error: 429 rate limited"))
+        self.assertTrue(
+            app.retryable_api_error(
+                "API Error: Request rejected (429) · litellm.RateLimitError"
+            )
+        )
+        self.assertTrue(
+            app.retryable_api_error("API 错误：请求被拒绝（429）· 超出速率限制")
+        )
+        self.assertFalse(
+            app.retryable_api_error("API Error: Request rejected (403) forbidden")
+        )
 
     def test_stopped_container_is_preserved_as_interrupted(self):
         with tempfile.TemporaryDirectory() as directory:

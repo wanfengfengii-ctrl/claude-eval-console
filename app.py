@@ -129,7 +129,7 @@ SOLO_QA_PROJECT_REJECTION_MARKERS = (
     "题材不合格",
 )
 SUBMITTER_NAME = os.environ.get("CLAUDE_EVAL_SUBMITTER", "牛宇航").strip() or "牛宇航"
-APP_VERSION = "20260914.4"
+APP_VERSION = "20260914.5"
 EVALUATION_REPAIR_POLICY_VERSION = 4
 REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/\[\]-]{0,127}$")
@@ -11110,7 +11110,13 @@ def preserve_interrupted_docker_turn(run_id: str, turn_number: int, reason: str)
 
 
 def retryable_api_error(detail: str) -> bool:
-    match = re.search(r"API Error:\s*(\d{3})", str(detail or ""), re.I)
+    match = re.search(
+        r"API\s*(?:Error|错误)\s*[:：]\s*"
+        r"(?:(?:Request\s+rejected|请求被拒绝)\s*)?"
+        r"[（(]?\s*(\d{3})\s*[）)]?",
+        str(detail or ""),
+        re.I,
+    )
     return bool(match and int(match.group(1)) in RETRYABLE_API_STATUS_CODES)
 
 
