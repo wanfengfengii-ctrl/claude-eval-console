@@ -3182,6 +3182,12 @@ class ParsingTests(unittest.TestCase):
         self.assertTrue(app.retryable_api_error("API Error: 429 rate limited"))
         self.assertTrue(
             app.retryable_api_error(
+                "API Error: Unable to connect to API "
+                "(UNKNOWN_CERTIFICATE_VERIFICATION_ERROR)"
+            )
+        )
+        self.assertTrue(
+            app.retryable_api_error(
                 "API Error: Request rejected (429) · litellm.RateLimitError"
             )
         )

@@ -130,7 +130,7 @@ SOLO_QA_PROJECT_REJECTION_MARKERS = (
     "题材不合格",
 )
 SUBMITTER_NAME = os.environ.get("CLAUDE_EVAL_SUBMITTER", "牛宇航").strip() or "牛宇航"
-APP_VERSION = "20260914.10"
+APP_VERSION = "20260914.11"
 EVALUATION_REPAIR_POLICY_VERSION = 5
 REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/\[\]-]{0,127}$")
@@ -617,6 +617,16 @@ AUTO_API_RETRY_LIMIT = 2
 AUTO_API_RETRY_DELAY_SECONDS = 30
 API_RESUME_GRACE_SECONDS = 30
 RETRYABLE_API_STATUS_CODES = {408, 429, 500, 502, 503, 504}
+RETRYABLE_API_ERROR_MARKERS = (
+    "unable to connect",
+    "connection reset",
+    "connection refused",
+    "remote end closed",
+    "ssl_error_syscall",
+    "certificate_verification_error",
+    "network error",
+    "network is unreachable",
+)
 CATEGORY_SCHEDULE = ("纯后端", "纯前端", "全栈", "纯后端", "纯前端", "全栈", "纯后端", "纯前端", "全栈", "纯后端")
 TASK_PROMPT_TARGET_CHARS = 450
 TASK_PROMPT_GENERATION_MIN_CHARS = 300
@@ -11881,6 +11891,9 @@ def preserve_interrupted_docker_turn(run_id: str, turn_number: int, reason: str)
 
 
 def retryable_api_error(detail: str) -> bool:
+    normalized = str(detail or "").casefold()
+    if any(marker in normalized for marker in RETRYABLE_API_ERROR_MARKERS):
+        return True
     match = re.search(
         r"API\s*(?:Error|错误)\s*[:：]\s*"
         r"(?:(?:Request\s+rejected|请求被拒绝)\s*)?"
