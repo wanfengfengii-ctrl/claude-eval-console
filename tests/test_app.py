@@ -515,7 +515,7 @@ class ValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(app.WorkflowError, "满分描述包含扣分点"):
             app.normalize_evaluation(evaluation, 1)
 
-    def test_new_score_descriptions_reject_generic_openings_from_b5_returns(self):
+    def test_new_score_descriptions_do_not_hard_block_generic_openings(self):
         cases = (
             (
                 "planning",
@@ -530,9 +530,7 @@ class ValidationTests(unittest.TestCase):
         )
 
         for dimension, description in cases:
-            with self.subTest(dimension=dimension), self.assertRaisesRegex(
-                app.WorkflowError, "使用通用轮次开头"
-            ):
+            with self.subTest(dimension=dimension):
                 app.validate_evaluation_description_novelty(
                     {dimension: {"score": 5, "description": description}},
                     {dimension: []},
@@ -561,7 +559,7 @@ class ValidationTests(unittest.TestCase):
                     require_distinct_opening=True,
                 )
 
-    def test_description_novelty_rejects_only_high_confidence_history_reuse(self):
+    def test_description_novelty_blocks_only_effectively_identical_history(self):
         previous = (
             "陶坯称重页面在第 1 轮接入批次核对和差异提示，src/App.tsx 保存筛选状态。"
             "验收记录显示 18 项检查完成，超差批次会在列表中标红并阻止确认。"
@@ -575,9 +573,15 @@ class ValidationTests(unittest.TestCase):
             }]
         }
 
-        with self.assertRaisesRegex(app.WorkflowError, "SOLO-QA #7001 高度重复"):
+        app.validate_evaluation_description_novelty(
+            {"delivery": {"score": 5, "description": copied}},
+            history,
+            require_distinct_opening=False,
+        )
+
+        with self.assertRaisesRegex(app.WorkflowError, "SOLO-QA #7001 完全重复"):
             app.validate_evaluation_description_novelty(
-                {"delivery": {"score": 5, "description": copied}},
+                {"delivery": {"score": 5, "description": previous}},
                 history,
                 require_distinct_opening=False,
             )
@@ -3304,6 +3308,164 @@ class ParsingTests(unittest.TestCase):
 
 
 class ReviewTests(unittest.TestCase):
+    def test_public_evaluation_history_keeps_only_qc_passed_prose(self):
+        accepted = sample_evaluation()
+        accepted["delivery"]["description"] = "历史 `交付` 点评"
+        newer_accepted = sample_evaluation()
+        newer_accepted["delivery"]["description"] = "较新的交付点评"
+        rejected = sample_evaluation()
+        rejected["delivery"]["description"] = "不应进入提示的返修点评"
+        rows = [
+            {
+                "solo_qa_state": "qc_passed",
+                "solo_qa_remote_submission_id": "6532",
+                "turn_review_result": json.dumps(
+                    {"evaluation": accepted}, ensure_ascii=False
+                ),
+                "turn_manual_evaluation": "",
+            },
+            {
+                "solo_qa_state": "needs_fix",
+                "solo_qa_remote_submission_id": "6546",
+                "turn_review_result": json.dumps(
+                    {"evaluation": rejected}, ensure_ascii=False
+                ),
+                "turn_manual_evaluation": "",
+            },
+            {
+                "solo_qa_state": "qc_passed",
+                "solo_qa_remote_submission_id": "6539",
+                "turn_review_result": json.dumps(
+                    {"evaluation": newer_accepted}, ensure_ascii=False
+                ),
+                "turn_manual_evaluation": "",
+            },
+        ]
+
+        with mock.patch.object(app, "completed_turn_rows", return_value=rows):
+            history = app.recent_qc_passed_public_evaluation_history(
+                limit=1,
+                include_account_remote=False,
+            )
+
+        self.assertEqual(history["delivery"], ["#6539 较新的交付点评"])
+        self.assertTrue(
+            all(len(history[key]) == 1 for key in app.EVALUATION_DIMENSION_KEYS)
+        )
+        self.assertFalse(
+            any("6546" in entry for values in history.values() for entry in values)
+        )
+
+    def test_public_evaluation_history_prioritizes_b5_inflight_and_old_samples(self):
+        def history_row(
+            run_id,
+            remote_id,
+            state,
+            updated_at,
+            description,
+            *,
+            remote_status="",
+            qc_summary="",
+        ):
+            evaluation = sample_evaluation()
+            for key in app.EVALUATION_DIMENSION_KEYS:
+                evaluation[key]["description"] = f"{description}-{key}"
+            return {
+                "run_id": run_id,
+                "turn_number": 1,
+                "turn_updated_at": updated_at,
+                "solo_qa_state": state,
+                "solo_qa_remote_status": remote_status,
+                "solo_qa_remote_submission_id": remote_id,
+                "solo_qa_qc_summary": qc_summary,
+                "turn_review_result": json.dumps(
+                    {"evaluation": evaluation}, ensure_ascii=False
+                ),
+                "turn_manual_evaluation": "",
+            }
+
+        rows = [
+            history_row(
+                "b5-rejected", "900", "needs_fix", "2026-09-13T12:30:00",
+                "B5被拒点评", remote_status="PENDING_FIX",
+                qc_summary="B-5 公共长片段与已交付数据 #100 重复",
+            ),
+            history_row(
+                "inflight", "", "", "2026-09-13T12:20:00", "尚未提交点评"
+            ),
+            history_row(
+                "ordinary-rejected", "901", "needs_fix", "2026-09-13T12:10:00",
+                "普通返修点评", remote_status="PENDING_FIX",
+                qc_summary="事实措辞需要调整",
+            ),
+            history_row(
+                "discarded", "902", "discarded", "2026-09-13T12:00:00",
+                "废弃点评", remote_status="DISCARDED",
+            ),
+        ]
+        for index in range(10):
+            rows.append(history_row(
+                f"recent-{index}", str(800 - index), "qc_passed",
+                f"2026-09-13T11:{59 - index:02d}:00", f"近期通过点评{index}",
+                remote_status="QC_PASSED",
+            ))
+        rows.extend([
+            history_row(
+                "b5-reference", "100", "qc_passed", "2026-02-01T00:00:00",
+                "被B5引用的旧点评", remote_status="QC_PASSED",
+            ),
+            history_row(
+                "oldest", "50", "qc_passed", "2025-01-01T00:00:00",
+                "全量扫描抽到的旧点评", remote_status="QC_PASSED",
+            ),
+        ])
+
+        with mock.patch.object(app, "completed_turn_rows", return_value=rows):
+            history = app.recent_qc_passed_public_evaluation_history(
+                limit=8,
+                max_chars=4_000,
+                include_account_remote=False,
+            )
+
+        delivery = history["delivery"]
+        self.assertTrue(any(entry.startswith("B-5引用 #100 ") for entry in delivery))
+        self.assertTrue(any(entry.startswith("B-5反例 #900 ") for entry in delivery))
+        self.assertTrue(any(entry.startswith("在途 inflight:1 ") for entry in delivery))
+        self.assertTrue(any(entry.startswith("旧样本 #50 ") for entry in delivery))
+        self.assertFalse(any("普通返修点评" in entry for entry in delivery))
+        self.assertFalse(any("废弃点评" in entry for entry in delivery))
+        self.assertTrue(all(len(values) <= 8 for values in history.values()))
+
+    def test_public_evaluation_history_enforces_per_dimension_character_budget(self):
+        rows = []
+        for index in range(12):
+            evaluation = sample_evaluation()
+            for key in app.EVALUATION_DIMENSION_KEYS:
+                evaluation[key]["description"] = f"第{index}条" + ("长点评" * 12)
+            rows.append({
+                "run_id": f"run-{index}",
+                "turn_number": 1,
+                "turn_updated_at": f"2026-09-13T11:{index:02d}:00",
+                "solo_qa_state": "qc_passed",
+                "solo_qa_remote_status": "QC_PASSED",
+                "solo_qa_remote_submission_id": str(700 + index),
+                "turn_review_result": json.dumps(
+                    {"evaluation": evaluation}, ensure_ascii=False
+                ),
+                "turn_manual_evaluation": "",
+            })
+
+        with mock.patch.object(app, "completed_turn_rows", return_value=rows):
+            history = app.recent_qc_passed_public_evaluation_history(
+                limit=20,
+                max_chars=180,
+                include_account_remote=False,
+            )
+
+        for values in history.values():
+            self.assertLessEqual(len("\n".join(values)), 180)
+            self.assertLess(len(values), len(rows))
+
     def test_evaluation_rubric_is_loaded_from_doc(self):
         rubric = app.evaluation_rubric_text()
         self.assertIn("交付完整性 (Delivery)", rubric)
@@ -8620,6 +8782,77 @@ class ExportTests(unittest.TestCase):
             )
         return repo
 
+    def test_english_dominant_public_description_is_targeted_for_repair(self):
+        evaluation = sample_evaluation()
+        evaluation["delivery"]["description"] = (
+            "Round one delivered the requested browser workflow with strict "
+            "validation, visible results, downloadable output, and verification."
+        )
+        issues = app.automatic_evaluation_description_repair_issues(evaluation)
+
+        self.assertTrue(any("交付完整性描述主要为英文" in issue for issue in issues))
+        self.assertFalse(
+            app.evaluation_description_is_english_dominant(
+                "第 1 轮在 src/App.tsx 调用 parseTimeline()，随后运行 npm test 完成检查。"
+            )
+        )
+
+    def test_english_public_description_waits_for_auto_repair_before_solo_qa(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.object(app, "DB_PATH", root / "test.db"), mock.patch.object(
+                app, "DATA_DIR", root
+            ):
+                app.initialize_database()
+                self.insert_completed_turn(root)
+                evaluation = sample_evaluation()
+                evaluation["score_validation_mode"] = "quality_platform_review"
+                evaluation["delivery"]["description"] = (
+                    "Round one delivered the requested browser workflow with strict "
+                    "validation, visible results, downloadable output, and verification."
+                )
+                app.update_turn(
+                    "abc123abc123",
+                    1,
+                    review_result=json.dumps(
+                        {"evaluation": evaluation}, ensure_ascii=False
+                    ),
+                )
+
+                completed = app.completed_turns()[0]
+
+        self.assertTrue(completed["export_ready"])
+        self.assertFalse(completed["solo_qa_ready"])
+        self.assertEqual(completed["evaluation_repair"]["status"], "needed")
+        self.assertTrue(
+            any("交付完整性描述主要为英文" in issue for issue in completed["solo_qa_issues"])
+        )
+
+    def test_description_only_repair_keeps_score_and_internal_evidence_out_of_schema(self):
+        evaluation = sample_evaluation()
+        replacement = "陶坯称重流程在第 1 轮完成交付，页面状态和导出结果都有对应记录。"
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            app,
+            "run_codex_structured",
+            return_value={"description": replacement},
+        ) as runner:
+            result = app.run_codex_evaluation_description_repair(
+                Path(directory),
+                "完成陶坯称重流程",
+                "STEP 1: 修改 src/App.tsx",
+                evaluation,
+                "delivery",
+                1,
+                ["自动检查的交付完整性描述主要为英文"],
+                avoidance_history=["#7001 另一条历史交付点评"],
+            )
+
+        schema = runner.call_args.args[1]
+        self.assertEqual(schema["required"], ["description"])
+        self.assertEqual(result, replacement)
+        self.assertIn("分数固定为 5 分", runner.call_args.args[0])
+        self.assertIn("不得返回或改变分数", runner.call_args.args[0])
+
     def test_completed_turn_list_and_delivery_row_use_reviewed_values(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -8821,7 +9054,7 @@ class ExportTests(unittest.TestCase):
                 evaluation = sample_evaluation()
                 evaluation["planning"] = {
                     "score": 4,
-                    "description": "第 1 轮检查计划仍有遗漏。该遗漏造成了一次返工。",
+                    "description": "第 1 轮检查 `app.py` 后发现计划仍有遗漏，该遗漏造成了一次返工。",
                 }
                 app.update_turn(
                     "abc123abc123",
@@ -8837,7 +9070,7 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(repair["status"], "needed")
         self.assertTrue(repair["can_start"])
         self.assertTrue(repair["repairable_issues"])
-        self.assertIn("具体步骤", repair["repairable_issues"][0])
+        self.assertIn("反引号", repair["repairable_issues"][0])
 
     def test_solo_qa_returned_description_issue_targets_named_dimensions(self):
         row = {
@@ -8928,7 +9161,7 @@ class ExportTests(unittest.TestCase):
                 evaluation = sample_evaluation()
                 evaluation["planning"] = {
                     "score": 4,
-                    "description": "第 1 轮检查计划仍有遗漏。该遗漏造成了一次返工。",
+                    "description": "第 1 轮检查 `app.py` 后发现计划仍有遗漏，该遗漏造成了一次返工。",
                 }
                 app.update_turn(
                     "abc123abc123",
@@ -8961,7 +9194,7 @@ class ExportTests(unittest.TestCase):
                 evaluation = sample_evaluation()
                 evaluation["planning"] = {
                     "score": 4,
-                    "description": "第 1 轮检查计划仍有遗漏。该遗漏造成了一次返工。",
+                    "description": "第 1 轮检查 `app.py` 后发现计划仍有遗漏，该遗漏造成了一次返工。",
                 }
                 app.update_turn(
                     "abc123abc123",
@@ -9010,7 +9243,7 @@ class ExportTests(unittest.TestCase):
                 evaluation = sample_evaluation()
                 evaluation["planning"] = {
                     "score": 4,
-                    "description": "第 1 轮检查计划仍有遗漏。该遗漏造成了一次返工。",
+                    "description": "第 1 轮检查 `app.py` 后发现计划仍有遗漏，该遗漏造成了一次返工。",
                 }
                 app.update_turn(
                     "abc123abc123",
@@ -9047,7 +9280,7 @@ class ExportTests(unittest.TestCase):
                 evaluation = sample_evaluation()
                 evaluation["planning"] = {
                     "score": 4,
-                    "description": "第 1 轮检查计划仍有遗漏。该遗漏造成了一次返工。",
+                    "description": "第 1 轮检查 `app.py` 后发现计划仍有遗漏，该遗漏造成了一次返工。",
                 }
                 app.update_turn(
                     "abc123abc123",
@@ -9062,26 +9295,25 @@ class ExportTests(unittest.TestCase):
                 source_sha256 = app.completed_turn_row(
                     "abc123abc123:1"
                 )["evaluation_repair_source_sha256"]
-                repaired = json.loads(json.dumps(evaluation, ensure_ascii=False))
-                repaired["planning"]["description"] = (
+                repaired_description = (
                     "“完成真实导出链路”在第 1 轮第 1 步规划时没有拆分提交前检查，"
                     "导致最终回复前缺少阶段记录。保存的最终回复显示“已经完成”，"
                     "因此该遗漏只造成过程依据不完整，没有影响最终结果。"
                 )
                 with mock.patch.object(
                     app,
-                    "normalize_evaluation_with_targeted_repairs",
+                    "run_codex_evaluation_description_repair",
                     side_effect=[
                         app.WorkflowError("API Error: 504 Gateway Time-out"),
-                        repaired,
+                        repaired_description,
                     ],
-                ) as normalize, mock.patch.object(app.time, "sleep"):
+                ) as repair, mock.patch.object(app.time, "sleep"):
                     app.evaluation_repair_worker(
                         "abc123abc123:1", source_sha256
                     )
                 row = app.completed_turn_row("abc123abc123:1")
 
-        self.assertEqual(normalize.call_count, 2)
+        self.assertEqual(repair.call_count, 2)
         self.assertEqual(row["evaluation_repair_job_status"], "succeeded")
         self.assertIn(
             "第 1 轮第 1 步规划",
@@ -9101,7 +9333,7 @@ class ExportTests(unittest.TestCase):
                 evaluation = sample_evaluation()
                 evaluation["planning"] = {
                     "score": 4,
-                    "description": "第 1 轮检查计划仍有遗漏。该遗漏造成了一次返工。",
+                    "description": "第 1 轮检查 `app.py` 后发现计划仍有遗漏，该遗漏造成了一次返工。",
                 }
                 app.update_turn(
                     "abc123abc123",
@@ -9144,7 +9376,7 @@ class ExportTests(unittest.TestCase):
                 evaluation = sample_evaluation()
                 evaluation["planning"] = {
                     "score": 4,
-                    "description": "第 1 轮检查计划仍有遗漏。该遗漏造成了一次返工。",
+                    "description": "第 1 轮检查 `app.py` 后发现计划仍有遗漏，该遗漏造成了一次返工。",
                 }
                 app.update_turn(
                     "abc123abc123",
@@ -9175,7 +9407,7 @@ class ExportTests(unittest.TestCase):
                 evaluation = sample_evaluation()
                 evaluation["planning"] = {
                     "score": 4,
-                    "description": "第 1 轮检查计划仍有遗漏。该遗漏造成了一次返工。",
+                    "description": "第 1 轮检查 `app.py` 后发现计划仍有遗漏，该遗漏造成了一次返工。",
                 }
                 app.update_turn(
                     "abc123abc123",
@@ -9194,16 +9426,15 @@ class ExportTests(unittest.TestCase):
                 source_sha256 = queued["results"][0] and app.completed_turn_row(
                     "abc123abc123:1"
                 )["evaluation_repair_source_sha256"]
-                repaired = json.loads(json.dumps(evaluation, ensure_ascii=False))
-                repaired["planning"]["description"] = (
+                repaired_description = (
                     "“完成真实导出链路”在第 1 轮第 1 步规划时没有拆分提交前检查，"
                     "导致最终回复前缺少阶段记录。保存的最终回复显示“已经完成”，"
                     "因此该遗漏只造成过程依据不完整，没有影响最终结果。"
                 )
                 with mock.patch.object(
                     app,
-                    "normalize_evaluation_with_targeted_repairs",
-                    return_value=repaired,
+                    "run_codex_evaluation_description_repair",
+                    return_value=repaired_description,
                 ):
                     app.evaluation_repair_worker(
                         "abc123abc123:1", source_sha256
@@ -9229,7 +9460,7 @@ class ExportTests(unittest.TestCase):
                 evaluation = sample_evaluation()
                 evaluation["planning"] = {
                     "score": 4,
-                    "description": "第 1 轮检查计划仍有遗漏。该遗漏造成了一次返工。",
+                    "description": "第 1 轮检查 `app.py` 后发现计划仍有遗漏，该遗漏造成了一次返工。",
                 }
                 original_review = json.dumps(
                     {"evaluation": evaluation}, ensure_ascii=False
@@ -9259,7 +9490,7 @@ class ExportTests(unittest.TestCase):
 
                 with mock.patch.object(
                     app,
-                    "normalize_evaluation_with_targeted_repairs",
+                    "run_codex_evaluation_description_repair",
                     side_effect=add_manual_override,
                 ):
                     app.evaluation_repair_worker(
@@ -9282,7 +9513,7 @@ class ExportTests(unittest.TestCase):
                 evaluation = sample_evaluation()
                 evaluation["planning"] = {
                     "score": 4,
-                    "description": "第 1 轮检查计划仍有遗漏。该遗漏造成了一次返工。",
+                    "description": "第 1 轮检查 `app.py` 后发现计划仍有遗漏，该遗漏造成了一次返工。",
                 }
                 original_review = json.dumps(
                     {"evaluation": evaluation}, ensure_ascii=False
@@ -9296,20 +9527,28 @@ class ExportTests(unittest.TestCase):
                 source_sha256 = app.completed_turn_row(
                     "abc123abc123:1"
                 )["evaluation_repair_source_sha256"]
-                changed_score = sample_evaluation()
-                with mock.patch.object(
-                    app,
-                    "normalize_evaluation_with_targeted_repairs",
-                    return_value=changed_score,
-                ):
-                    app.evaluation_repair_worker(
+                row = app.completed_turn_row("abc123abc123:1")
+                self.assertTrue(
+                    app.claim_evaluation_repair_job(
                         "abc123abc123:1", source_sha256
+                    )
+                )
+                changed_score = json.loads(json.dumps(evaluation, ensure_ascii=False))
+                changed_score["planning"]["score"] = 5
+                changed_score["planning"]["description"] = (
+                    "第 1 轮检查 app.py 后完成计划核对，最终结果已有记录。"
+                )
+                with self.assertRaisesRegex(app.WorkflowError, "不能改变原分数"):
+                    app.persist_completed_turn_evaluation_repair(
+                        row,
+                        source_sha256,
+                        changed_score,
+                        repaired_dimensions=["planning"],
                     )
                 row = app.completed_turn_row("abc123abc123:1")
 
         self.assertEqual(row["turn_review_result"], original_review)
-        self.assertEqual(row["evaluation_repair_job_status"], "failed")
-        self.assertIn("不能改变原分数", row["evaluation_repair_error"])
+        self.assertEqual(row["evaluation_repair_job_status"], "running")
 
     def test_completed_evaluation_repair_cas_stops_after_remote_qc_starts(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -9322,7 +9561,7 @@ class ExportTests(unittest.TestCase):
                 evaluation = sample_evaluation()
                 evaluation["planning"] = {
                     "score": 4,
-                    "description": "第 1 轮检查计划仍有遗漏。该遗漏造成了一次返工。",
+                    "description": "第 1 轮检查 `app.py` 后发现计划仍有遗漏，该遗漏造成了一次返工。",
                 }
                 original_review = json.dumps(
                     {"evaluation": evaluation}, ensure_ascii=False
