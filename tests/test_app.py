@@ -3319,6 +3319,60 @@ class ParsingTests(unittest.TestCase):
 
 
 class ReviewTests(unittest.TestCase):
+    def test_generation_structured_retries_only_transient_capacity_failure(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            app,
+            "run_codex_structured",
+            side_effect=[
+                app.WorkflowError("Selected model is at capacity"),
+                {"ok": True},
+            ],
+        ) as runner, mock.patch.object(
+            app, "wait_for_generation_retry"
+        ) as wait:
+            result = app.run_codex_generation_structured(
+                "返回结果",
+                {"type": "object"},
+                Path(directory),
+                "task-generation",
+                120,
+            )
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(runner.call_count, 2)
+        self.assertEqual(runner.call_args.kwargs["reasoning_effort"], "low")
+        wait.assert_called_once_with(15)
+
+    def test_generation_structured_does_not_retry_content_failure(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            app,
+            "run_codex_structured",
+            side_effect=app.WorkflowError("题面与历史项目重复"),
+        ) as runner, mock.patch.object(
+            app, "wait_for_generation_retry"
+        ) as wait, self.assertRaisesRegex(app.WorkflowError, "历史项目重复"):
+            app.run_codex_generation_structured(
+                "返回结果",
+                {"type": "object"},
+                Path(directory),
+                "task-generation",
+                120,
+            )
+
+        runner.assert_called_once()
+        wait.assert_not_called()
+
+    def test_worker_slot_is_reentrant_and_releases_shared_capacity(self):
+        semaphore = threading.BoundedSemaphore(1)
+        with mock.patch.object(app, "WORKER_SEMAPHORE", semaphore):
+            with app.worker_slot():
+                with app.worker_slot(timeout_seconds=0.01):
+                    pass
+            acquired = semaphore.acquire(blocking=False)
+            self.assertTrue(acquired)
+            if acquired:
+                semaphore.release()
+
     def test_public_evaluation_history_keeps_only_qc_passed_prose(self):
         accepted = sample_evaluation()
         accepted["delivery"]["description"] = "历史 `交付` 点评"
@@ -4868,6 +4922,71 @@ class ReviewTests(unittest.TestCase):
 
 
 class RepositoryTests(unittest.TestCase):
+    def test_snapshot_clone_retries_transient_network_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source"
+            destination = root / "destination"
+            source.mkdir()
+            destination.mkdir()
+            app.run_command(["git", "init"], cwd=source)
+            app.run_command(["git", "config", "user.name", "Test User"], cwd=source)
+            app.run_command(["git", "config", "user.email", "test@example.com"], cwd=source)
+            (source / "README.md").write_text("source\n", encoding="utf-8")
+            app.run_command(["git", "add", "README.md"], cwd=source)
+            app.run_command(["git", "commit", "-m", "initial"], cwd=source)
+            expected = app.run_command(
+                ["git", "rev-parse", "HEAD"], cwd=source
+            ).stdout.strip()
+            original_run_command = app.run_command
+            clone_calls = 0
+
+            def flaky_run_command(args, **kwargs):
+                nonlocal clone_calls
+                if "clone" in args:
+                    clone_calls += 1
+                    if clone_calls == 1:
+                        (destination / "partial").write_text(
+                            "incomplete", encoding="utf-8"
+                        )
+                        raise app.WorkflowError(
+                            "RPC failed; curl 16 Error in the HTTP2 framing layer"
+                        )
+                return original_run_command(args, **kwargs)
+
+            with mock.patch.object(
+                app, "run_command", side_effect=flaky_run_command
+            ), mock.patch.object(app, "wait_for_generation_retry") as wait:
+                checked_out = app.clone_repository_snapshot(
+                    str(source), destination, expected
+                )
+
+        self.assertEqual(checked_out, expected)
+        self.assertEqual(clone_calls, 2)
+        wait.assert_called_once_with(3)
+
+    def test_snapshot_clone_does_not_clean_preexisting_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            destination = Path(directory) / "destination"
+            destination.mkdir()
+            marker = destination / "keep.txt"
+            marker.write_text("preserve", encoding="utf-8")
+            with mock.patch.object(
+                app,
+                "run_command",
+                side_effect=app.WorkflowError("RPC failed; connection reset"),
+            ) as runner, mock.patch.object(
+                app, "wait_for_generation_retry"
+            ) as wait, self.assertRaisesRegex(app.WorkflowError, "RPC failed"):
+                app.clone_repository_snapshot(
+                    "https://example.invalid/demo.git",
+                    destination,
+                    "f" * 40,
+                )
+            self.assertEqual(marker.read_text(encoding="utf-8"), "preserve")
+            runner.assert_called_once()
+            wait.assert_not_called()
+
     def test_snapshot_clone_checks_out_recorded_commit_after_main_advances(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -6381,16 +6500,18 @@ class DraftTests(unittest.TestCase):
         rewrite.assert_not_called()
         self.assertIn("当前候选与历史题面实质重复，改用下一候选", progress)
 
-    def test_task_generation_has_a_fifteen_minute_overall_deadline(self):
+    def test_task_generation_has_a_ten_minute_overall_deadline(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             with mock.patch.object(app, "DB_PATH", root / "test.db"), mock.patch.object(
                 app, "DATA_DIR", root
-            ), mock.patch.object(app, "TASK_GENERATION_TIMEOUT_SECONDS", 0), mock.patch.object(
+            ), mock.patch.object(
+                app.time, "monotonic", side_effect=[0, 601]
+            ), mock.patch.object(
                 app, "run_codex_task_generation"
             ) as generate:
                 app.initialize_database()
-                with self.assertRaisesRegex(app.WorkflowError, "15 分钟"):
+                with self.assertRaisesRegex(app.WorkflowError, "10 分钟"):
                     app.generate_task_draft(1)
 
         generate.assert_not_called()
@@ -6897,6 +7018,29 @@ class DraftTests(unittest.TestCase):
             self.assertEqual(stopped["phase"], "stopped")
             self.assertIn("用户取消", stopped["status_detail"])
             record_failure.assert_not_called()
+
+    def test_generation_cancelled_by_service_restart_returns_to_queue(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            with mock.patch.object(app, "DB_PATH", root / "test.db"), mock.patch.object(
+                app, "DATA_DIR", root
+            ), mock.patch.object(app, "PROJECTS_ROOT", root), mock.patch.object(
+                app, "HISTORY_PATH", root / "history.md"
+            ), mock.patch.object(app, "schedule_worker"), mock.patch.object(
+                app, "generate_task_draft", side_effect=app.JobCancelled("后台任务已取消")
+            ):
+                app.initialize_database()
+                created = app.create_automatic_run({"project_directory": "team-a"})
+                app.SERVER_SHUTTING_DOWN.set()
+                try:
+                    app.automatic_generation_worker(created["id"])
+                    queued = app.serialize_run(app.run_row(created["id"]))
+                finally:
+                    app.SERVER_SHUTTING_DOWN.clear()
+
+            self.assertEqual(queued["phase"], "generation_queued")
+            self.assertIn("服务重启", queued["status_detail"])
+            self.assertEqual(queued["turns"][0]["status"], "queued")
 
     def test_retry_generation_button_is_only_for_failed_placeholders(self):
         javascript = (app.STATIC_DIR / "app.js").read_text(encoding="utf-8")
@@ -7976,6 +8120,8 @@ class IterationGenerationTests(unittest.TestCase):
         ), mock.patch.object(
             app, "run_codex_iteration_generation", side_effect=[invalid, self.candidate()]
         ) as generate, mock.patch.object(
+            app, "run_codex_iteration_format_repair"
+        ) as repair, mock.patch.object(
             app,
             "run_codex_iteration_validation",
             return_value=self.review_result(),
@@ -7984,8 +8130,39 @@ class IterationGenerationTests(unittest.TestCase):
 
         self.assertEqual(prompt, self.candidate()["prompt"])
         self.assertEqual(generate.call_count, 2)
+        repair.assert_not_called()
         review.assert_called_once()
         self.assertIn("内部范围限制", generate.call_args_list[1].args[1])
+
+    def test_iteration_format_failure_is_repaired_without_full_regeneration(self):
+        invalid = self.candidate()
+        invalid["prompt"] += "继续补充重复说明。" * 80
+        repaired = self.candidate()
+        context = {"repo_path": "/tmp/existing-project", "repo_name": "demo"}
+        source = {
+            "phase": "complete",
+            "container_cleaned": 1,
+            "repo_url": "https://example.invalid/demo",
+            "first_prompt_id": "prompt-1",
+            "imported_baseline": 0,
+        }
+        with mock.patch.object(app, "run_row", return_value=source), mock.patch.object(
+            app, "iteration_project_context", return_value=context
+        ), mock.patch.object(
+            app, "run_codex_iteration_generation", return_value=invalid
+        ) as generate, mock.patch.object(
+            app, "run_codex_iteration_format_repair", return_value=repaired
+        ) as repair, mock.patch.object(
+            app,
+            "run_codex_iteration_validation",
+            return_value=self.review_result(),
+        ) as review:
+            prompt = app.generate_iteration_prompt("source111111")
+
+        self.assertEqual(prompt, repaired["prompt"])
+        generate.assert_called_once()
+        repair.assert_called_once()
+        review.assert_called_once()
 
     def test_iteration_generation_retries_generator_timeout_with_feedback(self):
         candidate = self.candidate()
