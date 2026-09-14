@@ -129,8 +129,8 @@ SOLO_QA_PROJECT_REJECTION_MARKERS = (
     "题材不合格",
 )
 SUBMITTER_NAME = os.environ.get("CLAUDE_EVAL_SUBMITTER", "牛宇航").strip() or "牛宇航"
-APP_VERSION = "20260914.6"
-EVALUATION_REPAIR_POLICY_VERSION = 4
+APP_VERSION = "20260914.7"
+EVALUATION_REPAIR_POLICY_VERSION = 5
 REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/\[\]-]{0,127}$")
 BACKGROUND_ID_RE = re.compile(r"backgrounded\s+[·•]\s+([A-Za-z0-9_-]+)", re.I)
@@ -7759,6 +7759,10 @@ def solo_qa_returned_evaluation_fingerprint(row: Dict[str, Any]) -> str:
         "电报式",
         "残缺句",
         "不成叙述",
+        "环境限制",
+        "不能作为该维度的扣分理由",
+        "互斥的数字",
+        "验收统计",
         "B-5",
         "B5",
     )
@@ -7801,6 +7805,7 @@ def solo_qa_returned_evaluation_repair_issues(
     if (
         (multi_match and int(multi_match.group(1)) > len(selected))
         or re.search(r"(?:全部|所有|五)\s*个?维度|五维", summary)
+        or any(marker in summary for marker in ("互斥的数字", "验收统计不一致"))
     ):
         selected = list(EVALUATION_DIMENSION_KEYS)
     if not selected and (
@@ -7830,6 +7835,18 @@ def solo_qa_returned_evaluation_repair_issues(
             reason = f"自动检查的{label}描述包含错别字"
         elif "满分" in summary:
             reason = f"自动检查的{label}满分描述包含扣分点"
+        elif any(
+            marker in summary
+            for marker in ("环境限制", "不能作为该维度的扣分理由")
+        ) and any(marker in summary for marker in ("互斥的数字", "验收统计不一致")):
+            reason = f"自动检查的{label}描述需消除环境归因并统一验收统计"
+        elif any(
+            marker in summary
+            for marker in ("环境限制", "不能作为该维度的扣分理由")
+        ):
+            reason = f"自动检查的{label}描述把环境条件当作扣分依据"
+        elif any(marker in summary for marker in ("互斥的数字", "验收统计不一致")):
+            reason = f"自动检查的{label}描述中的验收统计与其他维度不一致"
         elif any(
             marker in summary
             for marker in ("纯英文", "全英文", "英文描述", "电报式", "残缺句", "不成叙述")

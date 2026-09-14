@@ -9169,6 +9169,45 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(len(issues), 5)
         self.assertTrue(all("描述包含错别字" in issue for issue in issues))
 
+    def test_solo_qa_environment_attribution_return_targets_named_dimension(self):
+        row = {
+            "solo_qa_state": "needs_fix",
+            "solo_qa_remote_submission_id": "11975",
+            "solo_qa_remote_status": "PENDING_FIX",
+            "solo_qa_remote_updated_at": "2026-09-14T20:30:00",
+            "solo_qa_qc_summary": (
+                "任务规划：这段描述把扣分点归因为运行环境里没有 Docker，"
+                "属于环境限制，不能作为该维度的扣分理由。"
+            ),
+        }
+
+        issues = app.solo_qa_returned_evaluation_repair_issues(
+            row, sample_evaluation()
+        )
+
+        self.assertEqual(len(issues), 1)
+        self.assertIn("任务规划", issues[0])
+        self.assertIn("环境条件", issues[0])
+
+    def test_solo_qa_conflicting_check_counts_rewrite_all_five(self):
+        row = {
+            "solo_qa_state": "needs_fix",
+            "solo_qa_remote_submission_id": "11974",
+            "solo_qa_remote_status": "PENDING_FIX",
+            "solo_qa_remote_updated_at": "2026-09-14T20:30:00",
+            "solo_qa_qc_summary": (
+                "交付完整性把环境限制作为扣分理由；整体：执行能力写 6 项通过，"
+                "其余四段写 35 项通过，同一份验收统计出现互斥的数字。"
+            ),
+        }
+
+        issues = app.solo_qa_returned_evaluation_repair_issues(
+            row, sample_evaluation()
+        )
+
+        self.assertEqual(len(issues), 5)
+        self.assertTrue(all("统一验收统计" in issue for issue in issues))
+
     def test_solo_qa_return_marker_suppresses_only_the_same_rejection(self):
         row = {
             "solo_qa_state": "needs_fix",
