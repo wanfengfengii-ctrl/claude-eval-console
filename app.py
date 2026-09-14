@@ -129,7 +129,7 @@ SOLO_QA_PROJECT_REJECTION_MARKERS = (
     "题材不合格",
 )
 SUBMITTER_NAME = os.environ.get("CLAUDE_EVAL_SUBMITTER", "牛宇航").strip() or "牛宇航"
-APP_VERSION = "20260914.1"
+APP_VERSION = "20260914.2"
 EVALUATION_REPAIR_POLICY_VERSION = 2
 REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/\[\]-]{0,127}$")
@@ -164,7 +164,7 @@ BUILTIN_MODEL_OPTIONS = [
     ("haiku", "Haiku"),
 ]
 try:
-    MAX_PARALLEL_RUNS = max(1, min(6, int(os.environ.get("CLAUDE_EVAL_MAX_PARALLEL", "4"))))
+    MAX_PARALLEL_RUNS = max(1, min(7, int(os.environ.get("CLAUDE_EVAL_MAX_PARALLEL", "4"))))
 except ValueError:
     MAX_PARALLEL_RUNS = 4
 AUTO_CLOSE_TERMINAL = os.environ.get(
