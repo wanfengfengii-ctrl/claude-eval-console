@@ -7915,6 +7915,119 @@ class IterationGenerationTests(unittest.TestCase):
                 repository_history=repository_history,
             )
 
+    def test_global_bug_guard_blocks_only_near_verbatim_cross_repo_issue(self):
+        history = [{
+            "reference": "SOLO-QA #10927",
+            "task_type": "Bug 修复",
+            "prompt": "同时构建接口和验收服务时镜像名称冲突，容器构建失败且一次性验收无法运行。",
+            "dedup_required": True,
+        }]
+        duplicate = {
+            "task_type": "Bug 修复",
+            "confirmed_bugs": [{
+                "customer_summary": "同时构建接口和验收服务时镜像冲突，整个 Docker 构建失败，验收服务应能正常运行",
+            }],
+        }
+        different = {
+            "task_type": "Bug 修复",
+            "confirmed_bugs": [{
+                "customer_summary": "导入含空白编号的批次后页面排序错乱，正确结果应保留有效编号并提示无效行",
+            }],
+        }
+
+        self.assertIn(
+            "SOLO-QA #10927",
+            app.cross_repository_bug_duplicate_reason(
+                duplicate, "Bug 修复", history
+            ),
+        )
+        self.assertEqual(
+            app.cross_repository_bug_duplicate_reason(
+                different, "Bug 修复", history
+            ),
+            "",
+        )
+
+    def test_global_prompt_history_shortlists_other_repository_candidates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.object(app, "DB_PATH", root / "test.db"), mock.patch.object(
+                app, "DATA_DIR", root
+            ):
+                app.initialize_database()
+                with app.db_connection() as database:
+                    database.execute(
+                        """INSERT INTO solo_qa_prompt_history(
+                               remote_submission_id, repo_key, repo_name, repo_url,
+                               prompt, task_type, remote_status, qc_summary,
+                               submitted_at, last_synced_at
+                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            "10927", "example/container-code-check-gate",
+                            "container-code-check-gate", "",
+                            "同时构建接口和验收服务时镜像名称冲突，容器构建失败且一次性验收无法运行。",
+                            "Bug 修复", "QC_PASSED", "", "2026-09-01", "2026-09-15",
+                        ),
+                    )
+                result = app.global_prompt_dedup_history(
+                    "example/saddle-stitch-signature-imposer",
+                    {
+                        "task_type": "Bug 修复",
+                        "confirmed_bugs": [{
+                            "customer_summary": "同时构建接口和验收服务时镜像冲突，整个 Docker 构建失败，验收服务应能正常运行",
+                        }],
+                    },
+                    "Bug 修复",
+                )
+
+        self.assertEqual(result[0]["reference"], "SOLO-QA #10927")
+        self.assertFalse(result[0]["same_repository"])
+        self.assertGreater(result[0]["lexical_similarity"], 0.6)
+
+    def test_semantic_dedup_blocks_only_high_confidence_matches(self):
+        high = {
+            "duplicate": True,
+            "confidence": "high",
+            "match_scope": "cross_repository",
+            "reference": "SOLO-QA #10927",
+            "overlap_kind": "same_bug",
+            "reason": "触发、镜像冲突和验收服务无法启动均相同",
+        }
+        medium = {**high, "confidence": "medium"}
+        same_repo_medium = {
+            **medium,
+            "match_scope": "same_repository",
+            "reference": "SOLO-QA #10873",
+        }
+
+        self.assertIn("SOLO-QA #10927", app.prompt_dedup_review_reason(high))
+        self.assertEqual(app.prompt_dedup_review_reason(medium), "")
+        self.assertIn(
+            "SOLO-QA #10873",
+            app.prompt_dedup_review_reason(same_repo_medium),
+        )
+
+    def test_semantic_dedup_prompt_is_conservative_for_cross_repo_history(self):
+        review = {
+            "duplicate": False,
+            "confidence": "low",
+            "match_scope": "none",
+            "reference": "",
+            "overlap_kind": "none",
+            "reason": "没有高置信度重复",
+        }
+        with mock.patch.object(
+            app, "run_codex_structured", return_value=review
+        ) as codex:
+            result = app.run_codex_prompt_dedup_validation(
+                self.candidate(), "Feature 迭代", [], []
+            )
+
+        self.assertEqual(result, review)
+        prompt = codex.call_args.args[0]
+        self.assertIn("跨仓库必须更保守", prompt)
+        self.assertIn("通用技术词不构成重复", prompt)
+
     def test_repository_key_matches_fallback_without_cross_owner_collision(self):
         self.assertEqual(
             app.canonical_repository_key(
@@ -8139,6 +8252,62 @@ class IterationGenerationTests(unittest.TestCase):
         repair.assert_not_called()
         review.assert_called_once()
         self.assertIn("内部范围限制", generate.call_args_list[1].args[1])
+
+    def test_iteration_generation_retries_high_confidence_semantic_duplicate(self):
+        candidate = self.candidate()
+        context = {
+            "repo_path": "/tmp/existing-project",
+            "repo_name": "demo",
+            "repo_key": "example/demo",
+            "repository_prompt_history": [{
+                "reference": "SOLO-QA #10",
+                "prompt": "仓库最初只实现样本登记和基础详情查看。",
+                "task_type": "0-1 代码生成",
+                "dedup_required": True,
+            }],
+        }
+        source = {
+            "phase": "complete",
+            "container_cleaned": 1,
+            "repo_url": "https://example.invalid/demo",
+            "first_prompt_id": "prompt-1",
+        }
+        duplicate = {
+            "duplicate": True,
+            "confidence": "high",
+            "match_scope": "cross_repository",
+            "reference": "SOLO-QA #88",
+            "overlap_kind": "same_feature",
+            "reason": "用户操作、状态变化和验收结果均相同",
+        }
+        distinct = {
+            "duplicate": False,
+            "confidence": "low",
+            "match_scope": "none",
+            "reference": "",
+            "overlap_kind": "none",
+            "reason": "没有高置信度重复",
+        }
+        with mock.patch.object(app, "run_row", return_value=source), mock.patch.object(
+            app, "iteration_project_context", return_value=context
+        ), mock.patch.object(
+            app, "run_codex_iteration_generation", return_value=candidate
+        ) as generate, mock.patch.object(
+            app, "global_prompt_dedup_history", return_value=[]
+        ), mock.patch.object(
+            app, "run_codex_iteration_validation", return_value=self.review_result()
+        ), mock.patch.object(
+            app,
+            "run_codex_prompt_dedup_validation",
+            side_effect=[duplicate, distinct],
+        ) as dedup:
+            result = app.generate_iteration_candidate("source111111")
+
+        self.assertEqual(result["prompt"], candidate["prompt"])
+        self.assertEqual(generate.call_count, 2)
+        self.assertEqual(dedup.call_count, 2)
+        self.assertIn("SOLO-QA #88", generate.call_args_list[1].args[1])
+        self.assertEqual(result["prompt_dedup_review"], distinct)
 
     def test_iteration_format_failure_is_repaired_without_full_regeneration(self):
         invalid = self.candidate()

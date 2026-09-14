@@ -39,6 +39,7 @@ const requests = [];
 let createdCount = 0;
 let transientRepairFailures = 0;
 let uploadValidationFailures = 0;
+let submissionValidationFailures = 0;
 let promptHistoryBootstrapRequired = false;
 
 function shanghaiDayKey(value = new Date()) {
@@ -223,6 +224,16 @@ globalThis.fetch = async (url, options = {}) => {
     assert.equal(body.schema_fingerprint, "schema-test");
     assert.match(body.data.user_prompt, /^完成真实提交链路 (one|two)$/);
     assert.equal(body.data.trace_file[0].path, "uploads/trace.jsonl");
+    if (submissionValidationFailures > 0) {
+      submissionValidationFailures -= 1;
+      return jsonResponse({
+        detail: "提交数据校验未通过",
+        errors: [{
+          field: "desc_planning",
+          message: "任务规划描述缺少可核验的具体步骤",
+        }],
+      }, 422);
+    }
     createdCount += 1;
     return jsonResponse({ id: 122 + createdCount, status: "SUBMITTED", message: "提交成功" });
   }
@@ -333,6 +344,28 @@ assert.equal(continuedBatchResponse.data.results[0].outcome, "failed");
 assert.equal(continuedBatchResponse.data.results[1].outcome, "submitted");
 assert.equal(continuedBatchResponse.data.failed, 1);
 assert.equal(continuedBatchResponse.data.stopped, false);
+
+submissionValidationFailures = 1;
+const detailedValidationResponse = await new Promise((resolve) => {
+  listener(
+    {
+      type: "SOLO_QA_SUBMIT",
+      payload: { turn_keys: ["abc123abc123:1"] },
+    },
+    { url: "http://127.0.0.1:8765/#exports" },
+    resolve,
+  );
+});
+assert.equal(detailedValidationResponse.ok, true);
+assert.equal(detailedValidationResponse.data.results[0].outcome, "failed");
+assert.match(
+  detailedValidationResponse.data.results[0].error,
+  /提交数据校验未通过：任务规划 - 描述：任务规划描述缺少可核验的具体步骤/,
+);
+assert.match(
+  localStates.at(-1).error,
+  /任务规划 - 描述：任务规划描述缺少可核验的具体步骤/,
+);
 
 const syncResponse = await new Promise((resolve) => {
   const asynchronous = listener(

@@ -130,7 +130,7 @@ SOLO_QA_PROJECT_REJECTION_MARKERS = (
     "题材不合格",
 )
 SUBMITTER_NAME = os.environ.get("CLAUDE_EVAL_SUBMITTER", "牛宇航").strip() or "牛宇航"
-APP_VERSION = "20260914.11"
+APP_VERSION = "20260915.1"
 EVALUATION_REPAIR_POLICY_VERSION = 5
 REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/\[\]-]{0,127}$")
@@ -182,6 +182,10 @@ TASK_GENERATION_RETRY_LIMIT = 1
 ITERATION_GENERATION_MODEL = REVIEW_MODEL
 ITERATION_GENERATION_ATTEMPTS = 2
 REPOSITORY_PROMPT_HISTORY_LIMIT = 40
+GLOBAL_PROMPT_DEDUP_SCAN_LIMIT = 600
+GLOBAL_PROMPT_DEDUP_SHORTLIST_LIMIT = 24
+GLOBAL_BUG_PROMPT_SEQUENCE_LIMIT = 0.62
+GLOBAL_BUG_PROMPT_BIGRAM_LIMIT = 0.48
 BUGFIX_GENERATION_ATTEMPT_TIMEOUT_SECONDS = 12 * 60
 ITERATION_GENERATION_ATTEMPT_TIMEOUT_SECONDS = 12 * 60
 ITERATION_VALIDATION_TIMEOUT_SECONDS = 10 * 60
@@ -3470,6 +3474,209 @@ def repository_prompt_history(
     return history
 
 
+def normalized_task_type_key(value: Any) -> str:
+    return re.sub(r"\s+", "", str(value or "")).casefold()
+
+
+def prompt_dedup_units(value: Any) -> List[str]:
+    """Return the natural issue/flow units used by the prompt dedup guards."""
+    if isinstance(value, dict):
+        confirmed = value.get("confirmed_bugs")
+        if isinstance(confirmed, list):
+            units = [
+                re.sub(r"\s+", " ", str(item.get("customer_summary") or "")).strip()
+                for item in confirmed
+                if isinstance(item, dict)
+            ]
+            units = [item for item in units if len(normalized_prompt_edge(item)) >= 12]
+            if units:
+                return units
+        value = value.get("prompt")
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    if not text:
+        return []
+    sentences = [
+        item.strip()
+        for item in re.split(r"[。！？!?；;]+", text)
+        if len(normalized_prompt_edge(item)) >= 12
+    ]
+    return sentences or [text]
+
+
+def prompt_bigram_containment(left: str, right: str) -> float:
+    left_edge = normalized_prompt_edge(left)
+    right_edge = normalized_prompt_edge(right)
+    if len(left_edge) < 2 or len(right_edge) < 2:
+        return 0.0
+    left_pairs = {left_edge[index:index + 2] for index in range(len(left_edge) - 1)}
+    right_pairs = {
+        right_edge[index:index + 2] for index in range(len(right_edge) - 1)
+    }
+    return len(left_pairs & right_pairs) / min(len(left_pairs), len(right_pairs))
+
+
+def prompt_unit_similarity(left: str, right: str) -> tuple[float, float]:
+    left_edge = normalized_prompt_edge(left)
+    right_edge = normalized_prompt_edge(right)
+    if not left_edge or not right_edge:
+        return 0.0, 0.0
+    return (
+        difflib.SequenceMatcher(None, left_edge, right_edge).ratio(),
+        prompt_bigram_containment(left, right),
+    )
+
+
+def global_prompt_dedup_history(
+    target_repo_key: str,
+    candidate: Dict[str, Any],
+    target_task_type: str,
+    limit: int = GLOBAL_PROMPT_DEDUP_SHORTLIST_LIMIT,
+) -> List[Dict[str, Any]]:
+    """Shortlist similar submitted prompts from other repositories."""
+    target_repo_key = str(target_repo_key or "").strip().casefold()
+    candidate_units = prompt_dedup_units(candidate)
+    if not target_repo_key or not candidate_units:
+        return []
+    task_type_key = normalized_task_type_key(target_task_type)
+    with db_connection() as database:
+        rows = database.execute(
+            """SELECT remote_submission_id, repo_key, repo_name, repo_url, prompt,
+                      task_type, remote_status, qc_summary, submitted_at
+                 FROM solo_qa_prompt_history
+                WHERE prompt <> ''
+                ORDER BY COALESCE(submitted_at, '') DESC,
+                         remote_submission_id DESC
+                LIMIT ?""",
+            (GLOBAL_PROMPT_DEDUP_SCAN_LIMIT,),
+        ).fetchall()
+        local_rows = database.execute(
+            """SELECT id, repo_name, repo_url, first_prompt AS prompt,
+                      task_type, phase, first_prompt_id, created_at
+                 FROM runs
+                WHERE deleted_at IS NULL
+                  AND first_prompt <> ''
+                ORDER BY created_at DESC, id DESC
+                LIMIT ?""",
+            (GLOBAL_PROMPT_DEDUP_SCAN_LIMIT,),
+        ).fetchall()
+
+    matches: List[tuple[float, float, Dict[str, Any]]] = []
+    seen: set[tuple[str, str]] = set()
+    for row in rows:
+        row_repo_key = str(row["repo_key"] or "") or canonical_repository_key(
+            row["repo_url"], row["repo_name"]
+        ) or repository_key_from_qc_summary(row["qc_summary"])
+        if repository_keys_match(target_repo_key, row_repo_key):
+            continue
+        if normalized_task_type_key(row["task_type"]) != task_type_key:
+            continue
+        history_units = prompt_dedup_units(row["prompt"])
+        scores = [
+            prompt_unit_similarity(candidate_unit, history_unit)
+            for candidate_unit in candidate_units
+            for history_unit in history_units
+        ]
+        if not scores:
+            continue
+        sequence_score, bigram_score = max(
+            scores, key=lambda item: (item[0], item[1])
+        )
+        seen.add((row_repo_key, normalized_prompt_edge(row["prompt"])))
+        matches.append((sequence_score, bigram_score, {
+            "reference": f"SOLO-QA #{row['remote_submission_id']}",
+            "source": "solo_qa_global",
+            "repo_key": row_repo_key,
+            "repo_name": str(row["repo_name"] or ""),
+            "task_type": str(row["task_type"] or ""),
+            "remote_status": str(row["remote_status"] or ""),
+            "prompt": re.sub(r"\s+", " ", str(row["prompt"] or "")).strip()[:1200],
+            "qc_summary": re.sub(
+                r"\s+", " ", str(row["qc_summary"] or "")
+            ).strip()[:600],
+            "lexical_similarity": round(sequence_score, 4),
+            "bigram_containment": round(bigram_score, 4),
+            "same_repository": False,
+            "dedup_required": True,
+        }))
+    for row in local_rows:
+        row_repo_key = canonical_repository_key(row["repo_url"], row["repo_name"])
+        if repository_keys_match(target_repo_key, row_repo_key):
+            continue
+        if normalized_task_type_key(row["task_type"]) != task_type_key:
+            continue
+        phase = str(row["phase"] or "")
+        if phase in {"failed", "generation_queued", "generation_running"} and not str(
+            row["first_prompt_id"] or ""
+        ):
+            continue
+        prompt_edge = normalized_prompt_edge(row["prompt"])
+        if not prompt_edge or (row_repo_key, prompt_edge) in seen:
+            continue
+        history_units = prompt_dedup_units(row["prompt"])
+        scores = [
+            prompt_unit_similarity(candidate_unit, history_unit)
+            for candidate_unit in candidate_units
+            for history_unit in history_units
+        ]
+        if not scores:
+            continue
+        sequence_score, bigram_score = max(
+            scores, key=lambda item: (item[0], item[1])
+        )
+        seen.add((row_repo_key, prompt_edge))
+        matches.append((sequence_score, bigram_score, {
+            "reference": f"本地任务 {str(row['id'])[:8]}",
+            "source": "local_global",
+            "repo_key": row_repo_key,
+            "repo_name": str(row["repo_name"] or ""),
+            "task_type": str(row["task_type"] or ""),
+            "remote_status": "",
+            "prompt": re.sub(r"\s+", " ", str(row["prompt"] or "")).strip()[:1200],
+            "qc_summary": "",
+            "lexical_similarity": round(sequence_score, 4),
+            "bigram_containment": round(bigram_score, 4),
+            "same_repository": False,
+            "dedup_required": True,
+        }))
+    matches.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [item for _, _, item in matches[:max(1, limit)]]
+
+
+def cross_repository_bug_duplicate_reason(
+    candidate: Dict[str, Any],
+    target_task_type: str,
+    global_history: Optional[List[Dict[str, Any]]] = None,
+) -> str:
+    """Block only near-verbatim Bug issues across repositories without a model call."""
+    if normalized_task_type_key(target_task_type) != normalized_task_type_key("Bug 修复"):
+        return ""
+    candidate_units = prompt_dedup_units(candidate)
+    for previous in global_history or []:
+        if previous.get("dedup_required") is False:
+            continue
+        if normalized_task_type_key(previous.get("task_type")) != normalized_task_type_key(
+            "Bug 修复"
+        ):
+            continue
+        for candidate_unit in candidate_units:
+            for history_unit in prompt_dedup_units(previous.get("prompt")):
+                sequence_score, bigram_score = prompt_unit_similarity(
+                    candidate_unit, history_unit
+                )
+                if (
+                    sequence_score >= GLOBAL_BUG_PROMPT_SEQUENCE_LIMIT
+                    and bigram_score >= GLOBAL_BUG_PROMPT_BIGRAM_LIMIT
+                ):
+                    reference = str(
+                        previous.get("reference") or "其他仓库已提交题面"
+                    )
+                    return (
+                        f"跨仓库 Bug 描述与{reference}近似重复"
+                        f"（字面相似度 {sequence_score:.2f}，连续片段重合 {bigram_score:.2f}）"
+                    )
+    return ""
+
+
 def historical_task_context(limit: int = 60) -> List[Dict[str, str]]:
     with db_connection() as database:
         rows = database.execute(
@@ -4405,6 +4612,7 @@ def iteration_project_context(row: sqlite3.Row) -> Dict[str, Any]:
     return {
         "repo_path": str(repo_path),
         "repo_name": str(row["repo_name"] or ""),
+        "repo_key": canonical_repository_key(row["repo_url"], row["repo_name"]),
         "project_category": str(row["project_category"] or "未记录"),
         "language_framework": str(row["language_framework"] or "未记录"),
         "current_commit": current_sha,
@@ -5413,6 +5621,92 @@ def run_codex_iteration_validation(
     )
 
 
+def run_codex_prompt_dedup_validation(
+    candidate: Dict[str, Any],
+    target_task_type: str,
+    repository_history: List[Dict[str, Any]],
+    global_history: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Run one conservative semantic comparison before accepting a prompt."""
+    schema = {
+        "type": "object",
+        "properties": {
+            "duplicate": {"type": "boolean"},
+            "confidence": {
+                "type": "string", "enum": ["low", "medium", "high"]
+            },
+            "match_scope": {
+                "type": "string",
+                "enum": ["none", "same_repository", "cross_repository"],
+            },
+            "reference": {"type": "string"},
+            "overlap_kind": {
+                "type": "string",
+                "enum": [
+                    "none", "same_bug", "same_feature", "same_user_flow",
+                    "same_acceptance",
+                ],
+            },
+            "reason": {"type": "string"},
+        },
+        "required": [
+            "duplicate", "confidence", "match_scope", "reference",
+            "overlap_kind", "reason",
+        ],
+        "additionalProperties": False,
+    }
+    payload = {
+        "task_type": target_task_type,
+        "candidate": candidate,
+        "same_repository_history": [
+            item for item in repository_history
+            if item.get("dedup_required") is not False
+        ][:REPOSITORY_PROMPT_HISTORY_LIMIT],
+        "cross_repository_shortlist": [
+            item for item in global_history
+            if item.get("dedup_required") is not False
+        ][:GLOBAL_PROMPT_DEDUP_SHORTLIST_LIMIT],
+    }
+    prompt = (
+        "你是提交前的高精度语义查重器，只判断候选题面是否实质重复，不评价难度、写法或开发质量。"
+        "同仓库历史中，若工程核心、主要用户操作、故障根因或最终验收结果相同，仅更换字段、参数、页面细节或同义词，判为重复。"
+        "跨仓库必须更保守：只有触发条件、故障机制和期望结果三者都实质相同，而且业务名词只是换皮时，才可给 duplicate=true 且 confidence=high。"
+        "共同使用 Docker、API、状态码、测试框架、错误处理、增删改查等通用技术词不构成重复；只共享背景、技术栈、一个局部动作或一般验收方式也不构成重复。"
+        "无法确定时必须 duplicate=false，confidence=low 或 medium；不要因为候选和历史文字相似就自动判重。"
+        "reference 必须取被命中的历史 reference，没有命中时留空；reason 用一句中文指出实际重合的触发、机制和结果，通过时简短说明没有高置信度重复。数据："
+        + json.dumps(payload, ensure_ascii=False)
+    )
+    return run_codex_generation_structured(
+        prompt,
+        schema,
+        APP_DIR,
+        "prompt-dedup-validation",
+        ITERATION_VALIDATION_TIMEOUT_SECONDS,
+        model=ITERATION_GENERATION_MODEL,
+        reasoning_effort="low",
+    )
+
+
+def prompt_dedup_review_reason(review: Dict[str, Any]) -> str:
+    """Match SOLO-QA's stricter same-repo and conservative cross-repo policy."""
+    if review.get("duplicate") is not True:
+        return ""
+    scope = str(review.get("match_scope") or "")
+    if scope not in {"same_repository", "cross_repository"}:
+        return ""
+    confidence = str(review.get("confidence") or "")
+    if scope == "same_repository" and confidence not in {"medium", "high"}:
+        return ""
+    if scope == "cross_repository" and confidence != "high":
+        return ""
+    reference = re.sub(r"\s+", " ", str(review.get("reference") or "")).strip()
+    reason = re.sub(r"\s+", " ", str(review.get("reason") or "")).strip()
+    if not reference or not reason:
+        return ""
+    label = "同仓库" if scope == "same_repository" else "跨仓库"
+    return f"提交前语义查重命中{label}历史 {reference}：{reason}"
+
+
 def bugfix_review_errors(validation: Dict[str, Any]) -> List[str]:
     review = validation.get("bug_review")
     if not isinstance(review, dict):
@@ -5592,6 +5886,16 @@ def generate_iteration_candidate(
                     )
                 checked_candidate = dict(candidate)
                 checked_candidate["prompt"] = normalized_prompt
+                global_history = global_prompt_dedup_history(
+                    str(context.get("repo_key") or ""),
+                    checked_candidate,
+                    target_task_type,
+                )
+                obvious_global_duplicate = cross_repository_bug_duplicate_reason(
+                    checked_candidate, target_task_type, global_history
+                )
+                if obvious_global_duplicate:
+                    raise WorkflowError(obvious_global_duplicate)
                 update_current_iteration_job_stage("独立复核中")
                 validation = run_codex_iteration_validation(
                     context, checked_candidate, target_task_type
@@ -5623,6 +5927,26 @@ def generate_iteration_candidate(
                 and reviewed_task_type == target_task_type
                 and not scope_errors
             ):
+                if repository_history or global_history:
+                    update_current_iteration_job_stage("提交前语义查重")
+                    try:
+                        dedup_review = run_codex_prompt_dedup_validation(
+                            checked_candidate,
+                            target_task_type,
+                            repository_history,
+                            global_history,
+                        )
+                    except WorkflowError as exc:
+                        # This is a supplemental high-precision guard. A transient
+                        # model or gateway failure must not make task generation
+                        # unavailable after the mandatory review already passed.
+                        checked_candidate["prompt_dedup_warning"] = str(exc)[:700]
+                    else:
+                        dedup_reason = prompt_dedup_review_reason(dedup_review)
+                        if dedup_reason:
+                            feedback = dedup_reason
+                            continue
+                        checked_candidate["prompt_dedup_review"] = dedup_review
                 if target_task_type == "Bug 修复":
                     checked_candidate["independent_review"] = validation
                     checked_candidate["evidence_verified_at"] = now_text()

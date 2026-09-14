@@ -66,13 +66,26 @@ const FIELD_KEY_LABELS = {
 function errorMessage(body, fallback) {
   if (typeof body === "string" && body.trim()) return body;
   if (body && typeof body === "object") {
-    if (typeof body.error === "string" && body.error) return body.error;
-    if (typeof body.detail === "string" && body.detail) return body.detail;
-    if (Array.isArray(body.detail) && body.detail[0]?.msg) return body.detail[0].msg;
-    if (Array.isArray(body.errors) && body.errors.length) {
-      return body.errors.map((item) => item?.message || item?.msg || item?.field).filter(Boolean).join("；");
+    const details = [];
+    const appendDetails = (items) => {
+      if (!Array.isArray(items)) return;
+      for (const item of items) {
+        if (!item || typeof item !== "object") continue;
+        const rawField = String(item.field || item.loc?.at?.(-1) || "").trim();
+        const field = FIELD_KEY_LABELS[rawField] || rawField;
+        const message = String(item.message || item.msg || "").trim();
+        const text = field && message ? `${field}：${message}` : (message || field);
+        if (text && !details.includes(text)) details.push(text);
+      }
+    };
+    appendDetails(body.errors);
+    appendDetails(Array.isArray(body.detail) ? body.detail : []);
+    const headline = [body.error, typeof body.detail === "string" ? body.detail : "", body.message]
+      .find((item) => typeof item === "string" && item.trim());
+    if (details.length) {
+      return [headline?.trim(), details.join("；")].filter(Boolean).join("：");
     }
-    if (typeof body.message === "string" && body.message) return body.message;
+    if (headline) return headline.trim();
   }
   return fallback;
 }
