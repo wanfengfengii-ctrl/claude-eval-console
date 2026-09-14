@@ -7434,7 +7434,7 @@ class AutoRefillTests(unittest.TestCase):
             )
             thread.assert_called_once_with(
                 target=app.automatic_iteration_worker,
-                args=(source["id"], "0-1 代码生成", False, True),
+                args=(source["id"], "0-1 代码生成", False, True, 0, ""),
                 daemon=True,
             )
         finally:
@@ -7928,6 +7928,11 @@ class IterationGenerationTests(unittest.TestCase):
         review_prompt = codex.call_args.args[0]
         self.assertIn(app.DEVELOPER_PROMPT_STYLE_GUIDANCE, review_prompt)
         self.assertIn("即使技术内容完整也必须 approved=false", review_prompt)
+        self.assertIn("不运行完整测试套件", review_prompt)
+        self.assertEqual(
+            codex.call_args.args[4], app.ITERATION_VALIDATION_TIMEOUT_SECONDS
+        )
+        self.assertEqual(codex.call_args.kwargs["reasoning_effort"], "low")
 
     def test_new_module_review_rejects_combined_complex_mechanisms(self):
         context = {"repo_path": "/tmp/existing-project", "repo_name": "demo"}
@@ -8011,6 +8016,36 @@ class IterationGenerationTests(unittest.TestCase):
             generate.call_args_list[1].args[1],
             "bugfix-generation 超时，已停止",
         )
+
+    def test_iteration_timeout_does_not_erase_previous_quality_feedback(self):
+        candidate = self.candidate()
+        context = {"repo_path": "/tmp/existing-project", "repo_name": "demo"}
+        source = {
+            "phase": "complete",
+            "container_cleaned": 1,
+            "repo_url": "https://example.invalid/demo",
+            "first_prompt_id": "prompt-1",
+            "imported_baseline": 0,
+        }
+        previous = "编号问题与历史题面重复，必须改选其他功能区域"
+        with mock.patch.object(app, "run_row", return_value=source), mock.patch.object(
+            app, "iteration_project_context", return_value=context
+        ), mock.patch.object(
+            app, "run_codex_iteration_generation",
+            side_effect=[app.WorkflowError("bugfix-generation 超时，已停止"), candidate],
+        ) as generate, mock.patch.object(
+            app,
+            "run_codex_iteration_validation",
+            return_value=self.review_result(),
+        ):
+            prompt = app.generate_iteration_prompt(
+                "source111111", initial_feedback=previous
+            )
+
+        self.assertEqual(prompt, candidate["prompt"])
+        retry_feedback = generate.call_args_list[1].args[1]
+        self.assertIn(previous, retry_feedback)
+        self.assertIn("bugfix-generation 超时，已停止", retry_feedback)
 
     def test_iteration_generation_preserves_cancellation_instead_of_retrying(self):
         context = {"repo_path": "/tmp/existing-project", "repo_name": "demo"}
@@ -8216,6 +8251,36 @@ class IterationGenerationTests(unittest.TestCase):
             result["prompt"],
         )
 
+    def test_first_bugfix_prompt_fills_missing_expected_state_from_evidence(self):
+        candidate = self.bugfix_candidate()
+        candidate["confirmed_bugs"][0]["customer_summary"] = (
+            "两人同时确认会让容器位置更新两次并产生重复记录"
+        )
+
+        result = app.normalize_generated_bugfix_candidate(candidate)
+
+        summary = result["confirmed_bugs"][0]["customer_summary"]
+        self.assertEqual(
+            summary,
+            "两人同时确认会让容器位置更新两次并产生重复记录，"
+            "正确结果是容器只移动一次且无重复记录",
+        )
+        self.assertIn(summary + "。", result["prompt"])
+
+    def test_first_bugfix_prompt_rebuilds_long_incomplete_summary(self):
+        candidate = self.bugfix_candidate()
+        candidate["confirmed_bugs"][0]["customer_summary"] = "重复确认导致异常" * 10
+
+        result = app.normalize_generated_bugfix_candidate(candidate)
+
+        summary = result["confirmed_bugs"][0]["customer_summary"]
+        self.assertEqual(
+            summary,
+            "两人同时提交同一个接收码，当前容器位置更新两次，"
+            "正确结果是容器只移动一次且无重复记录",
+        )
+        self.assertLessEqual(summary.__len__(), app.FIRST_BUGFIX_SUMMARY_MAX_CHARS)
+
     def test_bugfix_review_requires_verified_focused_scope(self):
         approved = {
             "approved": True,
@@ -8296,6 +8361,11 @@ class IterationGenerationTests(unittest.TestCase):
         schema = codex.call_args.args[1]
         self.assertEqual(schema["properties"]["task_type"]["enum"], ["0-1 代码生成"])
         self.assertIn("此前不存在的完整新模块", codex.call_args.args[0])
+        self.assertIn("不运行完整测试套件", codex.call_args.args[0])
+        self.assertEqual(
+            codex.call_args.args[4], app.ITERATION_GENERATION_ATTEMPT_TIMEOUT_SECONDS
+        )
+        self.assertEqual(codex.call_args.kwargs["reasoning_effort"], "low")
         self.assertEqual(
             app.validate_generated_iteration(candidate, "0-1 代码生成"),
             candidate["prompt"],
@@ -8558,11 +8628,96 @@ class IterationGenerationTests(unittest.TestCase):
             self.assertEqual(second["status"], "generating")
             thread.assert_called_once_with(
                 target=app.automatic_iteration_worker,
-                args=("source111111", "0-1 代码生成"),
+                args=("source111111", "0-1 代码生成", True, False, 0, ""),
                 daemon=True,
             )
             thread.return_value.start.assert_called_once_with()
         finally:
+            with app.ITERATION_JOB_LOCK:
+                app.ITERATION_JOBS.pop("source111111", None)
+
+    def test_background_queue_reuses_previous_failure_as_generation_feedback(self):
+        source = {
+            "phase": "stopped",
+            "container_cleaned": 1,
+            "repo_url": "https://example.invalid/demo",
+            "first_prompt_id": "prompt-1",
+        }
+        feedback = "编号问题与历史题面重复，必须改选其他功能区域"
+        with app.ITERATION_JOB_LOCK:
+            app.ITERATION_JOBS["source111111"] = {
+                "status": "failed",
+                "task_type": "Bug 修复",
+                "error": feedback,
+            }
+        try:
+            with mock.patch.object(
+                app, "existing_generated_iteration", return_value=None
+            ), mock.patch.object(
+                app, "validate_iteration_lineage_type", return_value={}
+            ), mock.patch.object(app, "run_row", return_value=source), mock.patch.object(
+                app, "latest_iteration_baseline_run_id", return_value="source111111"
+            ), mock.patch.object(
+                app, "iteration_origin_run_id", return_value="source111111"
+            ), mock.patch.object(
+                app, "iteration_project_context", return_value={"repo_path": "/tmp/demo"}
+            ), mock.patch.object(app, "add_event"), mock.patch.object(
+                app, "automatic_refill_occupancy", return_value=0
+            ), mock.patch.object(app.threading, "Thread") as thread:
+                job = app.queue_automatic_iteration("source111111", "Bug 修复")
+
+            self.assertEqual(job["last_error"], feedback)
+            thread.assert_called_once_with(
+                target=app.automatic_iteration_worker,
+                args=("source111111", "Bug 修复", True, False, 0, feedback),
+                daemon=True,
+            )
+        finally:
+            with app.ITERATION_JOB_LOCK:
+                app.ITERATION_JOBS.pop("source111111", None)
+
+    def test_cancelled_iteration_recovers_feedback_from_latest_failure_event(self):
+        database = mock.MagicMock()
+        database.execute.return_value.fetchone.return_value = {
+            "message": "自动生成迭代需求失败：旧方向与历史题面重复"
+        }
+        connection = mock.MagicMock()
+        connection.__enter__.return_value = database
+        with mock.patch.object(app, "db_connection", return_value=connection):
+            feedback = app.previous_iteration_generation_feedback(
+                "source111111",
+                "Bug 修复",
+                {
+                    "status": "stopped",
+                    "task_type": "Bug 修复",
+                    "error": "迭代题面生成已取消",
+                },
+            )
+
+        self.assertEqual(feedback, "旧方向与历史题面重复")
+
+    def test_service_shutdown_keeps_generating_iteration_for_recovery(self):
+        with app.ITERATION_JOB_LOCK:
+            app.ITERATION_JOBS["source111111"] = {
+                "status": "generating",
+                "task_type": "Bug 修复",
+                "last_error": "旧方向与历史题面重复",
+            }
+        app.SERVER_SHUTTING_DOWN.set()
+        try:
+            with mock.patch.object(
+                app,
+                "generate_and_start_iteration",
+                side_effect=app.JobCancelled("服务关闭"),
+            ):
+                app.automatic_iteration_worker("source111111", "Bug 修复")
+
+            with app.ITERATION_JOB_LOCK:
+                job = dict(app.ITERATION_JOBS["source111111"])
+            self.assertEqual(job["status"], "generating")
+            self.assertEqual(job["last_error"], "旧方向与历史题面重复")
+        finally:
+            app.SERVER_SHUTTING_DOWN.clear()
             with app.ITERATION_JOB_LOCK:
                 app.ITERATION_JOBS.pop("source111111", None)
 
