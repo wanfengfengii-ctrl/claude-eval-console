@@ -176,7 +176,8 @@ class ValidationTests(unittest.TestCase):
         )
         self.assertIn("不要为了凑结构编造过程", app.EVALUATION_DESCRIPTION_GUIDANCE)
         self.assertIn("五个维度不要使用相同的开头", app.EVALUATION_DESCRIPTION_GUIDANCE)
-        self.assertIn("对象＋结果＋本轮独有数字或故障恢复", app.EVALUATION_DESCRIPTION_GUIDANCE)
+        self.assertIn("执行写具体对象、操作结果和故障恢复", app.EVALUATION_DESCRIPTION_GUIDANCE)
+        self.assertIn("最多选在最相关的两个维度出现", app.EVALUATION_DESCRIPTION_GUIDANCE)
         self.assertIn("自然写明问题发生在第几轮", app.EVALUATION_DESCRIPTION_GUIDANCE)
         self.assertIn(
             "至少一项客观证据",
@@ -699,6 +700,39 @@ class ValidationTests(unittest.TestCase):
         )
         app.validate_evaluation_description_novelty(
             {"delivery": {"score": 5, "description": distinct}},
+            history,
+            require_distinct_opening=False,
+        )
+
+    def test_description_novelty_soft_scan_requests_only_a_wording_rewrite(self):
+        previous = (
+            "换线排程的接口和页面都完成了，后续独立验收执行 docker compose build "
+            "并确认真实服务场景通过，最后没有留下失败检查。"
+        )
+        candidate = (
+            "脉冲配对已经接入接口，后续独立验收执行 docker compose build "
+            "并核对窗口边界，最终服务可以正常使用。"
+        )
+        history = {
+            "delivery": [{
+                "reference": "SOLO-QA #7002",
+                "description": previous,
+                "source": "account_remote",
+            }]
+        }
+
+        with self.assertRaisesRegex(
+            app.WorkflowError, "SOLO-QA #7002 高度重复.*只重写该维度措辞"
+        ):
+            app.validate_evaluation_description_novelty(
+                {"delivery": {"score": 5, "description": candidate}},
+                history,
+                require_distinct_opening=False,
+                detect_shared_structure=True,
+            )
+
+        app.validate_evaluation_description_novelty(
+            {"delivery": {"score": 5, "description": candidate}},
             history,
             require_distinct_opening=False,
         )
@@ -8639,6 +8673,31 @@ class IterationGenerationTests(unittest.TestCase):
             app.prompt_dedup_review_reason(same_repo_medium),
         )
 
+    def test_semantic_dedup_always_reviews_eligible_same_repository_history(self):
+        unrelated_candidate = {
+            "prompt": "为新的库存盘点入口增加离线差异复核。",
+        }
+        repository_history = [{
+            "reference": "SOLO-QA #10873",
+            "prompt": "在既有排程页面增加打印批次预览。",
+            "dedup_required": True,
+        }]
+
+        self.assertTrue(
+            app.semantic_dedup_review_needed(
+                unrelated_candidate,
+                [],
+                repository_history,
+            )
+        )
+        self.assertFalse(
+            app.semantic_dedup_review_needed(
+                unrelated_candidate,
+                [],
+                [{**repository_history[0], "dedup_required": False}],
+            )
+        )
+
     def test_semantic_dedup_prompt_is_conservative_for_cross_repo_history(self):
         review = {
             "duplicate": False,
@@ -8705,18 +8764,13 @@ class IterationGenerationTests(unittest.TestCase):
             len(compact["repository_prompt_history"][0]["prompt"]), 700
         )
 
-    def test_low_risk_cross_repo_history_skips_extra_semantic_model_call(self):
+    def test_low_risk_cross_repo_without_same_repo_history_skips_semantic_call(self):
         candidate = self.candidate()
         context = {
             "repo_path": "/tmp/existing-project",
             "repo_name": "demo",
             "repo_key": "example/demo",
-            "repository_prompt_history": [{
-                "reference": "SOLO-QA #10",
-                "prompt": "仓库最初只实现样本登记和基础详情查看。",
-                "task_type": "0-1 代码生成",
-                "dedup_required": True,
-            }],
+            "repository_prompt_history": [],
         }
         source = {
             "phase": "complete",
@@ -13609,6 +13663,15 @@ class NiuBugWorkflowMergeTests(unittest.TestCase):
 
         self.assertTrue(app.terminal_idle_prompt_visible(idle))
         self.assertFalse(app.terminal_idle_prompt_visible(active))
+
+    def test_final_difficulty_guidance_keeps_one_deep_algorithm_hard(self):
+        guidance = app.TASK_DIFFICULTY_GUIDANCE
+
+        self.assertIn("至少一项不可删除", guidance)
+        self.assertIn("自定义算法判据", guidance)
+        self.assertIn("不要求为了达到困难同时叠加多项机制", guidance)
+        self.assertIn("后续局部 Bug 修复不得直接继承", guidance)
+        self.assertIn("地狱只用于产物确实同时包含多组深层机制", guidance)
 
     def test_terminal_screen_capture_falls_back_to_log_when_hardcopy_is_empty(self):
         with tempfile.TemporaryDirectory() as directory:

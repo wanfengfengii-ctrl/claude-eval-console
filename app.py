@@ -252,6 +252,10 @@ EVALUATION_SCORING_TRAJECTORY_MAX_CHARS = 60_000
 EVALUATION_SCORING_FALLBACK_TRAJECTORY_MAX_CHARS = 24_000
 EVALUATION_PUBLIC_HISTORY_LIMIT = 20
 EVALUATION_PUBLIC_HISTORY_MAX_CHARS = 6_000
+EVALUATION_NOVELTY_SCAN_LIMIT = 200
+EVALUATION_NOVELTY_LONGEST_RUN = 20
+EVALUATION_NOVELTY_SEQUENCE_RATIO = 0.30
+EVALUATION_NOVELTY_NGRAM_RATIO = 0.05
 try:
     SOLO_QA_MAX_TOTAL_SCORE = max(
         5,
@@ -689,7 +693,7 @@ PROMPT_HIGH_RISK_FRAGMENTS = (
 )
 BUG_REPAIR_REPEAT_SIMILARITY_LIMIT = 0.72
 BUG_REPAIR_RESIDUAL_MARKERS = ("上轮", "上次修复后", "修复后")
-EVALUATION_DESCRIPTION_GUIDANCE = f"""评分描述写成自然的项目工作记录，不写成评语或验收报告模板，不限制句数。每段按“做了什么—途中遇到什么—最后结果怎样”的顺序组织，从本项目特有的业务对象、测试数量、可观察结果或返工动作切入；没有发生波折时可以省略中间一项，不要为了凑结构编造过程。直接说本轮改了什么、哪里返工、还有什么没验证；一句只承载一组相关事实，功能很多时挑最能说明分数的两三项。不足可以逐项举例，但每项都要落到本轮真实发生的动作和后果。凡是低于 5 分的描述，必须用至少两个完整句子自然写明问题发生在第几轮；整段合计应包含具体步骤、工具调用动作、文件、函数、接口、命令、日志、报错或数量等至少一项客观证据，并说明具体不足及其实际影响，不强制这些内容挤在第一句。如果轨迹中找不到真实不足，应改评 5 分，不能为了保留非满分而编造问题。5 分描述必须写出实际核对或验收依据；本轮真实发生且属于当前维度的错误操作、遗漏、失误或返工不能藏起来，应降低该维分数。历史问题、环境故障和预期的 404、409、422 等正常契约反馈不自动构成扣分点，写入描述时要具体交代触发条件、可见反馈及为什么不属于本轮缺陷。五个维度不要使用相同的开头、转折和收尾，也不要把一个维度的扣分点搬到另一个维度：交付写最终得到什么，指令遵循对照明确要求，规划记录真实步骤和遗漏，推理写可见说明、决策和定位依据，执行写“对象＋结果＋本轮独有数字或故障恢复”。措辞尽量口语化：根据语境把“未”写成“没有”或“还没”，把“均”写成“都”，把“包含”写成“有”；不要改动代码、文件名、接口字段、原始报错、命令或引号内的原文。五维公开描述不使用 Markdown 反引号；文件名、函数名、命令和输入值直接保留正文，原始报错需要区分时使用中文引号。用通俗方式解释测试数据，不直接抄写 `[0,2,1,1]` 这类原始数字数组；应改写成“零费用项保持为零、其余费用按提交顺序分配”等可观察业务结果，原数组只保留在内部证据中。五维描述直接陈述本轮动作和结果，不使用“用户”这类泛化主语，不出现 AI、AI 浏览器、AI Agent、AI 模型、Codex、GPT、Claude Code 等身份、工具或模型名称，也不用“模型认为”“模型完成了”这类说法指代执行者。命令可以作为证据，但只引用原作业轨迹或验收材料中真实出现且与判断直接相关的完整命令；后续独立验收的命令必须明确写成“后续独立验收”，不能冒充原作业操作，也不要罗列无关命令串。五维描述只能使用当前轮次轨迹、Git 变化和验收结果中真实存在的事实；数字、成功或失败、修改前后状态必须与证据一致。“重复读取”“多次调用”等次数判断必须写出轨迹中可核对的次数；状态被清空、内容被覆盖和架构不匹配等因果判断必须有直接输出，不能只凭后续测试结果反推。不要推测执行者心里“意识到”或“抓住”了什么，也不要为了扣分编造错误。禁用这些措辞：{'、'.join(EVALUATION_DISALLOWED_PHRASES)}。高风险公共片段同样禁用：{'、'.join(EVALUATION_HIGH_RISK_FRAGMENTS)}。不复述分数，不提评分工具、内部提示或生成过程。只评价当前轮次完成的内容。"""
+EVALUATION_DESCRIPTION_GUIDANCE = f"""评分描述写成自然的项目工作记录，不写成评语或验收报告模板，不限制句数。每个维度应根据本项目材料选择自己的叙述顺序，不要固定套用“做了什么—途中遇到什么—最后结果怎样”或“分层推进—测试总数—后续复核”的公共句干；从本项目特有的业务对象、可见结果、关键判断或返工动作切入，没有发生波折时不要为了凑结构编造过程。直接说本轮改了什么、哪里返工、还有什么没验证；一句只承载一组相关事实，功能很多时挑最能说明分数的两三项。不足可以逐项举例，但每项都要落到本轮真实发生的动作和后果。凡是低于 5 分的描述，必须用至少两个完整句子自然写明问题发生在第几轮；整段合计应包含具体步骤、工具调用动作、文件、函数、接口、命令、日志、报错或数量等至少一项客观证据，并说明具体不足及其实际影响，不强制这些内容挤在第一句。如果轨迹中找不到真实不足，应改评 5 分，不能为了保留非满分而编造问题。5 分描述必须写出实际核对或验收依据；本轮真实发生且属于当前维度的错误操作、遗漏、失误或返工不能藏起来，应降低该维分数。历史问题、环境故障和预期的 404、409、422 等正常契约反馈不自动构成扣分点，写入描述时要具体交代触发条件、可见反馈及为什么不属于本轮缺陷。五个维度不要使用相同的开头、转折和收尾，也不要把一个维度的扣分点搬到另一个维度：交付写最终得到什么，指令遵循对照明确要求，规划聚焦真实取舍、步骤遗漏及其后果而不枚举通用开发层次，推理写可见说明、决策和定位依据，执行写具体对象、操作结果和故障恢复。测试总数或统一收尾结论最多选在最相关的两个维度出现，不能让五段都用相同数字结束。措辞尽量口语化：根据语境把“未”写成“没有”或“还没”，把“均”写成“都”，把“包含”写成“有”；不要改动代码、文件名、接口字段、原始报错、命令或引号内的原文。五维公开描述不使用 Markdown 反引号；文件名、函数名、命令和输入值直接保留正文，原始报错需要区分时使用中文引号。用通俗方式解释测试数据，不直接抄写 `[0,2,1,1]` 这类原始数字数组；应改写成“零费用项保持为零、其余费用按提交顺序分配”等可观察业务结果，原数组只保留在内部证据中。五维描述直接陈述本轮动作和结果，不使用“用户”这类泛化主语，不出现 AI、AI 浏览器、AI Agent、AI 模型、Codex、GPT、Claude Code 等身份、工具或模型名称，也不用“模型认为”“模型完成了”这类说法指代执行者。命令可以作为证据，但只引用原作业轨迹或验收材料中真实出现且与判断直接相关的完整命令；后续独立验收的命令必须明确写成“后续独立验收”，不能冒充原作业操作，也不要罗列无关命令串。五维描述只能使用当前轮次轨迹、Git 变化和验收结果中真实存在的事实；数字、成功或失败、修改前后状态必须与证据一致。“重复读取”“多次调用”等次数判断必须写出轨迹中可核对的次数；状态被清空、内容被覆盖和架构不匹配等因果判断必须有直接输出，不能只凭后续测试结果反推。不要推测执行者心里“意识到”或“抓住”了什么，也不要为了扣分编造错误。禁用这些措辞：{'、'.join(EVALUATION_DISALLOWED_PHRASES)}。高风险公共片段同样禁用：{'、'.join(EVALUATION_HIGH_RISK_FRAGMENTS)}。不复述分数，不提评分工具、内部提示或生成过程。只评价当前轮次完成的内容。"""
 EVALUATION_DESCRIPTION_GUIDANCE += """ 环境、网络、权限、系统解释器、包管理器或系统运行库问题只能写入 other_issues，不能出现在任何非满分维度中作为扣分理由。遇到这类阻碍后完成适配属于恢复事实，不是能力缺点；如果轨迹没有另外记录错误命令、错误修改、冗余调用或遗漏步骤，该维度应评 5 分。确有错误操作时只描述错误动作和它造成的后果，不把环境故障本身写成不足。"""
 EVALUATION_RUBRIC_START = "第三步：打分并撰写反馈"
 EVALUATION_RUBRIC_END = "第四步：提交数据"
@@ -697,7 +701,7 @@ EVALUATION_SCORE_GUIDANCE = """严格按交付完整性、指令遵循、任务�
 EVALUATION_PUBLIC_HISTORY_GUIDANCE = """历史同维公开点评只用于检查措辞雷同，不能作为本轮事实或评分依据，也不得在本轮输出中引用历史编号或复述历史内容。返回前逐条比较，不得复用历史中的连续长片段、通用句干、固定开头或固定收尾，也不能只替换项目名和业务名词；应改用本轮独有的对象、操作、可见结果和证据组织自然表达。"""
 EVALUATION_FACT_ATTRIBUTION_GUIDANCE = """先核验事实，再逐维定分，最后写描述。明确区分原作业实际操作、面向使用者的完成声明、源码事实、后续独立验收以及环境或网关故障；描述后续验收时必须显式写明来源，不能改写成原作业已经执行。指令义务只来自本轮实际 User Prompt 与当时有效上下文，后续评分提示、验收计划或复核新增条件不能反推为漏做。判定虚假成功必须同时找到本轮面向使用者的实际完成声明和与之矛盾的工具输出或产物事实；内部分析、计划、没有新增专项测试或没有写“未运行”不能单独定为虚假成功。后续独立验收通过不能抹掉原作业已经发生的虚假完成声明、真实失败、遗漏或没有验证的范围；临时副本补装依赖后的成功只证明该条件下的结果。环境、网关和检查脚本故障不自动成为五维扣分，也不统一限制最高分，已经证实的产品或过程问题仍按所属维度评价。504 后自动发送的“继续”属于同一业务目标，评分必须使用恢复前后的完整轨迹，保留所有实际调用、原始输出和过程问题，不能只摘取最后成功片段。评价推理能力只使用可见的说明、决策、排除过程和产物因果，不索取或猜测不可见的内部思维。"""
 EVALUATION_FACT_ATTRIBUTION_GUIDANCE += """ 独立代码复核新产生的复现结果、依赖盘点、文件数量、缓存大小或产物检查结论可以作为事实，但公开描述必须在引用这些事实的同一句明确写“后续独立复核发现”或“后续产物检查显示”；只在原作业轨迹或原验收结果中出现的事实不需要加该前缀。历史评分、历史点评和质检建议分只用于识别套话或定位待复核处，不得沿用为本轮分数和事实，也不能为了制造差异改写真实场景。文字润色只能调整表达，发现分数、事实或验证范围矛盾时必须先按证据重新评价。"""
-TASK_DIFFICULTY_GUIDANCE = """task_difficulty 必须在检查真实代码、验收结果和本轮轨迹后独立判定，不采用题面、自报或历史记录中的难度标签。简单表示改动集中、路径直接且验证成本低；中等表示跨模块完成一条工程链路并处理常见失败路径；困难表示存在较多状态不变量、恢复逻辑或复杂跨层协作；地狱只用于产物确实同时包含多组深层机制且实现与验证负担显著的情况。控制台只允许提交困难或地狱难度，但这条提交策略不能成为抬高评分的理由；真实产物只达到简单或中等时必须如实返回。"""
+TASK_DIFFICULTY_GUIDANCE = """task_difficulty 必须在检查真实代码、验收结果和本轮轨迹后独立判定，不采用题面、自报或历史记录中的难度标签。简单表示改动集中、路径直接且验证成本低；中等表示跨模块完成一条常见工程链路并处理常见失败路径；困难表示最简合规实现仍包含至少一项不可删除且需要独立建立判据的深层机制，例如状态不变量、恢复或并发逻辑、自定义算法判据，或者复杂跨层协作，不要求为了达到困难同时叠加多项机制。输入规模较小、实现代码较短或题面已明确边界，不能单独把已达到上述门槛的任务降为中等。地狱只用于产物确实同时包含多组深层机制且实现与验证负担显著的情况。每一轮独立判断，后续局部 Bug 修复不得直接继承前一轮 Feature 的困难标签。控制台只允许提交困难或地狱难度，但这条提交策略不能成为抬高评分的理由；真实产物只达到简单或中等时必须如实返回。"""
 TASK_DIFFICULTY_MARGIN_OPTIONS = ("低于困难", "困难边缘", "明确困难", "地狱")
 REQUIRED_TASK_DIFFICULTY_MARGINS = frozenset(("明确困难", "地狱"))
 GENERATION_DIFFICULTY_AXIS_GUIDANCE = """设计候选前先且只选择一个主要难点轴：一项复杂状态或恢复机制、一种自定义算法体系、或者四个真实模块间不可拆分的跨层契约。选择复杂状态轴时不得再加入迟到消息抑制、二进制损坏恢复或另一套补偿工作流；选择自定义算法轴时，普通输入校验、固定验证先后顺序、排序键和同分决胜规则只能作为该算法的确定性边界，不能扩展成另一套规则裁决算法；选择四模块协作轴时不得再引入复杂恢复或自定义算法。不要为了输出“首个错误”额外设计裁决系统；确需首错时直接给出完整固定优先级和同类决胜顺序，否则返回按输入位置稳定排序的全部错误。每个会改变核心结果的退化输入和多错误并发情形必须一次定义清楚，同时删除等量背景文字，不能把题面截断。"""
@@ -3983,14 +3987,25 @@ def compact_iteration_prompt_context(
 
 
 def semantic_dedup_review_needed(
-    candidate: Dict[str, Any], global_history: List[Dict[str, Any]]
+    candidate: Dict[str, Any],
+    global_history: List[Dict[str, Any]],
+    repository_history: Optional[List[Dict[str, Any]]] = None,
 ) -> bool:
-    """Use the extra model reviewer only for a plausible cross-repo match.
+    """Review every same-repository continuation and risky cross-repo matches.
 
-    Same-repository history is already evaluated by local guards and the
-    mandatory independent task review. The supplemental call is reserved for
-    cross-repository candidates whose lexical shortlist indicates real risk.
+    The quality platform's Rule C treats additions to the same interface,
+    page or state machine as semantic duplicates even when their wording is
+    dissimilar. Local lexical thresholds cannot safely decide that case, so
+    any eligible same-repository history requires the dedicated reviewer.
+    Cross-repository history remains risk-gated to keep generation responsive.
     """
+    if any(
+        item.get("dedup_required") is not False
+        and bool(str(item.get("prompt") or "").strip())
+        for item in repository_history or []
+        if isinstance(item, dict)
+    ):
+        return True
     for item in global_history:
         if item.get("dedup_required") is False:
             continue
@@ -6800,7 +6815,9 @@ def generate_iteration_candidate(
                     reviewed_difficulty_contract(validation)
                 )
                 if semantic_dedup_review_needed(
-                    checked_candidate, global_history
+                    checked_candidate,
+                    global_history,
+                    repository_history,
                 ):
                     update_current_iteration_job_stage("提交前语义查重")
                     try:
@@ -9087,6 +9104,39 @@ def evaluation_description_similarity(
     return ratio, longest, jaccard
 
 
+def evaluation_description_shared_style_reason(
+    candidate: Any,
+    previous: Any,
+) -> str:
+    """Return a conservative reason for likely B-5/B-9 prose reuse.
+
+    This is a rewrite trigger, not an export or scoring gate. It intentionally
+    ignores isolated shared paths and identifiers, while catching either a
+    long Chinese public fragment or a broader high-overlap sentence skeleton.
+    """
+    left = evaluation_description_comparison_text(candidate)
+    right = evaluation_description_comparison_text(previous)
+    if not left or not right or left == right:
+        return ""
+    matcher = difflib.SequenceMatcher(None, left, right, autojunk=False)
+    match = matcher.find_longest_match()
+    shared = left[match.a:match.a + match.size]
+    ratio, longest, ngram_ratio = evaluation_description_similarity(
+        candidate, previous
+    )
+    if (
+        longest >= EVALUATION_NOVELTY_LONGEST_RUN
+        and len(re.findall(r"[\u3400-\u9fff]", shared)) >= 8
+    ):
+        return f"连续公共片段达到 {longest} 个字符"
+    if (
+        ratio >= EVALUATION_NOVELTY_SEQUENCE_RATIO
+        and ngram_ratio >= EVALUATION_NOVELTY_NGRAM_RATIO
+    ):
+        return "句序和公共表达骨架高度相似"
+    return ""
+
+
 def historical_evaluation_descriptions(
     dimension_key: str,
     *,
@@ -9433,6 +9483,102 @@ def recent_qc_passed_public_evaluation_history(
     return history
 
 
+def known_b5_evaluation_style_history(
+    *,
+    exclude_turn_key: str = "",
+    exclude_remote_id: str = "",
+    limit: int = 80,
+) -> Dict[str, List[Dict[str, str]]]:
+    """Return only descriptions that SOLO-QA explicitly rejected for reuse.
+
+    These examples power a soft pre-submit rewrite. Passed prose is excluded so
+    the local guard does not become stricter than the quality platform.
+    """
+    history = {key: [] for key in EVALUATION_DIMENSION_KEYS}
+    maximum = max(1, min(int(limit), 200))
+    try:
+        with db_connection() as database:
+            rows = database.execute(
+                """SELECT submissions.run_id, submissions.turn_number,
+                          submissions.remote_submission_id,
+                          submissions.qc_summary,
+                          repairs.issues AS repair_issues,
+                          remote.delivery_description,
+                          remote.instruction_following_description,
+                          remote.planning_description,
+                          remote.reasoning_description,
+                          remote.execution_description
+                     FROM solo_qa_submissions AS submissions
+                     JOIN solo_qa_remote_evaluations AS remote
+                       ON remote.remote_submission_id =
+                          submissions.remote_submission_id
+                LEFT JOIN evaluation_repair_jobs AS repairs
+                       ON repairs.run_id = submissions.run_id
+                      AND repairs.turn_number = submissions.turn_number
+                    WHERE remote.remote_status = 'PENDING_FIX'
+                      AND (submissions.qc_summary != ''
+                           OR COALESCE(repairs.issues, '') != '')
+                    ORDER BY COALESCE(submissions.remote_updated_at,
+                                      submissions.submitted_at) DESC,
+                             submissions.remote_submission_id DESC
+                    LIMIT ?""",
+                (maximum * 4,),
+            ).fetchall()
+    except (OSError, sqlite3.Error):
+        return history
+    pattern = re.compile(
+        r"(?:\bB\s*[-_ ]?\s*[59]\b|公共长片段|模板(?:相似|雷同|重复)|"
+        r"套(?:用)?模板|骨架雷同)",
+        re.I,
+    )
+    seen = {key: set() for key in EVALUATION_DIMENSION_KEYS}
+    for raw in rows:
+        row = dict(raw)
+        remote_id = str(row.get("remote_submission_id") or "").strip()
+        turn_key = f"{row.get('run_id')}:{row.get('turn_number')}"
+        if (
+            turn_key == exclude_turn_key
+            or (exclude_remote_id and remote_id == exclude_remote_id)
+        ):
+            continue
+        summary = re.sub(
+            r"\s+",
+            " ",
+            " ".join((
+                str(row.get("qc_summary") or ""),
+                str(row.get("repair_issues") or ""),
+            )),
+        ).strip()
+        if not pattern.search(summary):
+            continue
+        selected = [
+            key for key in EVALUATION_DIMENSION_KEYS
+            if EVALUATION_DIMENSION_LABELS[key] in summary
+        ]
+        multi_match = re.search(r"等\s*([2-5])\s*个维度", summary)
+        if (
+            (multi_match and int(multi_match.group(1)) > len(selected))
+            or re.search(r"(?:全部|所有|五)\s*个?维度|五维", summary)
+        ):
+            selected = list(EVALUATION_DIMENSION_KEYS)
+        for key in selected:
+            if len(history[key]) >= maximum:
+                continue
+            description = re.sub(
+                r"\s+", " ", str(row.get(f"{key}_description") or "")
+            ).strip()
+            fingerprint = evaluation_description_comparison_text(description)
+            if not fingerprint or fingerprint in seen[key]:
+                continue
+            history[key].append({
+                "reference": f"SOLO-QA #{remote_id}" if remote_id else turn_key,
+                "description": description,
+                "source": "solo_qa_b5_rejection",
+            })
+            seen[key].add(fingerprint)
+    return history
+
+
 def evaluation_description_history_context(dimension_key: str) -> str:
     """Format prior prose as style-avoidance material, never as factual evidence."""
     history = recent_qc_passed_public_evaluation_history().get(dimension_key, [])
@@ -9450,8 +9596,12 @@ def validate_evaluation_description_novelty(
     history_by_dimension: Dict[str, List[Dict[str, str]]],
     *,
     require_distinct_opening: bool,
+    detect_shared_structure: bool = False,
+    shared_style_history_by_dimension: Optional[
+        Dict[str, List[Dict[str, str]]]
+    ] = None,
 ) -> None:
-    """Block only an effectively identical paragraph; softer overlap is advisory."""
+    """Reject exact copies and optionally request a soft pre-submit rewrite."""
     for dimension_key in EVALUATION_DIMENSION_KEYS:
         item = evaluation.get(dimension_key)
         if not isinstance(item, dict):
@@ -9471,6 +9621,23 @@ def validate_evaluation_description_novelty(
             reference = str(previous.get("reference") or "历史记录")
             raise WorkflowError(
                 f"自动检查的{label}描述与历史点评 {reference} 完全重复"
+            )
+        style_history = (
+            history_by_dimension.get(dimension_key, [])
+            if detect_shared_structure
+            else (shared_style_history_by_dimension or {}).get(dimension_key, [])
+        )
+        for previous in style_history:
+            previous_description = str(previous.get("description") or "")
+            shared_style = evaluation_description_shared_style_reason(
+                description, previous_description
+            )
+            if not shared_style:
+                continue
+            reference = str(previous.get("reference") or "历史记录")
+            raise WorkflowError(
+                f"自动检查的{label}描述与历史点评 {reference} 高度重复："
+                f"{shared_style}，只重写该维度措辞"
             )
 
 
@@ -17289,9 +17456,14 @@ def normalize_evaluation_with_targeted_repairs(
             key,
             exclude_turn_key=history_exclude_turn_key,
             exclude_remote_id=history_exclude_remote_id,
+            limit=EVALUATION_NOVELTY_SCAN_LIMIT,
         )
         for key in EVALUATION_DIMENSION_KEYS
     }
+    shared_style_history_by_dimension = known_b5_evaluation_style_history(
+        exclude_turn_key=history_exclude_turn_key,
+        exclude_remote_id=history_exclude_remote_id,
+    )
     attempts_by_dimension: Dict[str, int] = {}
     forced_issues = list(dict.fromkeys(initial_repair_issues or []))
     # Each of the five dimensions may need five focused rewrites. Keep one
@@ -17323,6 +17495,9 @@ def normalize_evaluation_with_targeted_repairs(
                 normalized,
                 history_by_dimension,
                 require_distinct_opening=True,
+                shared_style_history_by_dimension=(
+                    shared_style_history_by_dimension
+                ),
             )
             normalized["_description_novelty_version"] = 1
             synchronize_evaluation_public_mirrors(normalized)
