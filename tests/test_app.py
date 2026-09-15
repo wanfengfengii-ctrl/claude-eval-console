@@ -33,6 +33,20 @@ def sample_evaluation(task_type="0-1 代码生成"):
 
 
 class ValidationTests(unittest.TestCase):
+    def test_responses_schemas_do_not_use_unsupported_unique_items(self):
+        def walk(value):
+            if isinstance(value, dict):
+                self.assertNotIn("uniqueItems", value)
+                for child in value.values():
+                    walk(child)
+            elif isinstance(value, list):
+                for child in value:
+                    walk(child)
+
+        walk(app.evaluation_split_dimension_schema("delivery"))
+        walk(app.evaluation_score_cap_schema())
+        walk(app.difficulty_contract_schema())
+
     def test_score_cap_calibration_is_downward_only_and_updates_v2_mirrors(self):
         evaluation = sample_evaluation()
         evaluation["score_stage_version"] = 2
@@ -3490,6 +3504,47 @@ class ParsingTests(unittest.TestCase):
 
 
 class ReviewTests(unittest.TestCase):
+    def test_split_score_source_marker_triggers_attribution_repair(self):
+        schema = app.evaluation_split_dimension_schema("delivery")
+        self.assertIn("descriptionUsesIndependentReview", schema["required"])
+        self.assertTrue(
+            app.evaluation_public_description_needs_source_repair(
+                {
+                    "description": "产物检查发现依赖目录被提交。",
+                    "descriptionUsesIndependentReview": True,
+                }
+            )
+        )
+        self.assertFalse(
+            app.evaluation_public_description_needs_source_repair(
+                {
+                    "description": "后续独立复核发现依赖目录被提交。",
+                    "descriptionUsesIndependentReview": True,
+                }
+            )
+        )
+
+    def test_regrade_forwards_source_marker_issue_to_targeted_repair(self):
+        draft = sample_evaluation()
+        for key in app.EVALUATION_DIMENSION_KEYS:
+            draft[key]["score"] = 4
+        draft["_initial_repair_issues"] = [
+            "交付完整性描述引用后续独立复核证据但没有注明来源"
+        ]
+        with mock.patch.object(
+            app, "run_codex_split_regrade", return_value=draft
+        ), mock.patch.object(
+            app,
+            "review_evaluation_with_manual_fallback",
+            side_effect=lambda evaluation, *_args, **_kwargs: (evaluation, ""),
+        ) as review:
+            app.run_codex_regrade(Path("."), "题面", [], "轨迹", 1)
+
+        self.assertEqual(
+            review.call_args.kwargs["initial_repair_issues"],
+            ["交付完整性描述引用后续独立复核证据但没有注明来源"],
+        )
+
     def test_regrade_runs_one_joint_calibration_only_when_total_exceeds_cap(self):
         over_cap = sample_evaluation()
         over_cap.update({
@@ -6974,6 +7029,15 @@ class DraftTests(unittest.TestCase):
 
         self.assertTrue(any("未达到困难：中等" in error for error in errors))
 
+    def test_independent_review_rejects_borderline_difficulty_margin(self):
+        review = self.scope_review()
+        review["difficulty_margin"] = "困难边缘"
+        review["hardness_basis"] = "核心流程仍可能退化成常规接口串联"
+
+        errors = app.task_review_scope_errors(review)
+
+        self.assertTrue(any("难度余量不足：困难边缘" in error for error in errors))
+
     def test_local_task_validation_hard_limit_is_600_chars(self):
         candidate = self.candidate()
         candidate["prompt"] += "补充异常恢复约束。" * 80
@@ -7191,11 +7255,22 @@ class DraftTests(unittest.TestCase):
                     {"project_directory": "team-a", "_auto_refill": True},
                     allow_parallel_generation=True,
                 )
+                third = app.create_automatic_run(
+                    {"project_directory": "team-a", "_auto_refill": True},
+                    allow_parallel_generation=True,
+                )
+                capped = app.create_automatic_run(
+                    {"project_directory": "team-a", "_auto_refill": True},
+                    allow_parallel_generation=True,
+                )
 
             self.assertNotEqual(first["id"], second["id"])
+            self.assertNotEqual(second["id"], third["id"])
+            self.assertIn(capped["id"], {first["id"], second["id"], third["id"]})
             self.assertEqual(first["project_number"], "0001")
             self.assertEqual(second["project_number"], "0002")
-            self.assertEqual(scheduler.call_count, 2)
+            self.assertEqual(third["project_number"], "0003")
+            self.assertEqual(scheduler.call_count, app.TASK_GENERATION_MAX_PARALLEL)
 
     def test_failed_generation_retries_same_number_before_next_create_advances(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -7988,6 +8063,32 @@ class AutoRefillTests(unittest.TestCase):
                     {"project_directory": "team-a", "_auto_refill": True},
                     allow_parallel_generation=True,
                 )
+
+    def test_refill_keeps_zero_to_one_generation_at_three(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            with mock.patch.object(app, "DB_PATH", root / "test.db"), mock.patch.object(
+                app, "DATA_DIR", root
+            ), mock.patch.object(app, "PROJECTS_ROOT", root), mock.patch.object(
+                app, "HISTORY_PATH", root / "history.md"
+            ), mock.patch.object(app, "schedule_worker"):
+                app.initialize_database()
+                app.set_auto_refill({"enabled": True, "project_directory": "team-a"})
+                for _ in range(app.TASK_GENERATION_MAX_PARALLEL):
+                    app.create_automatic_run(
+                        {"project_directory": "team-a", "_auto_refill": True},
+                        allow_parallel_generation=True,
+                    )
+                with mock.patch.object(
+                    app, "automatic_refill_occupancy", return_value=3
+                ), mock.patch.object(
+                    app, "auto_refill_iteration_candidate", return_value=None
+                ), mock.patch.object(app, "create_automatic_run") as create:
+                    result = app.automatic_refill_once()
+
+        self.assertEqual(result["action"], "waiting_for_0_1_generation")
+        self.assertEqual(result["count"], app.TASK_GENERATION_MAX_PARALLEL)
+        create.assert_not_called()
 
     def test_refill_queue_uses_the_interleaved_task_type(self):
         source = {
@@ -11917,7 +12018,15 @@ class DatabaseTests(unittest.TestCase):
                 self.assertEqual(row["iteration_expansion_axis"], "人工复核")
                 self.assertEqual(json.loads(row["iteration_modules"]), metadata["modules"])
                 self.assertEqual(created["iteration_metadata"], metadata)
-                self.assertEqual(created["difficulty_contract"], contract)
+                self.assertEqual(
+                    created["difficulty_contract"],
+                    {
+                        **contract,
+                        "version": 2,
+                        "difficulty_margin": "明确困难",
+                        "hardness_basis": "状态、接口和页面共同维护版本一致性",
+                    },
+                )
                 history = app.iteration_lineage_state(created["id"])["history"]
                 child = next(item for item in history if item["run_id"] == created["id"])
                 self.assertEqual(child["engineering_core"], "复核授权闭环")
