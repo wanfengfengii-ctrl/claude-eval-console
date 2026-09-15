@@ -7307,6 +7307,28 @@ class AutoRefillTests(unittest.TestCase):
             self.assertEqual(candidate["id"], "root11111111")
             self.assertEqual(candidate["iteration_count"], 5)
 
+    def test_candidate_skips_repository_with_an_active_sibling_lineage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            with mock.patch.object(app, "DB_PATH", root / "test.db"), mock.patch.object(
+                app, "DATA_DIR", root
+            ), mock.patch.object(app, "PROJECTS_ROOT", root):
+                app.initialize_database()
+                with app.db_connection() as database:
+                    self.insert_run(database, "shared111111", "shared-repo")
+                    self.insert_run(database, "shared222222", "shared-repo")
+                    self.insert_run(
+                        database,
+                        "active111111",
+                        "shared-repo",
+                        phase="first_running",
+                        source_run_id="shared111111",
+                    )
+                    self.insert_run(database, "other1111111", "other-repo")
+                candidate = app.auto_refill_iteration_candidate()
+
+            self.assertEqual(candidate["id"], "other1111111")
+
     def test_refill_and_manual_iteration_skip_project_rejected_by_solo_qa(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -7915,6 +7937,96 @@ class IterationGenerationTests(unittest.TestCase):
                 repository_history=repository_history,
             )
 
+    def test_repository_history_includes_every_local_turn_and_submission(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.object(app, "DB_PATH", root / "test.db"), mock.patch.object(
+                app, "DATA_DIR", root
+            ):
+                app.initialize_database()
+                timestamp = app.now_text()
+                with app.db_connection() as database:
+                    for run_id, repo_name in (
+                        ("older1111111", "shared-repo"),
+                        ("target111111", "shared-repo"),
+                    ):
+                        database.execute(
+                            """INSERT INTO runs(
+                                 id, repo_name, repo_path, run_directory, repo_url,
+                                 phase, first_prompt, first_prompt_id,
+                                 container_cleaned, task_type,
+                                 verification_commands, created_at, updated_at
+                               ) VALUES (?, ?, ?, ?, ?, 'complete', ?, 'prompt-1',
+                                         1, '0-1 代码生成', '[]', ?, ?)""",
+                            (
+                                run_id,
+                                repo_name,
+                                str(root / run_id / "workspace"),
+                                str(root / run_id),
+                                "https://github.com/example/shared-repo.git",
+                                "首轮项目需求",
+                                timestamp,
+                                timestamp,
+                            ),
+                        )
+                    database.execute(
+                        """INSERT INTO run_turns(
+                             run_id, turn_number, intent_type, prompt, prompt_id,
+                             status, created_at, updated_at
+                           ) VALUES ('older1111111', 1, '0-1 代码生成',
+                                   '首轮项目需求', 'prompt-1', 'complete', ?, ?)""",
+                        (timestamp, timestamp),
+                    )
+                    database.execute(
+                        """INSERT INTO run_turns(
+                             run_id, turn_number, intent_type, prompt, prompt_id,
+                             status, created_at, updated_at
+                           ) VALUES ('older1111111', 2, 'Bug 修复',
+                                   '极大有限坐标换算后结果为空，应保留有效落点。',
+                                   'prompt-2', 'complete', ?, ?)""",
+                        (timestamp, timestamp),
+                    )
+                    database.execute(
+                        """INSERT INTO run_turns(
+                             run_id, turn_number, intent_type, prompt, prompt_id,
+                             status, created_at, updated_at
+                           ) VALUES ('target111111', 1, '0-1 代码生成',
+                                   '另一个首轮项目需求', 'prompt-target', 'complete', ?, ?)""",
+                        (timestamp, timestamp),
+                    )
+                    database.execute(
+                        """INSERT INTO solo_qa_submissions(
+                             run_id, turn_number, remote_submission_id,
+                             remote_status, state, created_at, updated_at
+                           ) VALUES ('older1111111', 2, '13653',
+                                   'QC_PASSED', 'qc_passed', ?, ?)""",
+                        (timestamp, timestamp),
+                    )
+                history = app.repository_prompt_history(
+                    app.run_row("target111111")
+                )
+                global_history = app.global_prompt_dedup_history(
+                    "example/another-repo",
+                    {
+                        "task_type": "Bug 修复",
+                        "confirmed_bugs": [{
+                            "customer_summary": (
+                                "极大有限坐标换算后结果为空，应保留有效落点。"
+                            ),
+                        }],
+                    },
+                    "Bug 修复",
+                )
+
+        second_turn = next(
+            item for item in history
+            if item.get("reference") == "SOLO-QA #13653"
+        )
+        self.assertEqual(second_turn["turn_number"], 2)
+        self.assertEqual(second_turn["task_type"], "Bug 修复")
+        self.assertIn("极大有限坐标", second_turn["prompt"])
+        self.assertEqual(global_history[0]["reference"], "本地任务 older111")
+
     def test_global_bug_guard_blocks_only_near_verbatim_cross_repo_issue(self):
         history = [{
             "reference": "SOLO-QA #10927",
@@ -8027,6 +8139,8 @@ class IterationGenerationTests(unittest.TestCase):
         prompt = codex.call_args.args[0]
         self.assertIn("跨仓库必须更保守", prompt)
         self.assertIn("通用技术词不构成重复", prompt)
+        self.assertIn("同一主接口、同一页面流程或同一状态机", prompt)
+        self.assertIn("开发动作、输入校验、失败结果和验收结构", prompt)
 
     def test_repository_key_matches_fallback_without_cross_owner_collision(self):
         self.assertEqual(
@@ -9255,6 +9369,31 @@ class IterationGenerationTests(unittest.TestCase):
         finally:
             with app.ITERATION_GENERATION_LOCK:
                 app.ITERATION_GENERATIONS.discard("source111111")
+
+    def test_parallel_generation_for_the_same_repository_is_rejected(self):
+        repository_token = "repo:example/shared-repo"
+        with app.ITERATION_GENERATION_LOCK:
+            app.ITERATION_GENERATIONS.add(repository_token)
+        try:
+            with mock.patch.object(
+                app, "existing_generated_iteration", return_value=None
+            ), mock.patch.object(
+                app, "latest_iteration_baseline_run_id", return_value="source111111"
+            ), mock.patch.object(
+                app, "validate_iteration_lineage_type", return_value={}
+            ), mock.patch.object(
+                app,
+                "run_row",
+                return_value={
+                    "id": "source111111",
+                    "repo_name": "shared-repo",
+                    "repo_url": "https://github.com/example/shared-repo.git",
+                },
+            ), self.assertRaisesRegex(app.WorkflowError, "同一仓库"):
+                app.generate_and_start_iteration("source111111")
+        finally:
+            with app.ITERATION_GENERATION_LOCK:
+                app.ITERATION_GENERATIONS.discard(repository_token)
 
 
 class ExportTests(unittest.TestCase):
