@@ -1,4 +1,4 @@
-const UI_VERSION = "20260915.3";
+const UI_VERSION = "20260915.4";
 const EXPORT_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 const TABLE_PAGE_SIZE = 20;
 const SOLO_QA_AUTO_REPAIR_POLL_MS = 3000;
@@ -413,7 +413,7 @@ function renderDirectoryPreview() {
   const root = state.health?.projects_root || "/Users/zhangxinyu/claude code";
   const directory = directoryInput.value.trim() || state.health?.default_project_directory || "zzzz";
   const selectedPath = directory.startsWith("/") ? directory.replace(/\/$/, "") : `${root}/${directory.replace(/^\.\//, "")}`;
-  preview.textContent = `新任务：${selectedPath}/0001-项目名（0001–2999） · 导入基线：3000–3999 · 难度由完成后的轨迹和产物评定`;
+  preview.textContent = `新任务：${selectedPath}/0001-项目名（0001–2999） · 导入基线：3000–3999 · 只生成困难或地狱题，最终按真实轨迹和产物评定`;
 }
 
 function renderRunList() {
@@ -840,7 +840,7 @@ function renderDetail() {
     ${canStartIteration ? `
       <section class="second-turn-box prominent-iteration-box" aria-labelledby="auto-iteration-title">
         <h3 id="auto-iteration-title">新建独立迭代会话</h3>
-        <p><strong>${escapeHtml(state.health?.iteration_generation_model || "gpt-5.6-sol")}</strong> 会在后台读取当前项目，按照你选择的类型生成一段可直接开发的跨模块需求；不预设难度，完成后根据真实轨迹和产物评定。生成成功后从当前 commit 快照创建独立目录（沿用源编号并追加 -1、-2 迭代序号）、新容器、新终端和新 SessionID，并立即执行。</p>
+        <p><strong>${escapeHtml(state.health?.iteration_generation_model || "gpt-5.6-sol")}</strong> 会在后台读取当前项目，只放行预估达到困难或地狱的跨模块需求；Bug 修复没有困难候选时会跳过。完成后仍根据真实轨迹和产物独立评定，低于困难将不能导出或提交。生成成功后从当前 commit 快照创建独立目录（沿用源编号并追加 -1、-2 迭代序号）、新容器、新终端和新 SessionID，并立即执行。</p>
         <div class="iteration-type-control">
           <label for="iteration-task-type">产出类型</label>
           <select id="iteration-task-type" ${iterationPending ? "disabled" : ""}>
