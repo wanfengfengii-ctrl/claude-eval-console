@@ -139,8 +139,8 @@ SOLO_QA_PROJECT_REJECTION_MARKERS = (
     "题材不合格",
 )
 SUBMITTER_NAME = os.environ.get("CLAUDE_EVAL_SUBMITTER", "牛宇航").strip() or "牛宇航"
-APP_VERSION = "20260915.13"
-EVALUATION_REPAIR_POLICY_VERSION = 6
+APP_VERSION = "20260916.1"
+EVALUATION_REPAIR_POLICY_VERSION = 7
 EVALUATION_SCORE_CAP_POLICY_VERSION = 1
 REPO_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
 MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/\[\]-]{0,127}$")
@@ -9912,6 +9912,148 @@ def solo_qa_returned_evaluation_fingerprint(row: Dict[str, Any]) -> str:
     ).hexdigest()
 
 
+def solo_qa_score_consistency_repair_dimensions(
+    row: Dict[str, Any], evaluation: Dict[str, Any]
+) -> List[str]:
+    """Find a returned full-score dimension explicitly contradicted by QC facts."""
+    if str(row.get("solo_qa_state") or "") != "needs_fix":
+        return []
+    summary = re.sub(
+        r"\s+", " ", str(row.get("solo_qa_qc_summary") or "")
+    ).strip()
+    if "满分" not in summary:
+        return []
+    selected: List[str] = []
+    for dimension_key in EVALUATION_DIMENSION_KEYS:
+        label = EVALUATION_DIMENSION_LABELS[dimension_key]
+        item = evaluation.get(dimension_key)
+        try:
+            score = int(item.get("score")) if isinstance(item, dict) else 0
+        except (TypeError, ValueError):
+            score = 0
+        if score != 5:
+            continue
+        # The leading "维度：该维度给了满分，但……" clause identifies the
+        # score being challenged. Labels later in the sentence are evidence
+        # sources, not additional repair targets.
+        if re.search(
+            rf"(?:^|[；。])\s*(?:[【「]\s*)?{re.escape(label)}"
+            rf"(?:\s*[-—－]\s*描述)?(?:\s*[】」])?\s*[：:]"
+            rf"[^；。]{{0,120}}?{re.escape(label)}(?:维度)?"
+            r"\s*(?:给了|得到|获得|评为|是|为)\s*满分",
+            summary,
+        ):
+            selected.append(dimension_key)
+    return selected
+
+
+def solo_qa_remote_duplicate_dimensions(remote_id: str) -> List[str]:
+    """Read the exact duplicate dimensions returned by the helper sync."""
+    remote_id = str(remote_id or "").strip()
+    if not remote_id:
+        return []
+    try:
+        with db_connection() as database:
+            row = database.execute(
+                """SELECT dedup_hits FROM solo_qa_remote_evaluations
+                    WHERE remote_submission_id = ?""",
+                (remote_id,),
+            ).fetchone()
+    except (OSError, sqlite3.Error):
+        return []
+    if not row:
+        return []
+    try:
+        hits = json.loads(str(row["dedup_hits"] or "[]"))
+    except (json.JSONDecodeError, TypeError):
+        return []
+    if not isinstance(hits, list):
+        return []
+    aliases: Dict[str, set[str]] = {}
+    for dimension_key, remote_key in EVALUATION_REMOTE_DIMENSION_KEYS.items():
+        aliases[dimension_key] = {
+            dimension_key,
+            remote_key,
+            f"desc_{dimension_key}",
+            f"desc_{remote_key}",
+            f"{dimension_key}_description",
+            f"{remote_key}_description",
+            EVALUATION_DIMENSION_LABELS[dimension_key],
+        }
+    selected: List[str] = []
+    for hit in hits:
+        if not isinstance(hit, dict):
+            continue
+        values = {
+            str(hit.get("field") or "").strip().lower(),
+            str(hit.get("dimension") or "").strip().lower(),
+        }
+        for dimension_key in EVALUATION_DIMENSION_KEYS:
+            if values & {alias.lower() for alias in aliases[dimension_key]}:
+                if dimension_key not in selected:
+                    selected.append(dimension_key)
+                break
+    return selected
+
+
+def solo_qa_abbreviated_duplicate_dimensions(
+    row: Dict[str, Any],
+    evaluation: Dict[str, Any],
+    explicit_dimensions: List[str],
+    desired_count: int,
+) -> List[str]:
+    """Resolve omitted B-5 dimensions from helper hits or the named peer."""
+    desired_count = max(1, min(int(desired_count), len(EVALUATION_DIMENSION_KEYS)))
+    selected = list(dict.fromkeys(explicit_dimensions))
+    for dimension_key in solo_qa_remote_duplicate_dimensions(
+        str(row.get("solo_qa_remote_submission_id") or "")
+    ):
+        if dimension_key not in selected:
+            selected.append(dimension_key)
+        if len(selected) >= desired_count:
+            return selected[:desired_count]
+
+    summary = str(row.get("solo_qa_qc_summary") or "")
+    reference_match = re.search(r"#\s*([A-Za-z0-9_-]+)", summary)
+    reference_id = reference_match.group(1) if reference_match else ""
+    reference: Dict[str, str] = {}
+    if reference_id:
+        try:
+            with db_connection() as database:
+                remote_row = database.execute(
+                    """SELECT delivery_description,
+                              instruction_following_description,
+                              planning_description, reasoning_description,
+                              execution_description
+                         FROM solo_qa_remote_evaluations
+                        WHERE remote_submission_id = ?""",
+                    (reference_id,),
+                ).fetchone()
+            if remote_row:
+                reference = dict(remote_row)
+        except (OSError, sqlite3.Error):
+            reference = {}
+    ranked: List[Tuple[Tuple[float, int, float], str]] = []
+    for dimension_key in EVALUATION_DIMENSION_KEYS:
+        if dimension_key in selected:
+            continue
+        item = evaluation.get(dimension_key)
+        candidate = item.get("description") if isinstance(item, dict) else ""
+        previous = reference.get(f"{dimension_key}_description", "")
+        ranked.append(
+            (evaluation_description_similarity(candidate, previous), dimension_key)
+        )
+    for similarity, dimension_key in sorted(ranked, reverse=True):
+        if not any(similarity):
+            continue
+        selected.append(dimension_key)
+        if len(selected) >= desired_count:
+            return selected[:desired_count]
+    # If the sync did not expose enough evidence, preserve the former safe
+    # fallback instead of pretending to know which omitted dimensions failed.
+    return list(EVALUATION_DIMENSION_KEYS)
+
+
 def solo_qa_returned_evaluation_repair_issues(
     row: Dict[str, Any], evaluation: Dict[str, Any]
 ) -> List[str]:
@@ -9922,19 +10064,32 @@ def solo_qa_returned_evaluation_repair_issues(
     summary = re.sub(
         r"\s+", " ", str(row.get("solo_qa_qc_summary") or "")
     ).strip()
-    selected = [
+    score_consistency_dimensions = solo_qa_score_consistency_repair_dimensions(
+        row, evaluation
+    )
+    selected = score_consistency_dimensions or [
         key
         for key in EVALUATION_DIMENSION_KEYS
         if EVALUATION_DIMENSION_LABELS[key] in summary
     ]
     # SOLO-QA can abbreviate a multi-field rejection as “某维度等 N 个维度”.
-    # The omitted names are not recoverable from that sentence, so rewrite all
-    # five descriptions rather than guessing which two were also flagged.
+    # Prefer the exact helper-provided hit fields. If an older helper omitted
+    # those fields, compare against the referenced delivery before falling back.
     multi_match = re.search(r"等\s*([2-5])\s*个维度", summary)
     if (
-        (multi_match and int(multi_match.group(1)) > len(selected))
-        or re.search(r"(?:全部|所有|五)\s*个?维度|五维", summary)
-        or any(marker in summary for marker in ("互斥的数字", "验收统计不一致"))
+        not score_consistency_dimensions
+        and multi_match
+        and int(multi_match.group(1)) > len(selected)
+    ):
+        selected = solo_qa_abbreviated_duplicate_dimensions(
+            row, evaluation, selected, int(multi_match.group(1))
+        )
+    elif (
+        not score_consistency_dimensions
+        and (
+            re.search(r"(?:全部|所有|五)\s*个?维度|五维", summary)
+            or any(marker in summary for marker in ("互斥的数字", "验收统计不一致"))
+        )
     ):
         selected = list(EVALUATION_DIMENSION_KEYS)
     if not selected and (
@@ -9952,7 +10107,9 @@ def solo_qa_returned_evaluation_repair_issues(
     issues: List[str] = []
     for key in selected:
         label = EVALUATION_DIMENSION_LABELS[key]
-        if any(
+        if key in score_consistency_dimensions:
+            reason = f"自动检查的{label}满分与跨维度事实不一致，需要重新核定分数与描述"
+        elif any(
             marker in summary
             for marker in (
                 "重复", "公共长片段", "套模板", "模板相似", "分段复读",
@@ -10360,6 +10517,7 @@ def persist_completed_turn_evaluation_repair(
     output_sha256: str = "",
     repaired_dimensions: Optional[List[str]] = None,
     allow_score_cap_repair: bool = False,
+    allowed_score_repair_dimensions: Optional[List[str]] = None,
 ) -> None:
     """CAS-save a full repaired evaluation without changing completion time."""
     turn_key = f"{row['run_id']}:{int(row['turn_number'])}"
@@ -10384,6 +10542,12 @@ def persist_completed_turn_evaluation_repair(
     repaired_scores = evaluation_score_values(repaired_evaluation)
     if original_scores is None or repaired_scores is None:
         raise WorkflowError("自动修复结果缺少有效的五维分数")
+    allowed_score_dimensions = set(allowed_score_repair_dimensions or [])
+    permitted_score_dimensions = set(
+        solo_qa_score_consistency_repair_dimensions(fresh, original_evaluation)
+    )
+    if allowed_score_dimensions - permitted_score_dimensions:
+        raise WorkflowError("评分自动修复包含质检未要求重评的维度")
     if allow_score_cap_repair:
         if not completed_turn_score_cap_issue(fresh, original_evaluation):
             raise WorkflowError("原评分没有超过 SOLO-QA 总分上限")
@@ -10402,15 +10566,31 @@ def persist_completed_turn_evaluation_repair(
             repaired_score = int(repaired_evaluation[dimension_key]["score"])
         except (KeyError, TypeError, ValueError) as exc:
             raise WorkflowError("自动修复结果缺少有效的五维分数") from exc
-        if not allow_score_cap_repair and repaired_score != original_score:
+        if (
+            not allow_score_cap_repair
+            and dimension_key not in allowed_score_dimensions
+            and repaired_score != original_score
+        ):
             raise WorkflowError(
                 f"{EVALUATION_DIMENSION_LABELS[dimension_key]}资料文字自动修复不能改变原分数"
+            )
+        if (
+            not allow_score_cap_repair
+            and dimension_key in allowed_score_dimensions
+            and repaired_score >= original_score
+        ):
+            raise WorkflowError(
+                f"{EVALUATION_DIMENSION_LABELS[dimension_key]}满分一致性返修必须依据事实下调分数"
             )
         original_dimension = dict(original_evaluation[dimension_key])
         repaired_dimension = dict(repaired_evaluation[dimension_key])
         original_dimension.pop("description", None)
         repaired_dimension.pop("description", None)
-        if not allow_score_cap_repair and repaired_dimension != original_dimension:
+        if (
+            not allow_score_cap_repair
+            and dimension_key not in allowed_score_dimensions
+            and repaired_dimension != original_dimension
+        ):
             raise WorkflowError(
                 f"{EVALUATION_DIMENSION_LABELS[dimension_key]}描述修复不能改变评分或内部证据"
             )
@@ -10419,7 +10599,7 @@ def persist_completed_turn_evaluation_repair(
         "descriptions",
         "_solo_qa_repair_qc_sha256",
     }
-    if allow_score_cap_repair:
+    if allow_score_cap_repair or allowed_score_dimensions:
         public_only_fields.update(
             {
                 "scores",
@@ -10619,6 +10799,13 @@ def evaluation_repair_worker(turn_key: str, source_sha256: str) -> None:
                 raise WorkflowError("评分文字已经没有需要自动修复的问题")
             original = automatic_turn_evaluation(row)
             score_cap_repair = bool(completed_turn_score_cap_issue(row, original))
+            score_consistency_targets = (
+                set()
+                if score_cap_repair
+                else set(
+                    solo_qa_score_consistency_repair_dimensions(row, original)
+                )
+            )
             issues_by_dimension: Dict[str, List[str]] = {
                 key: [] for key in EVALUATION_DIMENSION_KEYS
             }
@@ -10709,32 +10896,86 @@ def evaluation_repair_worker(turn_key: str, source_sha256: str) -> None:
                 update_evaluation_repair_job(
                     turn_key,
                     source_sha256,
-                    stage=f"正在重写{label}描述",
+                    stage=(
+                        f"正在重新核定{label}分数与描述"
+                        if dimension_key in score_consistency_targets
+                        else f"正在重写{label}描述"
+                    ),
                     error="",
                 )
                 transient_attempt = 0
+                semantic_attempt = 0
+                repair_feedback = list(issues_by_dimension[dimension_key])
                 while True:
                     try:
                         with tempfile.TemporaryDirectory(
                             prefix="eval-description-repair-"
                         ) as repair_directory:
-                            description = run_codex_evaluation_description_repair(
-                                Path(repair_directory),
-                                str(row.get("turn_prompt") or ""),
-                                trajectory,
-                                repaired,
-                                dimension_key,
-                                int(row["turn_number"]),
-                                issues_by_dimension[dimension_key],
-                                str(row.get("solo_qa_qc_summary") or ""),
-                                history.get(dimension_key, []),
-                                verification=str(row.get("turn_verification") or ""),
-                                supplemental_evidence=turn_review_grounding_evidence(row),
-                            )
+                            if dimension_key in score_consistency_targets:
+                                try:
+                                    verification_records = json.loads(
+                                        str(row.get("turn_verification") or "[]")
+                                    )
+                                except (json.JSONDecodeError, TypeError) as exc:
+                                    raise WorkflowError(
+                                        "验收结果不是有效 JSON，不能重新核定分数"
+                                    ) from exc
+                                if not isinstance(verification_records, list):
+                                    raise WorkflowError(
+                                        "验收结果格式不正确，不能重新核定分数"
+                                    )
+                                dimension_repair = run_codex_evaluation_dimension_repair(
+                                    Path(repair_directory),
+                                    str(row.get("turn_prompt") or ""),
+                                    verification_records,
+                                    trajectory,
+                                    repaired,
+                                    dimension_key,
+                                    label,
+                                    int(row["turn_number"]),
+                                    "；".join(repair_feedback),
+                                    supplemental_evidence=turn_review_grounding_evidence(row),
+                                    history_exclude_turn_key=turn_key,
+                                    history_exclude_remote_id=str(
+                                        row.get("solo_qa_remote_submission_id") or ""
+                                    ),
+                                    preserve_score=False,
+                                )
+                            else:
+                                description = run_codex_evaluation_description_repair(
+                                    Path(repair_directory),
+                                    str(row.get("turn_prompt") or ""),
+                                    trajectory,
+                                    repaired,
+                                    dimension_key,
+                                    int(row["turn_number"]),
+                                    repair_feedback,
+                                    str(row.get("solo_qa_qc_summary") or ""),
+                                    history.get(dimension_key, []),
+                                    verification=str(row.get("turn_verification") or ""),
+                                    supplemental_evidence=turn_review_grounding_evidence(row),
+                                )
                         break
                     except JobCancelled:
                         raise
                     except Exception as exc:
+                        if (
+                            semantic_attempt < 2
+                            and retryable_review_output_error(str(exc))
+                        ):
+                            semantic_attempt += 1
+                            repair_feedback.append(str(exc))
+                            update_evaluation_repair_job(
+                                turn_key,
+                                source_sha256,
+                                stage=(
+                                    f"{label}证据表述未通过，正在定向重写 "
+                                    f"{semantic_attempt}/2"
+                                ),
+                                error="",
+                            )
+                            ensure_job_active(job_key)
+                            continue
                         if (
                             transient_attempt >= EVALUATION_REPAIR_TRANSIENT_RETRY_LIMIT
                             or not retryable_control_error(str(exc))
@@ -10753,14 +10994,19 @@ def evaluation_repair_worker(turn_key: str, source_sha256: str) -> None:
                         if EVALUATION_REPAIR_TRANSIENT_RETRY_DELAY_SECONDS:
                             time.sleep(EVALUATION_REPAIR_TRANSIENT_RETRY_DELAY_SECONDS)
                         ensure_job_active(job_key)
-                item = repaired.get(dimension_key)
-                if not isinstance(item, dict):
-                    raise WorkflowError(f"缺少{label}评分，无法写回描述")
-                item["description"] = description
-                projected = repaired.get("descriptions")
-                dimension_index = EVALUATION_DIMENSION_KEYS.index(dimension_key)
-                if isinstance(projected, list) and dimension_index < len(projected):
-                    projected[dimension_index] = description
+                if dimension_key in score_consistency_targets:
+                    apply_evaluation_dimension_repair(
+                        repaired, dimension_key, dimension_repair
+                    )
+                else:
+                    item = repaired.get(dimension_key)
+                    if not isinstance(item, dict):
+                        raise WorkflowError(f"缺少{label}评分，无法写回描述")
+                    item["description"] = description
+                    projected = repaired.get("descriptions")
+                    dimension_index = EVALUATION_DIMENSION_KEYS.index(dimension_key)
+                    if isinstance(projected, list) and dimension_index < len(projected):
+                        projected[dimension_index] = description
             returned_qc_fingerprint = solo_qa_returned_evaluation_fingerprint(row)
             if returned_qc_fingerprint:
                 repaired["_solo_qa_repair_qc_sha256"] = returned_qc_fingerprint
@@ -10780,8 +11026,18 @@ def evaluation_repair_worker(turn_key: str, source_sha256: str) -> None:
                         raise WorkflowError("总分校准不能提高任何维度的原始分数")
             else:
                 for dimension_key in EVALUATION_DIMENSION_KEYS:
-                    if int(repaired[dimension_key]["score"]) != int(
-                        original[dimension_key]["score"]
+                    repaired_score = int(repaired[dimension_key]["score"])
+                    original_score = int(original[dimension_key]["score"])
+                    if (
+                        dimension_key in score_consistency_targets
+                        and repaired_score >= original_score
+                    ):
+                        raise WorkflowError(
+                            f"{EVALUATION_DIMENSION_LABELS[dimension_key]}满分一致性返修没有下调分数"
+                        )
+                    if (
+                        dimension_key not in score_consistency_targets
+                        and repaired_score != original_score
                     ):
                         raise WorkflowError(
                             f"{EVALUATION_DIMENSION_LABELS[dimension_key]}资料文字自动修复不能改变原分数"
@@ -10818,6 +11074,7 @@ def evaluation_repair_worker(turn_key: str, source_sha256: str) -> None:
                 repaired,
                 repaired_dimensions=changed_dimensions,
                 allow_score_cap_repair=score_cap_repair,
+                allowed_score_repair_dimensions=list(score_consistency_targets),
             )
             try:
                 add_event(

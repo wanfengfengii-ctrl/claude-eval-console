@@ -10795,7 +10795,7 @@ class ExportTests(unittest.TestCase):
         self.assertIn("推理能力", issues[1])
         self.assertTrue(all("SOLO-QA 打回原文" in issue for issue in issues))
 
-    def test_solo_qa_abbreviated_multi_dimension_return_rewrites_all_five(self):
+    def test_solo_qa_abbreviated_multi_dimension_uses_synced_hit_fields(self):
         row = {
             "solo_qa_state": "needs_fix",
             "solo_qa_remote_submission_id": "8060",
@@ -10807,12 +10807,41 @@ class ExportTests(unittest.TestCase):
             ),
         }
 
-        issues = app.solo_qa_returned_evaluation_repair_issues(
-            row, sample_evaluation()
-        )
+        with mock.patch.object(
+            app,
+            "solo_qa_remote_duplicate_dimensions",
+            return_value=["planning", "reasoning", "execution"],
+        ):
+            issues = app.solo_qa_returned_evaluation_repair_issues(
+                row, sample_evaluation()
+            )
 
-        self.assertEqual(len(issues), 5)
+        self.assertEqual(len(issues), 3)
+        self.assertIn("执行能力", issues[0])
+        self.assertIn("任务规划", issues[1])
+        self.assertIn("推理能力", issues[2])
         self.assertTrue(all("描述与历史点评高度重复" in issue for issue in issues))
+
+    def test_solo_qa_full_score_consistency_targets_only_leading_dimension(self):
+        row = {
+            "solo_qa_state": "needs_fix",
+            "solo_qa_remote_submission_id": "16010",
+            "solo_qa_remote_status": "PENDING_FIX",
+            "solo_qa_remote_updated_at": "2026-09-16T00:40:00",
+            "solo_qa_qc_summary": (
+                "指令遵循：指令遵循给了满分，但交付完整性、推理能力和"
+                "执行能力三段都指出，请求校验曾漏报多个字段错误。"
+            ),
+        }
+        evaluation = sample_evaluation()
+        evaluation["delivery"]["score"] = 4
+        evaluation["reasoning"]["score"] = 4
+        evaluation["execution"]["score"] = 3
+
+        issues = app.solo_qa_returned_evaluation_repair_issues(row, evaluation)
+
+        self.assertEqual(len(issues), 1)
+        self.assertIn("指令遵循满分与跨维度事实不一致", issues[0])
 
     def test_solo_qa_spelling_return_rewrites_all_five_descriptions(self):
         row = {
@@ -11313,6 +11342,80 @@ class ExportTests(unittest.TestCase):
 
         self.assertEqual(row["turn_review_result"], original_review)
         self.assertEqual(row["evaluation_repair_job_status"], "running")
+
+    def test_returned_full_score_consistency_repair_can_lower_named_dimension(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.object(app, "DB_PATH", root / "test.db"), mock.patch.object(
+                app, "DATA_DIR", root
+            ), mock.patch.object(app, "schedule_evaluation_repair"):
+                app.initialize_database()
+                self.insert_completed_turn(root)
+                evaluation = sample_evaluation()
+                evaluation["delivery"]["score"] = 4
+                evaluation["reasoning"]["score"] = 4
+                evaluation["execution"]["score"] = 3
+                app.update_turn(
+                    "abc123abc123",
+                    1,
+                    review_result=json.dumps(
+                        {"evaluation": evaluation}, ensure_ascii=False
+                    ),
+                )
+                timestamp = app.now_text()
+                with app.db_connection() as database:
+                    database.execute(
+                        """INSERT INTO solo_qa_submissions(
+                               run_id, turn_number, remote_submission_id,
+                               remote_status, state, qc_summary,
+                               created_at, updated_at
+                             ) VALUES (?, 1, '16010', 'PENDING_FIX',
+                               'needs_fix', ?, ?, ?)""",
+                        (
+                            "abc123abc123",
+                            "指令遵循：指令遵循给了满分，但交付完整性、推理能力和"
+                            "执行能力三段都指出，请求校验曾漏报多个字段错误。",
+                            timestamp,
+                            timestamp,
+                        ),
+                    )
+                queued = app.queue_completed_turn_evaluation_repairs(
+                    {"turn_keys": ["abc123abc123:1"]}, schedule_jobs=False
+                )
+                row = app.completed_turn_row("abc123abc123:1")
+                source_sha256 = row["evaluation_repair_source_sha256"]
+                self.assertTrue(
+                    app.claim_evaluation_repair_job(
+                        "abc123abc123:1", source_sha256
+                    )
+                )
+                repaired = json.loads(json.dumps(evaluation, ensure_ascii=False))
+                repaired["instruction_following"] = {
+                    "score": 4,
+                    "description": (
+                        "真实接口检查最终通过，但第 1 轮请求校验曾漏报同批字段错误。"
+                        "该遗漏造成校验控制流返工。"
+                    ),
+                }
+                with mock.patch.object(
+                    app,
+                    "completed_description_repair_candidate_policy_issues",
+                    return_value=[],
+                ):
+                    app.persist_completed_turn_evaluation_repair(
+                        row,
+                        source_sha256,
+                        repaired,
+                        repaired_dimensions=["instruction_following"],
+                        allowed_score_repair_dimensions=["instruction_following"],
+                    )
+                saved = app.completed_turn_row("abc123abc123:1")
+
+        self.assertEqual(queued["queued"], 1)
+        self.assertEqual(
+            app.turn_evaluation(saved)["instruction_following"]["score"], 4
+        )
+        self.assertEqual(saved["evaluation_repair_job_status"], "succeeded")
 
     def test_completed_evaluation_repair_cas_stops_after_remote_qc_starts(self):
         with tempfile.TemporaryDirectory() as directory:
