@@ -33,6 +33,99 @@ def sample_evaluation(task_type="0-1 代码生成"):
 
 
 class ValidationTests(unittest.TestCase):
+    def test_score_cap_calibration_is_downward_only_and_updates_v2_mirrors(self):
+        evaluation = sample_evaluation()
+        evaluation["score_stage_version"] = 2
+        evaluation["scores"] = [5, 5, 5, 5, 5]
+        evaluation["descriptions"] = [
+            evaluation[key]["description"] for key in app.EVALUATION_DIMENSION_KEYS
+        ]
+        for field in app.EVALUATION_SCORE_STAGE_DETAIL_FIELDS:
+            evaluation[field] = [
+                f"{field}-{key}" for key in app.EVALUATION_DIMENSION_KEYS
+            ]
+        evaluation["processFindings"] = "评分版本 2；" + "；".join(
+            f"{app.EVALUATION_DIMENSION_LABELS[key]}=5分；事实={key}.py:1"
+            for key in app.EVALUATION_DIMENSION_KEYS
+        )
+        calibration = {"calibrated": True, "reason": "按真实边界事实校准"}
+        for index, key in enumerate(app.EVALUATION_DIMENSION_KEYS):
+            score = 5 if index == 0 else 4
+            calibration[key] = {
+                "score": score,
+                "description": f"第 1 轮在 {key}.py 发现一项真实遗漏。该遗漏造成对应边界没有验证。",
+                "when": f"第 1 轮第 2 步操作 {key}.py",
+                "behavior": f"检查 {key}.py",
+                "impact": "对应边界没有验证",
+                "expected": "应补齐边界检查",
+                "evidenceRefs": f"{key}.py:1",
+                "processFinding": (
+                    f"{app.EVALUATION_DIMENSION_LABELS[key]}={score}分；"
+                    f"事实={key}.py:1"
+                ),
+            }
+
+        adjusted = app.apply_evaluation_score_cap_calibration(
+            evaluation, calibration
+        )
+
+        self.assertEqual(app.evaluation_total_score(evaluation), 25)
+        self.assertEqual(app.evaluation_total_score(adjusted), 21)
+        self.assertEqual(adjusted["scores"], [5, 4, 4, 4, 4])
+        self.assertEqual(
+            adjusted["_score_cap"]["original_scores"], [5, 5, 5, 5, 5]
+        )
+        self.assertEqual(
+            adjusted["_score_cap"]["adjusted_dimensions"],
+            list(app.EVALUATION_DIMENSION_KEYS[1:]),
+        )
+        self.assertEqual(
+            adjusted["descriptions"][1],
+            adjusted["instruction_following"]["description"],
+        )
+
+    def test_score_cap_calibration_rejects_over_reduction_and_score_increase(self):
+        evaluation = sample_evaluation()
+        calibration = {"calibrated": True, "reason": "错误校准"}
+        for key in app.EVALUATION_DIMENSION_KEYS:
+            calibration[key] = {
+                "score": 4,
+                "description": "第 1 轮存在真实遗漏。该遗漏造成边界没有验证。",
+                "when": "第 1 轮第 2 步操作 app.py",
+                "behavior": "检查 app.py",
+                "impact": "边界没有验证",
+                "expected": "应补齐边界检查",
+                "evidenceRefs": "app.py:1",
+                "processFinding": (
+                    f"{app.EVALUATION_DIMENSION_LABELS[key]}=4分；事实=app.py:1"
+                ),
+            }
+        with self.assertRaisesRegex(app.WorkflowError, "恰好收敛到 21 分"):
+            app.apply_evaluation_score_cap_calibration(evaluation, calibration)
+
+        evaluation["delivery"]["score"] = 4
+        calibration["delivery"]["score"] = 5
+        with self.assertRaisesRegex(app.WorkflowError, "只能保持或降低"):
+            app.apply_evaluation_score_cap_calibration(evaluation, calibration)
+
+    def test_score_cap_row_policy_requires_new_version_marker(self):
+        evaluation = sample_evaluation()
+        row = {"solo_qa_state": "not_submitted"}
+        self.assertEqual(
+            app.completed_turn_score_cap_issue(row, evaluation), ""
+        )
+        evaluation["_score_cap_policy_version"] = (
+            app.EVALUATION_SCORE_CAP_POLICY_VERSION
+        )
+        self.assertIn(
+            "最高允许 21 分",
+            app.completed_turn_score_cap_issue(row, evaluation),
+        )
+        row["solo_qa_state"] = "qc_passed"
+        self.assertEqual(
+            app.completed_turn_score_cap_issue(row, evaluation), ""
+        )
+
     def test_evaluation_descriptions_reject_template_phrases(self):
         evaluation = sample_evaluation()
         evaluation["planning"]["description"] = "阶段顺序清楚，最终产物可用。"
@@ -710,7 +803,8 @@ class ValidationTests(unittest.TestCase):
         evaluation["reasoning"] = {
             "score": 4,
             "description": (
-                "第 1 轮边界复现没有及时返回，并记录“probe_timeout_after_2s”。"
+                "后续独立复核发现，第 1 轮边界复现没有及时返回，"
+                "并记录“probe_timeout_after_2s”。"
                 "该结果导致页面输入路径需要补充常数时间拦截。"
             ),
         }
@@ -723,13 +817,84 @@ class ValidationTests(unittest.TestCase):
 
         self.assertEqual(issues, [])
 
+    def test_trace_grounding_requires_source_for_number_only_in_review_evidence(self):
+        evaluation = sample_evaluation()
+        evaluation["execution"] = {
+            "score": 4,
+            "description": (
+                "第 1 轮提交时有约 3505 个 node_modules 文件，并缺少 "
+                "@rollup/rollup-darwin-arm64。这个结果造成依赖目录无法直接复用。"
+            ),
+        }
+
+        issues = app.evaluation_trace_grounding_issues(
+            evaluation,
+            "ASSISTANT FINAL: 已经完成。",
+            supplemental_evidence=(
+                "产物盘点：3505 个 node_modules 文件，"
+                "缺少 @rollup/rollup-darwin-arm64"
+            ),
+        )
+
+        self.assertTrue(
+            any("执行能力描述引用后续独立复核证据但没有注明来源" in issue for issue in issues),
+            issues,
+        )
+
+    def test_trace_grounding_accepts_attributed_review_only_number(self):
+        evaluation = sample_evaluation()
+        evaluation["execution"] = {
+            "score": 4,
+            "description": (
+                "后续产物检查显示，第 1 轮提交中有约 3505 个 node_modules 文件，"
+                "并缺少 @rollup/rollup-darwin-arm64。这个结果造成依赖目录无法直接复用。"
+            ),
+        }
+
+        issues = app.evaluation_trace_grounding_issues(
+            evaluation,
+            "ASSISTANT FINAL: 已经完成。",
+            supplemental_evidence=(
+                "产物盘点：3505 个 node_modules 文件，"
+                "缺少 @rollup/rollup-darwin-arm64"
+            ),
+        )
+
+        self.assertEqual(issues, [])
+
+    def test_trace_grounding_does_not_require_source_for_original_trace_number(self):
+        evaluation = sample_evaluation()
+        evaluation["execution"] = {
+            "score": 4,
+            "description": (
+                "第 1 轮检查输出记录 2679 个文件，提交范围因此需要收窄。"
+                "这个遗漏造成仓库体积增加。"
+            ),
+        }
+        trajectory = (
+            'TOOL Bash: {"command": "find .venv -type f"}\n'
+            "TOOL RESULT: 2679 个文件\n"
+        )
+
+        issues = app.evaluation_trace_grounding_issues(
+            evaluation,
+            trajectory,
+            supplemental_evidence="后续复核也记录 2679 个文件",
+        )
+
+        self.assertFalse(
+            any("引用后续独立复核证据" in issue for issue in issues),
+            issues,
+        )
+
     def test_review_evidence_does_not_count_as_direct_tool_output(self):
         evaluation = sample_evaluation()
         evaluation["planning"] = {
             "score": 4,
             "description": (
                 "第 1 轮修改 stack.spec.ts 时没有预先列出入口隔离检查。"
-                "场景因复用“phantom_probe”辅助函数而需要回头修正，造成返工。"
+                "后续独立复核发现，场景因复用“phantom_probe”辅助函数而需要"
+                "回头修正，造成返工。"
             ),
         }
 
@@ -914,7 +1079,7 @@ class ValidationTests(unittest.TestCase):
             "description": "第 1 轮存在具体不足。该问题造成了实际影响。",
         }
         evaluation["reasoning"]["description"] = (
-            "第 1 轮核对了输入 `1e100000000` 的边界，结果有对应记录。"
+            "后续独立复核发现，第 1 轮输入 `1e100000000` 的边界结果有对应记录。"
         )
         with tempfile.TemporaryDirectory() as directory:
             trajectory_path = Path(directory) / "turn.jsonl"
@@ -3325,6 +3490,110 @@ class ParsingTests(unittest.TestCase):
 
 
 class ReviewTests(unittest.TestCase):
+    def test_regrade_runs_one_joint_calibration_only_when_total_exceeds_cap(self):
+        over_cap = sample_evaluation()
+        over_cap.update({
+            "scores": [5, 5, 5, 5, 5],
+            "descriptions": [
+                over_cap[key]["description"]
+                for key in app.EVALUATION_DIMENSION_KEYS
+            ],
+            "other": "无",
+        })
+        adjusted = json.loads(json.dumps(over_cap, ensure_ascii=False))
+        for key in app.EVALUATION_DIMENSION_KEYS[1:]:
+            adjusted[key]["score"] = 4
+        adjusted["scores"] = [5, 4, 4, 4, 4]
+        with mock.patch.object(
+            app, "run_codex_split_regrade", return_value=over_cap
+        ), mock.patch.object(
+            app,
+            "review_evaluation_with_manual_fallback",
+            side_effect=lambda evaluation, *_args, **_kwargs: (evaluation, ""),
+        ), mock.patch.object(
+            app,
+            "run_codex_evaluation_score_cap_calibration",
+            return_value=adjusted,
+        ) as calibrate:
+            result = app.run_codex_regrade(
+                Path("."), "题面", [], "轨迹", 1
+            )
+
+        calibrate.assert_called_once()
+        self.assertEqual(result["scores"], [5, 4, 4, 4, 4])
+        self.assertEqual(app.evaluation_total_score(result), 21)
+
+    def test_regrade_preserves_over_cap_scores_and_warns_when_calibration_fails(self):
+        over_cap = sample_evaluation()
+        over_cap.update({
+            "scores": [5, 5, 5, 5, 5],
+            "descriptions": [
+                over_cap[key]["description"]
+                for key in app.EVALUATION_DIMENSION_KEYS
+            ],
+            "other": "无",
+        })
+        with mock.patch.object(
+            app, "run_codex_split_regrade", return_value=over_cap
+        ), mock.patch.object(
+            app,
+            "review_evaluation_with_manual_fallback",
+            return_value=(over_cap, ""),
+        ), mock.patch.object(
+            app,
+            "run_codex_evaluation_score_cap_calibration",
+            side_effect=app.WorkflowError("没有可用降分事实"),
+        ):
+            result = app.run_codex_regrade(
+                Path("."), "题面", [], "轨迹", 1
+            )
+
+        self.assertEqual(result["scores"], [5, 5, 5, 5, 5])
+        self.assertIn("保留原始证据评分并阻止提交", result["_evaluation_warning"])
+
+    def test_generation_failure_codes_keep_semantic_and_style_causes_separate(self):
+        self.assertEqual(
+            app.generation_failure_codes("与历史题面重复"),
+            ["HISTORY_DUPLICATE"],
+        )
+        self.assertEqual(
+            app.generation_failure_codes("题面表达模板化"),
+            ["STYLE_ONLY"],
+        )
+
+    def test_generation_call_metrics_record_prompt_cost_and_attempts(self):
+        previous = app.current_job_key()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.object(app, "DB_PATH", root / "test.db"), mock.patch.object(
+                app, "DATA_DIR", root
+            ), mock.patch.object(
+                app, "run_codex_structured", return_value={"ok": True}
+            ):
+                app.initialize_database()
+                app.CODEX_JOB_CONTEXT.key = "generation:test-run"
+                try:
+                    app.run_codex_generation_structured(
+                        "精简题面",
+                        {"type": "object"},
+                        root,
+                        "task-generation",
+                        120,
+                        reasoning_effort="medium",
+                    )
+                finally:
+                    app.CODEX_JOB_CONTEXT.key = previous
+                with app.db_connection() as database:
+                    metric = database.execute(
+                        "SELECT * FROM generation_call_metrics"
+                    ).fetchone()
+
+        self.assertEqual(metric["job_key"], "generation:test-run")
+        self.assertEqual(metric["prefix"], "task-generation")
+        self.assertEqual(metric["prompt_chars"], len("精简题面"))
+        self.assertEqual(metric["attempt_count"], 1)
+        self.assertEqual(metric["status"], "complete")
+
     def test_generation_structured_retries_only_transient_capacity_failure(self):
         with tempfile.TemporaryDirectory() as directory, mock.patch.object(
             app,
@@ -3721,6 +3990,8 @@ class ReviewTests(unittest.TestCase):
             app,
             "normalize_evaluation_with_targeted_repairs",
             side_effect=exhausted,
+        ), mock.patch.object(
+            app, "SOLO_QA_MAX_TOTAL_SCORE", 25
         ):
             result = app.score_review_findings(
                 findings,
@@ -3892,7 +4163,7 @@ class ReviewTests(unittest.TestCase):
         self.assertEqual(len(dimension_calls), 5)
         for call in runner.call_args_list:
             self.assertEqual(call.kwargs["sandbox"], "read-only")
-            self.assertEqual(call.kwargs["reasoning_effort"], "low")
+            self.assertEqual(call.kwargs["reasoning_effort"], "medium")
         self.assertEqual(result["task_type"], "Feature 迭代")
 
     def test_codex_review_uses_pinned_model_and_structured_output(self):
@@ -6327,6 +6598,10 @@ class DraftTests(unittest.TestCase):
         self.assertEqual(draft["project_number"], "0001")
         self.assertEqual(draft["task_type"], "0-1 代码生成")
         self.assertEqual(draft["task_difficulty"], "待评估")
+        self.assertEqual(
+            draft["difficulty_contract"]["estimated_task_difficulty"], "困难"
+        )
+        self.assertEqual(draft["difficulty_contract"]["axis"], "状态不变量")
         self.assertEqual(draft["first_prompt"], self.candidate()["prompt"])
         self.assertNotIn("项目编号", draft["first_prompt"])
         self.assertNotIn("\n", draft["first_prompt"])
@@ -6506,7 +6781,7 @@ class DraftTests(unittest.TestCase):
         self.assertEqual(draft["repo_name"], alternate["repo_slug"])
         self.assertEqual(validate.call_count, 2)
         rewrite.assert_not_called()
-        self.assertIn("当前候选与历史题面实质重复，改用下一候选", progress)
+        self.assertIn("当前候选与历史题面实质重复，按需生成下一候选", progress)
 
     def test_task_generation_has_a_ten_minute_overall_deadline(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -6550,8 +6825,8 @@ class DraftTests(unittest.TestCase):
             app.run_codex_task_generation(2, "纯前端", [])
 
         schema = codex.call_args.args[1]
-        self.assertEqual(schema["properties"]["candidates"]["minItems"], 2)
-        self.assertEqual(schema["properties"]["candidates"]["maxItems"], 2)
+        self.assertEqual(schema["properties"]["candidates"]["minItems"], 1)
+        self.assertEqual(schema["properties"]["candidates"]["maxItems"], 1)
         properties = schema["properties"]["candidates"]["items"]["properties"]
         self.assertNotIn("task_difficulty", properties)
         for field in app.TASK_DIVERSITY_FIELDS:
@@ -6562,7 +6837,7 @@ class DraftTests(unittest.TestCase):
         self.assertIn("目标约 450 字", generation_prompt)
         self.assertIn("300 至 520 字", generation_prompt)
         self.assertIn("不能成为主体", generation_prompt)
-        self.assertIn("不能只替换业务名词", generation_prompt)
+        self.assertIn("只会在它无法通过或无法定向修复时再请求下一候选", generation_prompt)
         self.assertIn("最后 160 字", generation_prompt)
         self.assertIn("最多出现 3 种", generation_prompt)
         self.assertIn("这是写作偏好", generation_prompt)
@@ -6575,6 +6850,10 @@ class DraftTests(unittest.TestCase):
         self.assertNotIn("复杂度控制在中等偏易", generation_prompt)
         self.assertIn("预计必须达到困难或地狱", generation_prompt)
         self.assertIn("题面正文不得出现难度标签", generation_prompt)
+        self.assertIn(app.GENERATION_DIFFICULTY_AXIS_GUIDANCE, generation_prompt)
+        self.assertIn("设计 1 道", generation_prompt)
+        self.assertNotIn("一次设计 2 道", generation_prompt)
+        self.assertEqual(codex.call_args.kwargs["reasoning_effort"], "medium")
 
     def test_task_batch_rejects_repeated_scope_dimensions(self):
         first = app.validate_generated_task(
@@ -6616,11 +6895,15 @@ class DraftTests(unittest.TestCase):
         schema = codex.call_args.args[1]
         self.assertIn("estimated_task_difficulty", schema["properties"])
         self.assertIn("difficulty_evidence", schema["properties"])
+        self.assertIn("difficulty_contract", schema["properties"])
         self.assertIn("只有同时满足这些硬条件", codex.call_args.args[0])
         self.assertIn("estimated_task_difficulty 为困难或地狱", codex.call_args.args[0])
         self.assertIn("scope_review", schema["properties"])
         self.assertIn("soft_suggestions", schema["properties"])
         self.assertIn("不能照抄或信任候选题自报的范围字段", codex.call_args.args[0])
+        self.assertIn(app.REVIEW_DIFFICULTY_AXIS_GUIDANCE, codex.call_args.args[0])
+        self.assertIn(app.DIFFICULTY_CONTRACT_REVIEW_GUIDANCE, codex.call_args.args[0])
+        self.assertEqual(codex.call_args.kwargs["reasoning_effort"], "medium")
 
     def test_local_task_validation_rejects_generic_systems_overcomplexity_and_forbidden_topics(self):
         candidate = self.candidate()
@@ -7017,6 +7300,11 @@ class DraftTests(unittest.TestCase):
                 app.automatic_generation_worker(created["id"])
                 exhausted = app.serialize_run(app.run_row(created["id"]))
                 configuration = app.auto_refill_configuration()
+                with app.db_connection() as database:
+                    failures = database.execute(
+                        "SELECT value FROM settings "
+                        "WHERE key = 'auto_refill_consecutive_failures'"
+                    ).fetchone()["value"]
 
             self.assertEqual(retrying["phase"], "generation_queued")
             self.assertEqual(retrying["generation_retry_count"], 1)
@@ -7024,7 +7312,8 @@ class DraftTests(unittest.TestCase):
             self.assertEqual(exhausted["project_number"], "0001")
             self.assertEqual(exhausted["generation_retry_count"], 1)
             self.assertTrue(configuration["enabled"])
-            self.assertIn("连续 1/3", configuration["detail"])
+            self.assertIn("跳过未通过题面校验", configuration["detail"])
+            self.assertEqual(failures, "0")
             scheduler.assert_called_once_with(
                 created["id"], "generation_queued", app.automatic_generation_worker
             )
@@ -7033,6 +7322,20 @@ class DraftTests(unittest.TestCase):
             self.assertEqual(
                 generate.call_args_list[1].kwargs["initial_feedback"], rejection
             )
+
+    def test_generation_candidate_rejection_is_not_an_infrastructure_failure(self):
+        self.assertTrue(app.task_generation_candidate_quality_failure(
+            "候选复核与一次定向改写后仍不合规：范围超过预算"
+        ))
+        self.assertTrue(app.task_generation_candidate_quality_failure(
+            f"连续 {app.TASK_GENERATION_BATCH_ATTEMPTS} 批未生成合规题目：边界不明确"
+        ))
+        self.assertFalse(app.task_generation_candidate_quality_failure(
+            "task-generation 超时，已停止"
+        ))
+        self.assertFalse(app.task_generation_candidate_quality_failure(
+            "API 请求失败：连接中断"
+        ))
 
     def test_cancelled_generation_is_stopped_without_counting_auto_refill_failure(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -7096,14 +7399,18 @@ class AutoRefillTests(unittest.TestCase):
         auto_refill=0,
         task_type=None,
         prompt="需求",
+        task_difficulty="待评估",
+        difficulty_contract=None,
     ):
         timestamp = app.now_text()
+        contract = json.dumps(difficulty_contract or {}, ensure_ascii=False)
         database.execute(
             """INSERT INTO runs(
                  id, repo_name, repo_path, run_directory, repo_url, phase,
                  first_prompt, first_prompt_id, container_cleaned, task_type,
-                 source_run_id, auto_refill, verification_commands, created_at, updated_at
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, 'prompt-1', 1, ?, ?, ?, '[]', ?, ?)""",
+                 source_run_id, auto_refill, task_difficulty, difficulty_contract,
+                 verification_commands, created_at, updated_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, 'prompt-1', 1, ?, ?, ?, ?, ?, '[]', ?, ?)""",
             (
                 run_id,
                 repo_name,
@@ -7115,6 +7422,8 @@ class AutoRefillTests(unittest.TestCase):
                 task_type or ("Feature 迭代" if source_run_id else "0-1 代码生成"),
                 source_run_id,
                 auto_refill,
+                task_difficulty,
+                contract,
                 timestamp,
                 timestamp,
             ),
@@ -7566,6 +7875,84 @@ class AutoRefillTests(unittest.TestCase):
                 self.assertEqual(
                     app.automatic_iteration_task_type(state), "Feature 迭代"
                 )
+
+    def test_medium_delivery_with_contract_forces_feature_recovery(self):
+        contract = {
+            "version": 1,
+            "estimated_task_difficulty": "困难",
+            "axis": "状态不变量",
+            "hard_requirement": "断点恢复后必须保持批次状态唯一",
+            "acceptance_evidence": ["中断后从最后确认点继续"],
+            "rejected_shortcut": "只保存一个完成标记无法恢复分段状态",
+            "difficulty_evidence": ["跨进程维护恢复状态"],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            with mock.patch.object(app, "DB_PATH", root / "test.db"), mock.patch.object(
+                app, "DATA_DIR", root
+            ):
+                app.initialize_database()
+                with app.db_connection() as database:
+                    self.insert_run(
+                        database,
+                        "medium111111",
+                        "medium-project",
+                        task_difficulty="中等",
+                        difficulty_contract=contract,
+                    )
+                    self.insert_run(
+                        database,
+                        "hard11111111",
+                        "hard-project",
+                        task_difficulty="困难",
+                        difficulty_contract=contract,
+                    )
+
+                candidate = app.auto_refill_iteration_candidate()
+                recovery = app.auto_refill_iteration_candidate(
+                    difficulty_recovery_only=True
+                )
+                state = app.iteration_lineage_state("medium111111")
+
+        self.assertEqual(candidate["id"], "medium111111")
+        self.assertEqual(recovery["id"], "medium111111")
+        self.assertTrue(state["difficulty_recovery_required"])
+        self.assertEqual(
+            app.automatic_iteration_task_type(state), "Feature 迭代"
+        )
+        self.assertEqual(
+            state["latest_product_difficulty_contract"]["hard_requirement"],
+            "断点恢复后必须保持批次状态唯一",
+        )
+
+    def test_difficulty_recovery_runs_even_when_normal_refill_is_disabled(self):
+        source = {
+            "id": "medium111111",
+            "repo_name": "medium-project",
+            "iteration_count": 0,
+            "difficulty_recovery_required": True,
+            "latest_product_task_difficulty": "中等",
+            "next_iteration_task_type": "Feature 迭代",
+        }
+        with mock.patch.object(
+            app,
+            "auto_refill_configuration",
+            return_value={"enabled": False},
+        ), mock.patch.object(
+            app, "automatic_refill_occupancy", return_value=0
+        ), mock.patch.object(
+            app, "auto_refill_iteration_candidate", return_value=source
+        ) as select, mock.patch.object(
+            app,
+            "queue_refill_iteration",
+            return_value={"status": "generating", "task_type": "Feature 迭代"},
+        ) as queue, mock.patch.object(app, "record_auto_refill_detail"):
+            result = app.automatic_refill_once()
+
+        select.assert_called_once_with(difficulty_recovery_only=True)
+        queue.assert_called_once_with("medium111111")
+        self.assertEqual(result["action"], "iteration")
+        self.assertIn("难度止损", result["detail"])
 
     def test_refill_prefers_feature_iteration_then_falls_back_to_new_0_1(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -8173,6 +8560,119 @@ class IterationGenerationTests(unittest.TestCase):
         self.assertIn("通用技术词不构成重复", prompt)
         self.assertIn("同一主接口、同一页面流程或同一状态机", prompt)
         self.assertIn("开发动作、输入校验、失败结果和验收结构", prompt)
+        self.assertEqual(codex.call_args.kwargs["reasoning_effort"], "medium")
+
+    def test_prompt_context_is_bounded_and_history_is_ranked_for_review(self):
+        candidate = self.candidate()
+        history = [
+            {
+                "reference": f"SOLO-QA #{number}",
+                "prompt": f"完全不同的历史流程 {number}。" * 80,
+                "task_type": "Feature 迭代",
+                "dedup_required": True,
+            }
+            for number in range(20)
+        ]
+        history[-1]["prompt"] = candidate["prompt"]
+        context = {
+            "repo_path": "/tmp/example",
+            "readme": "说明" * 9000,
+            "original_or_current_prompt": "原题" * 5000,
+            "tracked_files": [f"src/{number}.py" for number in range(220)],
+            "iteration_history": history,
+            "repository_prompt_history": history,
+        }
+
+        compact = app.compact_iteration_prompt_context(
+            context,
+            candidate,
+            repository_limit=app.ITERATION_REVIEW_HISTORY_LIMIT,
+        )
+
+        self.assertLessEqual(len(compact["readme"]), 8000)
+        self.assertLessEqual(len(compact["original_or_current_prompt"]), 6000)
+        self.assertEqual(len(compact["tracked_files"]), 160)
+        self.assertEqual(
+            len(compact["repository_prompt_history"]),
+            app.ITERATION_REVIEW_HISTORY_LIMIT,
+        )
+        self.assertEqual(
+            compact["repository_prompt_history"][0]["reference"],
+            "SOLO-QA #19",
+        )
+        self.assertLessEqual(
+            len(compact["repository_prompt_history"][0]["prompt"]), 700
+        )
+
+    def test_low_risk_cross_repo_history_skips_extra_semantic_model_call(self):
+        candidate = self.candidate()
+        context = {
+            "repo_path": "/tmp/existing-project",
+            "repo_name": "demo",
+            "repo_key": "example/demo",
+            "repository_prompt_history": [{
+                "reference": "SOLO-QA #10",
+                "prompt": "仓库最初只实现样本登记和基础详情查看。",
+                "task_type": "0-1 代码生成",
+                "dedup_required": True,
+            }],
+        }
+        source = {
+            "phase": "complete",
+            "container_cleaned": 1,
+            "repo_url": "https://example.invalid/demo",
+            "first_prompt_id": "prompt-1",
+        }
+        low_risk = [{
+            "reference": "SOLO-QA #77",
+            "prompt": "一本书的目录页面需要增加只读页码展示。",
+            "task_type": "Feature 迭代",
+            "lexical_similarity": 0.08,
+            "bigram_containment": 0.05,
+            "dedup_required": True,
+        }]
+        with mock.patch.object(app, "run_row", return_value=source), mock.patch.object(
+            app, "iteration_project_context", return_value=context
+        ), mock.patch.object(
+            app, "run_codex_iteration_generation", return_value=candidate
+        ), mock.patch.object(
+            app, "global_prompt_dedup_history", return_value=low_risk
+        ), mock.patch.object(
+            app, "run_codex_iteration_validation", return_value=self.review_result()
+        ), mock.patch.object(
+            app, "run_codex_prompt_dedup_validation"
+        ) as dedup:
+            result = app.generate_iteration_candidate("source111111")
+
+        self.assertEqual(result["prompt"], candidate["prompt"])
+        dedup.assert_not_called()
+
+    def test_style_only_review_uses_local_repair_without_full_rereview(self):
+        candidate = self.candidate()
+        review = self.review_result()
+        review["scope_review"]["ai_style_issues"] = ["结尾集中罗列测试清单"]
+        context = {"repo_path": "/tmp/existing-project", "repo_name": "demo"}
+        source = {
+            "phase": "complete",
+            "container_cleaned": 1,
+            "repo_url": "https://example.invalid/demo",
+            "first_prompt_id": "prompt-1",
+        }
+        with mock.patch.object(app, "run_row", return_value=source), mock.patch.object(
+            app, "iteration_project_context", return_value=context
+        ), mock.patch.object(
+            app, "run_codex_iteration_generation", return_value=candidate
+        ) as generate, mock.patch.object(
+            app, "run_codex_iteration_validation", return_value=review
+        ) as validate, mock.patch.object(
+            app, "run_codex_iteration_format_repair", return_value=candidate
+        ) as repair:
+            result = app.generate_iteration_candidate("source111111")
+
+        self.assertEqual(result["prompt"], candidate["prompt"])
+        generate.assert_called_once()
+        validate.assert_called_once()
+        repair.assert_called_once()
 
     def test_repository_key_matches_fallback_without_cross_owner_collision(self):
         self.assertEqual(
@@ -8197,7 +8697,31 @@ class IterationGenerationTests(unittest.TestCase):
         self.assertEqual(codex.call_args.args[2], Path("/tmp/existing-project"))
         self.assertEqual(codex.call_args.kwargs["model"], "gpt-5.6-sol")
         self.assertIn(app.DEVELOPER_PROMPT_STYLE_GUIDANCE, codex.call_args.args[0])
+        self.assertIn(app.GENERATION_DIFFICULTY_AXIS_GUIDANCE, codex.call_args.args[0])
         self.assertIn("repository_prompt_history", codex.call_args.args[0])
+
+    def test_medium_delivery_recovery_prompt_keeps_project_and_changes_axis(self):
+        context = {
+            "repo_path": "/tmp/existing-project",
+            "repo_name": "demo",
+            "difficulty_recovery": {
+                "required": True,
+                "previous_actual_difficulty": "中等",
+                "previous_contract": {
+                    "hard_requirement": "断点恢复必须保持状态唯一",
+                    "rejected_shortcut": "单一完成标记无法恢复分段状态",
+                },
+            },
+        }
+        with mock.patch.object(
+            app, "run_codex_structured", return_value=self.candidate()
+        ) as codex:
+            app.run_codex_iteration_generation(context)
+
+        generation_prompt = codex.call_args.args[0]
+        self.assertIn("代码成果必须继续作为本轮基线", generation_prompt)
+        self.assertIn("不得废弃或重新出同一道题", generation_prompt)
+        self.assertIn("与上一题不同的 Feature 扩展轴", generation_prompt)
 
     def test_new_module_generation_schema_has_scope_caps(self):
         context = {"repo_path": "/tmp/existing-project", "repo_name": "demo"}
@@ -8336,15 +8860,19 @@ class IterationGenerationTests(unittest.TestCase):
 
         review_prompt, schema = codex.call_args.args[:2]
         self.assertIn(app.DEVELOPER_PROMPT_STYLE_GUIDANCE, review_prompt)
-        self.assertIn("即使技术内容完整也必须 approved=false", review_prompt)
+        self.assertIn("这属于可局部修复的表达问题", review_prompt)
+        self.assertIn("不要仅因此令 approved=false", review_prompt)
         self.assertIn("不运行完整测试套件", review_prompt)
         self.assertIn("estimated_task_difficulty", schema["properties"])
         self.assertIn("difficulty_evidence", schema["properties"])
+        self.assertIn("difficulty_contract", schema["properties"])
         self.assertIn("只有预估为困难或地狱才可 approved=true", review_prompt)
+        self.assertIn(app.REVIEW_DIFFICULTY_AXIS_GUIDANCE, review_prompt)
+        self.assertIn(app.DIFFICULTY_CONTRACT_REVIEW_GUIDANCE, review_prompt)
         self.assertEqual(
             codex.call_args.args[4], app.ITERATION_VALIDATION_TIMEOUT_SECONDS
         )
-        self.assertEqual(codex.call_args.kwargs["reasoning_effort"], "low")
+        self.assertEqual(codex.call_args.kwargs["reasoning_effort"], "medium")
 
     def test_new_module_review_rejects_combined_complex_mechanisms(self):
         context = {"repo_path": "/tmp/existing-project", "repo_name": "demo"}
@@ -8442,7 +8970,16 @@ class IterationGenerationTests(unittest.TestCase):
         ), mock.patch.object(
             app, "run_codex_iteration_generation", return_value=candidate
         ) as generate, mock.patch.object(
-            app, "global_prompt_dedup_history", return_value=[]
+            app,
+            "global_prompt_dedup_history",
+            return_value=[{
+                "reference": "SOLO-QA #88",
+                "prompt": candidate["prompt"],
+                "task_type": "Feature 迭代",
+                "lexical_similarity": 0.91,
+                "bigram_containment": 0.86,
+                "dedup_required": True,
+            }],
         ), mock.patch.object(
             app, "run_codex_iteration_validation", return_value=self.review_result()
         ), mock.patch.object(
@@ -8588,15 +9125,20 @@ class IterationGenerationTests(unittest.TestCase):
             side_effect=[self.candidate(), self.candidate()],
         ) as generate, mock.patch.object(
             app,
+            "run_codex_iteration_targeted_repair",
+            return_value=self.candidate(),
+        ) as repair, mock.patch.object(
+            app,
             "run_codex_iteration_validation",
             side_effect=[medium_review, self.review_result()],
         ) as review:
             prompt = app.generate_iteration_prompt("source111111")
 
         self.assertEqual(prompt, self.candidate()["prompt"])
-        self.assertEqual(generate.call_count, 2)
+        self.assertEqual(generate.call_count, 1)
+        repair.assert_called_once()
         self.assertEqual(review.call_count, 2)
-        self.assertIn("未达到困难：中等", generate.call_args_list[1].args[1])
+        self.assertIn("未达到困难：中等", repair.call_args.args[3])
 
     def test_iteration_generation_accepts_stopped_completed_baseline(self):
         context = {"repo_path": "/tmp/existing-project", "repo_name": "demo"}
@@ -8681,6 +9223,7 @@ class IterationGenerationTests(unittest.TestCase):
         self.assertNotIn("请修复", prompt)
         self.assertEqual(len(result["confirmed_bugs"]), 4)
         self.assertIn("程序只把 scope_summary", codex.call_args.args[0])
+        self.assertIn("实际执行的检查命令及关键结果摘要", codex.call_args.args[0])
         self.assertEqual(
             codex.call_args.args[4],
             app.BUGFIX_GENERATION_ATTEMPT_TIMEOUT_SECONDS,
@@ -8695,6 +9238,7 @@ class IterationGenerationTests(unittest.TestCase):
         self.assertEqual(bug_schema["actual"]["maxLength"], 18)
         self.assertEqual(bug_schema["expected"]["minLength"], 8)
         self.assertEqual(bug_schema["expected"]["maxLength"], 18)
+        self.assertEqual(codex.call_args.kwargs["reasoning_effort"], "medium")
 
     def test_first_bugfix_prompt_uses_only_scope_and_customer_summaries(self):
         candidate = self.bugfix_candidate()
@@ -8813,6 +9357,19 @@ class IterationGenerationTests(unittest.TestCase):
             app.iteration_review_scope_errors(approved, "Bug 修复")[0],
         )
 
+    def test_bugfix_review_reuses_complete_generation_evidence(self):
+        context = {"repo_path": "/tmp/existing-project", "repo_name": "demo"}
+        with mock.patch.object(
+            app,
+            "run_codex_structured",
+            return_value=self.review_result("Bug 修复"),
+        ) as codex:
+            app.run_codex_bugfix_validation(context, self.bugfix_candidate())
+
+        review_prompt = codex.call_args.args[0]
+        self.assertIn("证据完整且相互一致时不要重复执行同一检查", review_prompt)
+        self.assertIn("证据缺失、矛盾或无法对应当前提交时才补跑", review_prompt)
+
     def test_bugfix_review_rejects_medium_and_generation_prompt_allows_skip(self):
         review = {
             "approved": False,
@@ -8839,6 +9396,7 @@ class IterationGenerationTests(unittest.TestCase):
         ) as codex:
             app.run_codex_bugfix_generation(context)
         self.assertIn("若当前代码没有这种组合", codex.call_args.args[0])
+        self.assertIn(app.GENERATION_DIFFICULTY_AXIS_GUIDANCE, codex.call_args.args[0])
 
     def test_bugfix_candidate_keeps_independent_review_and_source_commit(self):
         candidate = self.bugfix_candidate()
@@ -8904,7 +9462,7 @@ class IterationGenerationTests(unittest.TestCase):
         self.assertEqual(
             codex.call_args.args[4], app.ITERATION_GENERATION_ATTEMPT_TIMEOUT_SECONDS
         )
-        self.assertEqual(codex.call_args.kwargs["reasoning_effort"], "low")
+        self.assertEqual(codex.call_args.kwargs["reasoning_effort"], "medium")
         self.assertEqual(
             app.validate_generated_iteration(candidate, "0-1 代码生成"),
             candidate["prompt"],
@@ -9542,6 +10100,140 @@ class ExportTests(unittest.TestCase):
             )
         return repo
 
+    def test_new_score_policy_blocks_over_21_and_offers_automatic_repair(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.object(app, "DB_PATH", root / "test.db"), mock.patch.object(
+                app, "DATA_DIR", root
+            ):
+                app.initialize_database()
+                self.insert_completed_turn(root)
+                old_row = app.completed_turn_rows()[0]
+                old_ready, old_issues = app.export_readiness(old_row)
+                old_summary = app.completed_turns()[0]
+                evaluation = sample_evaluation()
+                evaluation["_score_cap_policy_version"] = (
+                    app.EVALUATION_SCORE_CAP_POLICY_VERSION
+                )
+                app.update_turn(
+                    "abc123abc123",
+                    1,
+                    review_result=json.dumps(
+                        {"evaluation": evaluation}, ensure_ascii=False
+                    ),
+                )
+                row = app.completed_turn_rows()[0]
+                export_ready, export_issues = app.export_readiness(row)
+                solo_ready, solo_issues = app.solo_qa_readiness(row)
+                summary = app.completed_turns()[0]
+
+        self.assertTrue(old_ready, old_issues)
+        self.assertFalse(old_summary["score_cap_applies"])
+        self.assertFalse(export_ready)
+        self.assertFalse(solo_ready)
+        self.assertTrue(any("最高允许 21 分" in issue for issue in export_issues))
+        self.assertTrue(any("最高允许 21 分" in issue for issue in solo_issues))
+        self.assertEqual(summary["score_total"], 25)
+        self.assertEqual(summary["score_max_total"], 21)
+        self.assertTrue(summary["score_cap_applies"])
+        self.assertEqual(summary["evaluation_repair"]["status"], "needed")
+
+    def test_manual_score_save_rejects_over_cap_only_for_new_policy_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.object(app, "DB_PATH", root / "test.db"), mock.patch.object(
+                app, "DATA_DIR", root
+            ):
+                app.initialize_database()
+                self.insert_completed_turn(root)
+                evaluation = sample_evaluation()
+                evaluation["_score_cap_policy_version"] = (
+                    app.EVALUATION_SCORE_CAP_POLICY_VERSION
+                )
+                app.update_turn(
+                    "abc123abc123",
+                    1,
+                    review_result=json.dumps(
+                        {"evaluation": evaluation}, ensure_ascii=False
+                    ),
+                )
+                manual = {
+                    key: dict(sample_evaluation()[key])
+                    for key in app.EVALUATION_DIMENSION_KEYS
+                }
+                with self.assertRaisesRegex(
+                    app.WorkflowError, "最高允许 21 分"
+                ):
+                    app.save_completed_turn_evaluation({
+                        "turn_key": "abc123abc123:1",
+                        "evaluation": manual,
+                    })
+
+    def test_score_cap_auto_repair_can_atomically_persist_lower_scores(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.object(app, "DB_PATH", root / "test.db"), mock.patch.object(
+                app, "DATA_DIR", root
+            ):
+                app.initialize_database()
+                self.insert_completed_turn(root)
+                original = sample_evaluation()
+                original["_score_cap_policy_version"] = (
+                    app.EVALUATION_SCORE_CAP_POLICY_VERSION
+                )
+                app.update_turn(
+                    "abc123abc123",
+                    1,
+                    review_result=json.dumps(
+                        {"evaluation": original}, ensure_ascii=False
+                    ),
+                )
+                queued = app.queue_completed_turn_evaluation_repairs(
+                    {"turn_keys": ["abc123abc123:1"]}, schedule_jobs=False
+                )
+                source_sha256 = app.completed_turns()[0][
+                    "evaluation_repair"
+                ]["revision"]
+                self.assertTrue(
+                    app.claim_evaluation_repair_job(
+                        "abc123abc123:1", source_sha256
+                    )
+                )
+                repaired = json.loads(json.dumps(original, ensure_ascii=False))
+                for key in app.EVALUATION_DIMENSION_KEYS[1:]:
+                    repaired[key] = {
+                        "score": 4,
+                        "description": (
+                            f"第 1 轮检查 {key}.py 时遗漏了一项边界。"
+                            "该遗漏造成对应路径没有验证。"
+                        ),
+                    }
+                repaired["_score_cap"] = {
+                    "policy_version": app.EVALUATION_SCORE_CAP_POLICY_VERSION,
+                    "max_total": 21,
+                    "original_scores": [5, 5, 5, 5, 5],
+                    "adjusted_scores": [5, 4, 4, 4, 4],
+                    "adjusted_dimensions": list(
+                        app.EVALUATION_DIMENSION_KEYS[1:]
+                    ),
+                    "reason": "依据真实边界事实校准",
+                }
+                row = app.completed_turn_rows()[0]
+                app.persist_completed_turn_evaluation_repair(
+                    row,
+                    source_sha256,
+                    repaired,
+                    repaired_dimensions=list(app.EVALUATION_DIMENSION_KEYS[1:]),
+                    allow_score_cap_repair=True,
+                )
+                saved = app.completed_turn_rows()[0]
+                job = app.completed_turns()[0]["evaluation_repair"]
+
+        self.assertEqual(queued["queued"], 1)
+        self.assertEqual(app.evaluation_total_score(app.turn_evaluation(saved)), 21)
+        self.assertEqual(job["status"], "succeeded")
+
+
     def test_english_dominant_public_description_is_targeted_for_repair(self):
         evaluation = sample_evaluation()
         evaluation["delivery"]["description"] = (
@@ -9612,6 +10304,101 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(result, replacement)
         self.assertIn("分数固定为 5 分", runner.call_args.args[0])
         self.assertIn("不得返回或改变分数", runner.call_args.args[0])
+
+    def test_description_repair_keeps_review_fact_with_explicit_source(self):
+        evaluation = sample_evaluation()
+        evaluation["execution"] = {
+            "score": 4,
+            "description": "第 1 轮提交了大量依赖文件，造成仓库体积增加。",
+        }
+        replacement = (
+            "后续产物检查显示，第 1 轮提交中有 4803 个依赖文件进入版本控制。"
+            "这个遗漏造成仓库体积增加。"
+        )
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            app,
+            "run_codex_structured",
+            return_value={"description": replacement},
+        ) as runner:
+            result = app.run_codex_evaluation_description_repair(
+                Path(directory),
+                "不要提交依赖目录",
+                "ASSISTANT FINAL: 已经完成。",
+                evaluation,
+                "execution",
+                1,
+                ["执行能力描述引用后续独立复核证据但没有注明来源"],
+                supplemental_evidence="产物盘点发现 4803 个依赖文件进入版本控制",
+            )
+
+        self.assertEqual(result, replacement)
+        prompt = runner.call_args.args[0]
+        self.assertIn("后续独立代码复核证据", prompt)
+        self.assertIn("后续产物检查显示", prompt)
+
+    def test_description_repair_rejects_unattributed_review_only_number(self):
+        evaluation = sample_evaluation()
+        evaluation["execution"] = {
+            "score": 4,
+            "description": "第 1 轮提交了大量依赖文件，造成仓库体积增加。",
+        }
+        replacement = (
+            "第 1 轮提交中有 4803 个依赖文件进入版本控制。"
+            "这个遗漏造成仓库体积增加。"
+        )
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            app,
+            "run_codex_structured",
+            return_value={"description": replacement},
+        ):
+            with self.assertRaisesRegex(app.WorkflowError, "没有注明来源"):
+                app.run_codex_evaluation_description_repair(
+                    Path(directory),
+                    "不要提交依赖目录",
+                    "ASSISTANT FINAL: 已经完成。",
+                    evaluation,
+                    "execution",
+                    1,
+                    ["执行能力描述引用后续独立复核证据但没有注明来源"],
+                    supplemental_evidence="产物盘点发现 4803 个依赖文件进入版本控制",
+                )
+
+    def test_completed_turn_queues_missing_review_evidence_attribution_as_repair(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.object(app, "DB_PATH", root / "test.db"), mock.patch.object(
+                app, "DATA_DIR", root
+            ):
+                app.initialize_database()
+                self.insert_completed_turn(root)
+                evaluation = sample_evaluation()
+                evaluation["score_validation_mode"] = "quality_platform_review"
+                evaluation["execution"] = {
+                    "score": 4,
+                    "description": (
+                        "第 1 轮提交中有 4803 个依赖文件进入版本控制。"
+                        "这个遗漏造成仓库体积增加。"
+                    ),
+                }
+                review = {
+                    "quality_gaps": [
+                        {"evidence": "产物盘点发现 4803 个依赖文件进入版本控制"}
+                    ],
+                    "evaluation": evaluation,
+                }
+                app.update_turn(
+                    "abc123abc123",
+                    1,
+                    review_result=json.dumps(review, ensure_ascii=False),
+                )
+                row = app.completed_turn_row("abc123abc123:1")
+
+                repairable, _ = app.completed_turn_repairable_evaluation_issues(row)
+
+        self.assertTrue(
+            any("执行能力描述引用后续独立复核证据但没有注明来源" in issue for issue in repairable),
+            repairable,
+        )
 
     def test_completed_turn_list_and_delivery_row_use_reviewed_values(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -9907,6 +10694,29 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(len(issues), 1)
         self.assertIn("任务规划", issues[0])
         self.assertIn("环境条件", issues[0])
+
+    def test_solo_qa_review_evidence_attribution_return_targets_named_dimensions(self):
+        row = {
+            "solo_qa_state": "needs_fix",
+            "solo_qa_remote_submission_id": "13001",
+            "solo_qa_remote_status": "PENDING_FIX",
+            "solo_qa_remote_updated_at": "2026-09-15T16:00:00",
+            "solo_qa_qc_summary": (
+                "指令遵循、任务规划和执行能力写了 .venv 有 2679 个文件、"
+                "Git pack 增加约 13.05 MiB，这些数字只存在于后续代码复核材料中，"
+                "来源没有明确区分。"
+            ),
+        }
+
+        issues = app.solo_qa_returned_evaluation_repair_issues(
+            row, sample_evaluation()
+        )
+
+        self.assertEqual(len(issues), 3)
+        self.assertTrue(
+            all("引用后续独立复核证据但没有注明来源" in issue for issue in issues),
+            issues,
+        )
 
     def test_solo_qa_conflicting_check_counts_rewrite_all_five(self):
         row = {
@@ -11078,6 +11888,15 @@ class DatabaseTests(unittest.TestCase):
                     "api_or_actions": ["确认当前项", "确认全部"],
                     "new_state_sets": ["确认状态"],
                 }
+                contract = {
+                    "version": 1,
+                    "estimated_task_difficulty": "困难",
+                    "axis": "跨模块契约",
+                    "hard_requirement": "确认状态必须与证据版本跨层一致",
+                    "acceptance_evidence": ["证据变化后旧确认自动失效"],
+                    "rejected_shortcut": "只保存确认布尔值无法识别证据版本变化",
+                    "difficulty_evidence": ["状态、接口和页面共同维护版本一致性"],
+                }
                 created = app.create_run(
                     {
                         "repo_name": "demo",
@@ -11090,6 +11909,7 @@ class DatabaseTests(unittest.TestCase):
                         "_source_repo_url": "https://example.invalid/demo",
                         "_source_snapshot": "https://example.invalid/demo/commit/abc123",
                         "_iteration_metadata": metadata,
+                        "_difficulty_contract": contract,
                     }
                 )
 
@@ -11097,6 +11917,7 @@ class DatabaseTests(unittest.TestCase):
                 self.assertEqual(row["iteration_expansion_axis"], "人工复核")
                 self.assertEqual(json.loads(row["iteration_modules"]), metadata["modules"])
                 self.assertEqual(created["iteration_metadata"], metadata)
+                self.assertEqual(created["difficulty_contract"], contract)
                 history = app.iteration_lineage_state(created["id"])["history"]
                 child = next(item for item in history if item["run_id"] == created["id"])
                 self.assertEqual(child["engineering_core"], "复核授权闭环")
@@ -12370,6 +13191,68 @@ class ResilienceTests(unittest.TestCase):
 class ConcurrencyTests(unittest.TestCase):
     def test_default_parallel_limit_is_four(self):
         self.assertEqual(app.MAX_PARALLEL_RUNS, 4)
+
+    def test_same_run_cannot_start_duplicate_delivery_verification(self):
+        with app.verification_run_lock("singleflight111"):
+            with self.assertRaisesRegex(app.JobCancelled, "交付验收已在运行"):
+                with app.verification_run_lock("singleflight111"):
+                    self.fail("duplicate verification lock should not be acquired")
+
+    def test_restart_cleanup_terminates_matching_verification_process_group(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            app, "DATA_DIR", Path(directory)
+        ), mock.patch.object(
+            app, "process_group_snapshot", return_value=(43210, "docker compose build")
+        ), mock.patch.object(
+            app, "terminate_recorded_process_group"
+        ) as terminate:
+            record = app.verification_process_record_path("orphan111111")
+            record.parent.mkdir(parents=True)
+            record.write_text(
+                json.dumps({
+                    "token": "stale",
+                    "owner_pid": os.getpid() + 1000,
+                    "pid": 43210,
+                    "pgid": 43210,
+                    "command": "docker compose build",
+                    "cwd": "/tmp/workspace",
+                }),
+                encoding="utf-8",
+            )
+
+            cleaned = app.cleanup_orphaned_verification_processes()
+
+        self.assertEqual(cleaned, ["orphan111111"])
+        terminate.assert_called_once_with(43210)
+        self.assertFalse(record.exists())
+
+    def test_restart_cleanup_does_not_kill_reused_unrelated_pid(self):
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            app, "DATA_DIR", Path(directory)
+        ), mock.patch.object(
+            app, "process_group_snapshot", return_value=(43210, "python unrelated.py")
+        ), mock.patch.object(
+            app, "terminate_recorded_process_group"
+        ) as terminate:
+            record = app.verification_process_record_path("stale1111111")
+            record.parent.mkdir(parents=True)
+            record.write_text(
+                json.dumps({
+                    "token": "stale",
+                    "owner_pid": os.getpid() + 1000,
+                    "pid": 43210,
+                    "pgid": 43210,
+                    "command": "docker compose build",
+                    "cwd": "/tmp/workspace",
+                }),
+                encoding="utf-8",
+            )
+
+            cleaned = app.cleanup_orphaned_verification_processes()
+
+        self.assertEqual(cleaned, [])
+        terminate.assert_not_called()
+        self.assertFalse(record.exists())
 
     def test_scheduler_respects_parallel_limit(self):
         with tempfile.TemporaryDirectory() as directory:

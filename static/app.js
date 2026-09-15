@@ -1,4 +1,4 @@
-const UI_VERSION = "20260915.4";
+const UI_VERSION = "20260915.12";
 const EXPORT_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 const TABLE_PAGE_SIZE = 20;
 const SOLO_QA_AUTO_REPAIR_POLL_MS = 3000;
@@ -879,7 +879,9 @@ function renderDetail() {
             ${metadataItem("项目编号", run.project_number, "project-number-value")}
             ${metadataItem("任务类型", run.task_type, "task-type-value")}
             ${metadataItem("项目类别", run.project_category, "project-category-value")}
-            ${metadataItem("任务难度", run.task_difficulty, "task-difficulty-value")}
+            ${metadataItem("出题预估难度", run.difficulty_contract?.estimated_task_difficulty || "待评估", "estimated-task-difficulty-value")}
+            ${metadataItem("实际任务难度", run.task_difficulty, "task-difficulty-value")}
+            ${metadataItem("难度契约", run.difficulty_contract?.hard_requirement || "未记录", "difficulty-contract-value")}
             ${metadataItem("语言 / 框架", run.language_framework, "framework-value")}
             ${metadataItem("GitHub 仓库名", run.repo_name, "repo-name-value")}
             ${metadataItem("本地保存分组", run.project_directory, "project-directory-value")}
@@ -1714,6 +1716,14 @@ function exportEvaluationEditorHtml(turn) {
     return '<div class="export-evaluation-empty">该轮尚无可编辑评分。</div>';
   }
   const draft = exportEvaluationDraft(turn);
+  const maxTotal = Number(turn.score_max_total || 21);
+  const total = exportEvaluationDimensions.reduce(
+    (sum, [key]) => sum + Number(draft[key]?.score || 0),
+    0,
+  );
+  const totalLabel = turn.score_cap_applies
+    ? `当前总分 ${total} / ${maxTotal}${total > maxTotal ? "，超过平台上限" : ""}`
+    : `当前总分 ${total}，旧评分不追溯 21 分上限`;
   const repairBusy = evaluationRepairIsActive(turn);
   const busy = state.exportEvaluationBusy.has(turn.key) || repairBusy;
   const status = repairBusy
@@ -1724,7 +1734,7 @@ function exportEvaluationEditorHtml(turn) {
     ? `<span class="manual">已人工修改${turn.evaluation_override_updated_at ? ` · ${escapeHtml(turn.evaluation_override_updated_at)}` : ""}</span>`
     : "<span>当前为自动评分</span>"));
   return `<section class="export-evaluation-editor" data-evaluation-editor="${escapeHtml(turn.key)}">
-    <div class="export-evaluation-heading"><div><strong>五维评分与描述</strong>${status}</div><small>保存后，Excel 导出和 SOLO-QA 提交均使用这里的内容。</small></div>
+    <div class="export-evaluation-heading"><div><strong>五维评分与描述</strong>${status}</div><small>保存后，Excel 导出和 SOLO-QA 提交均使用这里的内容。<span data-evaluation-total="${escapeHtml(turn.key)}">${totalLabel}</span>。</small></div>
     <div class="export-evaluation-grid">${exportEvaluationDimensions.map(([key, label]) => {
       const item = draft[key] || {};
       return `<label class="export-evaluation-item"><span>${escapeHtml(label)}</span><select data-evaluation-key="${escapeHtml(turn.key)}" data-evaluation-dimension="${key}" data-evaluation-field="score" aria-label="${escapeHtml(label)}分数" ${repairBusy ? "disabled" : ""}>${[1, 2, 3, 4, 5].map((score) => `<option value="${score}" ${Number(item.score) === score ? "selected" : ""}>${score} 分</option>`).join("")}</select><textarea rows="6" maxlength="2000" data-evaluation-key="${escapeHtml(turn.key)}" data-evaluation-dimension="${key}" data-evaluation-field="description" aria-label="${escapeHtml(label)}描述" ${repairBusy ? "disabled" : ""}>${escapeHtml(item.description || "")}</textarea></label>`;
@@ -1745,6 +1755,19 @@ function updateEvaluationDraft(input) {
     [field]: field === "score" ? Number(input.value) : input.value,
   };
   state.exportEvaluationDrafts.set(key, draft);
+  const total = exportEvaluationDimensions.reduce(
+    (sum, [dimensionKey]) => sum + Number(draft[dimensionKey]?.score || 0),
+    0,
+  );
+  const totalNode = document.querySelector(
+    `[data-evaluation-total="${CSS.escape(key)}"]`,
+  );
+  if (totalNode) {
+    const maxTotal = Number(turn.score_max_total || 21);
+    totalNode.textContent = turn.score_cap_applies
+      ? `当前总分 ${total} / ${maxTotal}${total > maxTotal ? "，超过平台上限" : ""}`
+      : `当前总分 ${total}，旧评分不追溯 21 分上限`;
+  }
 }
 
 async function saveExportEvaluation(turnKey, reset = false) {
