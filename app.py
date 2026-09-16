@@ -139,7 +139,7 @@ SOLO_QA_PROJECT_REJECTION_MARKERS = (
     "题材不合格",
 )
 SUBMITTER_NAME = os.environ.get("CLAUDE_EVAL_SUBMITTER", "牛宇航").strip() or "牛宇航"
-APP_VERSION = "20260916.5"
+APP_VERSION = "20260916.6"
 COMPLETED_TURN_CACHE_TTL_SECONDS = 24 * 60 * 60
 _COMPLETED_TURN_CACHE_LOCK = threading.RLock()
 _COMPLETED_TURN_RECORD_CACHE: Dict[str, Tuple[str, float, Dict[str, Any]]] = {}
@@ -200,9 +200,11 @@ TASK_GENERATION_HISTORY_LIMIT = 15
 TASK_GENERATION_REVIEW_HISTORY_LIMIT = 10
 TASK_GENERATION_TIMEOUT_SECONDS = 10 * 60
 TASK_GENERATION_RETRY_LIMIT = 1
-# Keep room for iteration generation and review/scoring while all six product
-# slots remain usable. This is a scheduler cap, not a model-wide semaphore.
-TASK_GENERATION_MAX_PARALLEL = 3
+# Prompt generation may use every otherwise-idle product slot. Iteration
+# generation keeps its own smaller cap so slow iteration searches cannot block
+# new 0-1 projects from filling the remaining global capacity.
+TASK_GENERATION_MAX_PARALLEL = MAX_PARALLEL_RUNS
+ITERATION_GENERATION_MAX_PARALLEL = min(3, TASK_GENERATION_MAX_PARALLEL)
 ITERATION_GENERATION_MODEL = REVIEW_MODEL
 ITERATION_GENERATION_ATTEMPTS = 2
 REPOSITORY_PROMPT_HISTORY_LIMIT = 40
@@ -3363,6 +3365,8 @@ def auto_refill_configuration() -> Dict[str, Any]:
         "enabled": enabled,
         "project_directory": project_directory,
         "max_parallel": MAX_PARALLEL_RUNS,
+        "zero_to_one_generation_max_parallel": TASK_GENERATION_MAX_PARALLEL,
+        "iteration_generation_max_parallel": ITERATION_GENERATION_MAX_PARALLEL,
         "max_iterations_per_root": AUTO_REFILL_MAX_ITERATIONS_PER_ROOT,
         "max_new_modules_per_root": MAX_NEW_MODULE_ITERATIONS_PER_ROOT,
         "new_module_slots": list(AUTO_REFILL_NEW_MODULE_SLOTS),
@@ -7442,6 +7446,11 @@ def queue_automatic_iteration_locked(
             "created_run_id": existing["id"],
             "task_type": existing["task_type"],
         }
+    if active_iteration_generation_count() >= ITERATION_GENERATION_MAX_PARALLEL:
+        raise WorkflowError(
+            f"已有 {ITERATION_GENERATION_MAX_PARALLEL} 个迭代题面正在生成，"
+            "请等待迭代生成槽"
+        )
     if active_task_generation_count() >= TASK_GENERATION_MAX_PARALLEL:
         raise WorkflowError(
             f"已有 {TASK_GENERATION_MAX_PARALLEL} 个题面正在生成，请等待生成槽"
@@ -7631,11 +7640,11 @@ def automatic_refill_occupancy() -> int:
     return scheduled + generating_iterations + failed_startup_resource_count()
 
 
-def active_task_generation_count() -> int:
-    """Count every 0-1 and iteration prompt workflow using generation capacity."""
+def active_zero_to_one_generation_count() -> int:
+    """Count durable 0-1 placeholders currently generating their task brief."""
     try:
         with db_connection() as database:
-            zero_to_one = int(
+            return int(
                 database.execute(
                     """SELECT COUNT(*) FROM runs
                          WHERE deleted_at IS NULL
@@ -7643,11 +7652,22 @@ def active_task_generation_count() -> int:
                 ).fetchone()[0]
             )
     except sqlite3.OperationalError:
-        zero_to_one = 0
-    iterations = sum(
+        return 0
+
+
+def active_iteration_generation_count() -> int:
+    """Count Feature/Bug prompt workflows using the iteration sub-cap."""
+    return sum(
         1 for job in iteration_job_values() if job.get("status") == "generating"
     )
-    return zero_to_one + iterations
+
+
+def active_task_generation_count() -> int:
+    """Count every 0-1 and iteration prompt workflow using global capacity."""
+    return (
+        active_zero_to_one_generation_count()
+        + active_iteration_generation_count()
+    )
 
 
 def auto_refill_iteration_candidate(
@@ -7848,6 +7868,11 @@ def queue_refill_iteration_locked(source_run_id: str) -> Dict[str, Any]:
     current = get_iteration_job(source_run_id)
     if current and current.get("status") == "generating":
         return dict(current)
+    if active_iteration_generation_count() >= ITERATION_GENERATION_MAX_PARALLEL:
+        raise WorkflowError(
+            f"已有 {ITERATION_GENERATION_MAX_PARALLEL} 个迭代题面正在生成，"
+            "请等待迭代生成槽"
+        )
     if active_task_generation_count() >= TASK_GENERATION_MAX_PARALLEL:
         raise WorkflowError(
             f"已有 {TASK_GENERATION_MAX_PARALLEL} 个题面正在生成，请等待生成槽"
@@ -7910,11 +7935,20 @@ def automatic_refill_once() -> Dict[str, Any]:
                 "count": generation_count,
             }
 
+        iteration_generation_count = active_iteration_generation_count()
+        iteration_generation_saturated = (
+            iteration_generation_count >= ITERATION_GENERATION_MAX_PARALLEL
+        )
+
         replace_saturated_source = bool(
             configuration["enabled"] and auto_refill_new_project_backlog() > 0
         )
-        source = None if replace_saturated_source else auto_refill_iteration_candidate(
-            difficulty_recovery_only=not configuration["enabled"]
+        source = (
+            None
+            if replace_saturated_source or iteration_generation_saturated
+            else auto_refill_iteration_candidate(
+                difficulty_recovery_only=not configuration["enabled"]
+            )
         )
         if source:
             source_run_id = str(source["id"])
@@ -7970,6 +8004,11 @@ def automatic_refill_once() -> Dict[str, Any]:
             return {"action": "iteration", "job": job, "detail": detail}
 
         if not configuration["enabled"]:
+            if iteration_generation_saturated:
+                return {
+                    "action": "waiting_for_iteration_generation",
+                    "count": iteration_generation_count,
+                }
             return {"action": "disabled"}
 
         with db_connection() as database:
@@ -7998,6 +8037,11 @@ def automatic_refill_once() -> Dict[str, Any]:
             detail = (
                 "自动补题：迭代来源语义已饱和，已直接创建新的 "
                 f"{created['project_number']} 0-1 任务"
+            )
+        elif iteration_generation_saturated:
+            detail = (
+                f"自动补题：迭代题面已满 {ITERATION_GENERATION_MAX_PARALLEL} 路，"
+                f"已用空闲槽创建新的 {created['project_number']} 0-1 任务"
             )
         else:
             detail = f"自动补题：没有可迭代项目，已创建新的 {created['project_number']} 0-1 任务"
@@ -21005,6 +21049,7 @@ def dependency_status() -> Dict[str, Any]:
                 "task_generation_model": TASK_GENERATION_MODEL,
                 "task_generation_reasoning_effort": TASK_GENERATION_REASONING_EFFORT,
                 "task_generation_max_parallel": TASK_GENERATION_MAX_PARALLEL,
+                "iteration_generation_max_parallel": ITERATION_GENERATION_MAX_PARALLEL,
                 "iteration_generation_model": ITERATION_GENERATION_MODEL,
                 "evaluation_reasoning_effort": EVALUATION_REASONING_EFFORT,
                 "first_review_reasoning_effort": FIRST_REVIEW_REASONING_EFFORT,
@@ -21043,9 +21088,9 @@ def dependency_status() -> Dict[str, Any]:
         queued_jobs = database.execute(
             "SELECT COUNT(*) FROM runs WHERE deleted_at IS NULL AND phase IN ('generation_queued', 'queued', 'first_retry_queued', 'review_queued', 'second_queued', 'final_review_queued')"
         ).fetchone()[0]
-    active_jobs += sum(
-        1 for job in iteration_job_values() if job.get("status") == "generating"
-    )
+    zero_to_one_generating = active_zero_to_one_generation_count()
+    iteration_generating = active_iteration_generation_count()
+    active_jobs += iteration_generating
     status.update({
         "model": current_model(),
         "models": available_models(),
@@ -21056,6 +21101,11 @@ def dependency_status() -> Dict[str, Any]:
         "max_turns": MAX_TURNS,
         "active_jobs": active_jobs,
         "queued_jobs": queued_jobs,
+        "task_generation_active": {
+            "total": zero_to_one_generating + iteration_generating,
+            "zero_to_one": zero_to_one_generating,
+            "iteration": iteration_generating,
+        },
         "auto_refill": auto_refill_configuration(),
     })
     return status
@@ -21399,6 +21449,7 @@ def recover_iteration_jobs() -> None:
             )
     except (sqlite3.Error, TypeError):
         started_recoveries = 0
+    started_iteration_recoveries = 0
     for job in jobs:
         if (
             job.get("status") in {"failed", "generating"}
@@ -21449,7 +21500,11 @@ def recover_iteration_jobs() -> None:
             continue
         if (
             bool(job.get("auto_refill"))
-            and started_recoveries >= TASK_GENERATION_MAX_PARALLEL
+            and (
+                started_recoveries >= TASK_GENERATION_MAX_PARALLEL
+                or started_iteration_recoveries
+                >= ITERATION_GENERATION_MAX_PARALLEL
+            )
         ):
             previous_error = str(
                 job.get("error") or job.get("last_error") or ""
@@ -21464,7 +21519,8 @@ def recover_iteration_jobs() -> None:
             try:
                 add_event(
                     source_run_id,
-                    "服务恢复时题面生成已达到 3 路，本来源已退回自动队列等待空槽",
+                    "服务恢复时迭代题面生成已达到 "
+                    f"{ITERATION_GENERATION_MAX_PARALLEL} 路，本来源已退回自动队列等待空槽",
                     "warning",
                 )
             except Exception:
@@ -21490,6 +21546,7 @@ def recover_iteration_jobs() -> None:
             daemon=True,
         ).start()
         started_recoveries += 1
+        started_iteration_recoveries += 1
 
 
 def recover_retryable_review_failures() -> int:

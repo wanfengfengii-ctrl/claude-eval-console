@@ -7286,29 +7286,24 @@ class DraftTests(unittest.TestCase):
                 app, "HISTORY_PATH", root / "history.md"
             ), mock.patch.object(app, "schedule_worker") as scheduler:
                 app.initialize_database()
-                first = app.create_automatic_run(
-                    {"project_directory": "team-a", "_auto_refill": True},
-                    allow_parallel_generation=True,
-                )
-                second = app.create_automatic_run(
-                    {"project_directory": "team-a", "_auto_refill": True},
-                    allow_parallel_generation=True,
-                )
-                third = app.create_automatic_run(
-                    {"project_directory": "team-a", "_auto_refill": True},
-                    allow_parallel_generation=True,
-                )
+                created = [
+                    app.create_automatic_run(
+                        {"project_directory": "team-a", "_auto_refill": True},
+                        allow_parallel_generation=True,
+                    )
+                    for _ in range(app.TASK_GENERATION_MAX_PARALLEL)
+                ]
                 capped = app.create_automatic_run(
                     {"project_directory": "team-a", "_auto_refill": True},
                     allow_parallel_generation=True,
                 )
 
-            self.assertNotEqual(first["id"], second["id"])
-            self.assertNotEqual(second["id"], third["id"])
-            self.assertIn(capped["id"], {first["id"], second["id"], third["id"]})
-            self.assertEqual(first["project_number"], "0001")
-            self.assertEqual(second["project_number"], "0002")
-            self.assertEqual(third["project_number"], "0003")
+            self.assertEqual(len({item["id"] for item in created}), app.TASK_GENERATION_MAX_PARALLEL)
+            self.assertIn(capped["id"], {item["id"] for item in created})
+            self.assertEqual(
+                [item["project_number"] for item in created],
+                [f"{index:04d}" for index in range(1, app.TASK_GENERATION_MAX_PARALLEL + 1)],
+            )
             self.assertEqual(scheduler.call_count, app.TASK_GENERATION_MAX_PARALLEL)
 
     def test_failed_generation_retries_same_number_before_next_create_advances(self):
@@ -8103,7 +8098,7 @@ class AutoRefillTests(unittest.TestCase):
                     allow_parallel_generation=True,
                 )
 
-    def test_refill_keeps_zero_to_one_generation_at_three(self):
+    def test_refill_keeps_zero_to_one_generation_within_global_capacity(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
             with mock.patch.object(app, "DB_PATH", root / "test.db"), mock.patch.object(
@@ -8119,7 +8114,9 @@ class AutoRefillTests(unittest.TestCase):
                         allow_parallel_generation=True,
                     )
                 with mock.patch.object(
-                    app, "automatic_refill_occupancy", return_value=3
+                    app,
+                    "automatic_refill_occupancy",
+                    return_value=app.MAX_PARALLEL_RUNS - 1,
                 ), mock.patch.object(
                     app, "auto_refill_iteration_candidate", return_value=None
                 ), mock.patch.object(app, "create_automatic_run") as create:
@@ -8138,6 +8135,8 @@ class AutoRefillTests(unittest.TestCase):
             app,
             "active_task_generation_count",
             return_value=app.TASK_GENERATION_MAX_PARALLEL,
+        ), mock.patch.object(
+            app, "active_iteration_generation_count", return_value=0
         ), mock.patch.object(
             app, "auto_refill_iteration_candidate"
         ) as select:
@@ -8163,17 +8162,68 @@ class AutoRefillTests(unittest.TestCase):
             "active_task_generation_count",
             side_effect=[2, app.TASK_GENERATION_MAX_PARALLEL],
         ), mock.patch.object(
+            app, "active_iteration_generation_count", return_value=0
+        ), mock.patch.object(
             app, "auto_refill_iteration_candidate", return_value=source
         ), mock.patch.object(
             app,
             "queue_refill_iteration",
-            side_effect=app.WorkflowError("已有 3 个题面正在生成，请等待生成槽"),
+            side_effect=app.WorkflowError(
+                f"已有 {app.TASK_GENERATION_MAX_PARALLEL} 个题面正在生成，请等待生成槽"
+            ),
         ), mock.patch.object(app, "put_iteration_job") as put:
             result = app.automatic_refill_once()
 
         self.assertEqual(result["action"], "waiting_for_task_generation")
         self.assertEqual(result["count"], app.TASK_GENERATION_MAX_PARALLEL)
         put.assert_not_called()
+
+    def test_refill_uses_idle_slot_for_zero_to_one_when_iteration_generation_is_full(self):
+        created = {"id": "new01111111", "project_number": "0009"}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            with mock.patch.object(
+                app, "DB_PATH", root / "test.db"
+            ), mock.patch.object(
+                app, "DATA_DIR", root
+            ), mock.patch.object(
+                app, "PROJECTS_ROOT", root
+            ), mock.patch.object(
+                app, "auto_refill_configuration", return_value={
+                    "enabled": True,
+                    "project_directory": "team-a",
+                }
+            ), mock.patch.object(
+                app,
+                "automatic_refill_occupancy",
+                return_value=app.ITERATION_GENERATION_MAX_PARALLEL,
+            ), mock.patch.object(
+                app,
+                "active_task_generation_count",
+                return_value=app.ITERATION_GENERATION_MAX_PARALLEL,
+            ), mock.patch.object(
+                app,
+                "active_iteration_generation_count",
+                return_value=app.ITERATION_GENERATION_MAX_PARALLEL,
+            ), mock.patch.object(
+                app, "auto_refill_new_project_backlog", return_value=0
+            ), mock.patch.object(
+                app, "auto_refill_iteration_candidate"
+            ) as select, mock.patch.object(
+                app, "create_automatic_run", return_value=created
+            ) as create, mock.patch.object(
+                app, "record_auto_refill_detail"
+            ), mock.patch.object(app, "add_event"):
+                app.initialize_database()
+                result = app.automatic_refill_once()
+
+        self.assertEqual(result["action"], "0-1")
+        self.assertIn("迭代题面已满 3 路", result["detail"])
+        select.assert_not_called()
+        create.assert_called_once_with(
+            {"project_directory": "team-a", "_auto_refill": True},
+            allow_parallel_generation=True,
+        )
 
     def test_refill_queue_uses_the_interleaved_task_type(self):
         source = {
@@ -8269,6 +8319,8 @@ class AutoRefillTests(unittest.TestCase):
                     app, "automatic_refill_occupancy", return_value=1
                 ), mock.patch.object(
                     app, "active_task_generation_count", return_value=0
+                ), mock.patch.object(
+                    app, "active_iteration_generation_count", return_value=0
                 ), mock.patch.object(
                     app, "auto_refill_iteration_candidate"
                 ) as select, mock.patch.object(
@@ -10154,7 +10206,7 @@ class IterationGenerationTests(unittest.TestCase):
                 "started_at": f"2026-09-16 08:0{index}:00 +0800",
                 "last_error": "旧候选未完成",
             }
-            for index in range(app.TASK_GENERATION_MAX_PARALLEL + 2)
+            for index in range(app.ITERATION_GENERATION_MAX_PARALLEL + 2)
         ]
         database = mock.MagicMock()
 
@@ -10182,8 +10234,11 @@ class IterationGenerationTests(unittest.TestCase):
         ), mock.patch.object(app.threading, "Thread") as thread:
             app.recover_iteration_jobs()
 
-        self.assertEqual(thread.call_count, app.TASK_GENERATION_MAX_PARALLEL)
-        self.assertEqual(thread.return_value.start.call_count, app.TASK_GENERATION_MAX_PARALLEL)
+        self.assertEqual(thread.call_count, app.ITERATION_GENERATION_MAX_PARALLEL)
+        self.assertEqual(
+            thread.return_value.start.call_count,
+            app.ITERATION_GENERATION_MAX_PARALLEL,
+        )
         deferred = [
             job for job in saved
             if job.get("stage") == "服务恢复后等待生成槽"

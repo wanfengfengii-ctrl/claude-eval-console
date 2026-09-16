@@ -1,4 +1,4 @@
-const UI_VERSION = "20260916.5";
+const UI_VERSION = "20260916.6";
 const EXPORT_REFRESH_INTERVAL_MS = 60 * 1000;
 const TABLE_PAGE_SIZE = 20;
 const SOLO_QA_AUTO_REPAIR_POLL_MS = 3000;
@@ -338,7 +338,9 @@ function renderHealth() {
     directoryInput.value = state.health.default_project_directory || "zzzz";
   }
   renderDirectoryPreview();
-  $("#parallel-status").textContent = `并行 ${state.health.active_jobs} / ${state.health.max_parallel}${state.health.queued_jobs ? ` · 排队 ${state.health.queued_jobs}` : ""}`;
+  const taskGeneration = state.health.task_generation_active || {};
+  const taskGenerationStatus = ` · 题面 0-1 ${taskGeneration.zero_to_one || 0}/${state.health.task_generation_max_parallel || state.health.max_parallel}、迭代 ${taskGeneration.iteration || 0}/${state.health.iteration_generation_max_parallel || 3}`;
+  $("#parallel-status").textContent = `并行 ${state.health.active_jobs} / ${state.health.max_parallel}${state.health.queued_jobs ? ` · 排队 ${state.health.queued_jobs}` : ""}${taskGenerationStatus}`;
   const refill = state.health.auto_refill || {};
   const refillRow = $("#auto-refill-row");
   const refillButton = $("#auto-refill-toggle");
