@@ -8120,9 +8120,55 @@ class AutoRefillTests(unittest.TestCase):
                 ), mock.patch.object(app, "create_automatic_run") as create:
                     result = app.automatic_refill_once()
 
-        self.assertEqual(result["action"], "waiting_for_0_1_generation")
+        self.assertEqual(result["action"], "waiting_for_task_generation")
         self.assertEqual(result["count"], app.TASK_GENERATION_MAX_PARALLEL)
         create.assert_not_called()
+
+    def test_refill_caps_zero_to_one_and_iteration_generation_together(self):
+        with mock.patch.object(
+            app, "auto_refill_configuration", return_value={"enabled": True}
+        ), mock.patch.object(
+            app, "automatic_refill_occupancy", return_value=2
+        ), mock.patch.object(
+            app,
+            "active_task_generation_count",
+            return_value=app.TASK_GENERATION_MAX_PARALLEL,
+        ), mock.patch.object(
+            app, "auto_refill_iteration_candidate"
+        ) as select:
+            result = app.automatic_refill_once()
+
+        self.assertEqual(result["action"], "waiting_for_task_generation")
+        self.assertEqual(result["count"], app.TASK_GENERATION_MAX_PARALLEL)
+        select.assert_not_called()
+
+    def test_refill_generation_slot_race_does_not_fail_the_source(self):
+        source = {
+            "id": "root11111111",
+            "repo_name": "root-one",
+            "iteration_count": 1,
+            "next_iteration_task_type": "Feature 迭代",
+        }
+        with mock.patch.object(
+            app, "auto_refill_configuration", return_value={"enabled": True}
+        ), mock.patch.object(
+            app, "automatic_refill_occupancy", return_value=2
+        ), mock.patch.object(
+            app,
+            "active_task_generation_count",
+            side_effect=[2, app.TASK_GENERATION_MAX_PARALLEL],
+        ), mock.patch.object(
+            app, "auto_refill_iteration_candidate", return_value=source
+        ), mock.patch.object(
+            app,
+            "queue_refill_iteration",
+            side_effect=app.WorkflowError("已有 3 个题面正在生成，请等待生成槽"),
+        ), mock.patch.object(app, "put_iteration_job") as put:
+            result = app.automatic_refill_once()
+
+        self.assertEqual(result["action"], "waiting_for_task_generation")
+        self.assertEqual(result["count"], app.TASK_GENERATION_MAX_PARALLEL)
+        put.assert_not_called()
 
     def test_refill_queue_uses_the_interleaved_task_type(self):
         source = {
@@ -8203,6 +8249,36 @@ class AutoRefillTests(unittest.TestCase):
             self.assertIn("题面校验", configuration["detail"])
             self.assertIn("283 字", configuration["error"])
             self.assertEqual(values["auto_refill_consecutive_failures"], "0")
+
+    def test_rule_c_saturation_prioritizes_a_new_project_over_old_iterations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            with mock.patch.object(app, "DB_PATH", root / "test.db"), mock.patch.object(
+                app, "DATA_DIR", root
+            ), mock.patch.object(app, "PROJECTS_ROOT", root):
+                app.initialize_database()
+                app.set_auto_refill({"enabled": True, "project_directory": "team-a"})
+                app.request_auto_refill_new_project("来源 A 命中同仓库规则 C")
+                created = {"id": "new01111111", "project_number": "0009"}
+                with mock.patch.object(
+                    app, "automatic_refill_occupancy", return_value=1
+                ), mock.patch.object(
+                    app, "active_task_generation_count", return_value=0
+                ), mock.patch.object(
+                    app, "auto_refill_iteration_candidate"
+                ) as select, mock.patch.object(
+                    app, "create_automatic_run", return_value=created
+                ) as create, mock.patch.object(app, "add_event"):
+                    result = app.automatic_refill_once()
+
+                self.assertEqual(result["action"], "0-1")
+                self.assertIn("语义已饱和", result["detail"])
+                select.assert_not_called()
+                create.assert_called_once_with(
+                    {"project_directory": "team-a", "_auto_refill": True},
+                    allow_parallel_generation=True,
+                )
+                self.assertEqual(app.auto_refill_new_project_backlog(), 0)
 
     def test_reenabling_auto_refill_starts_a_fresh_failure_window(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -9150,6 +9226,94 @@ class IterationGenerationTests(unittest.TestCase):
         self.assertIn("SOLO-QA #88", generate.call_args_list[1].args[1])
         self.assertEqual(result["prompt_dedup_review"], distinct)
 
+    def test_same_repository_semantic_dedup_failure_discards_candidate(self):
+        candidate = self.candidate()
+        context = {
+            "repo_path": "/tmp/existing-project",
+            "repo_name": "demo",
+            "repo_key": "example/demo",
+            "repository_prompt_history": [{
+                "reference": "SOLO-QA #10",
+                "prompt": "仓库最初只实现样本登记和基础详情查看。",
+                "task_type": "0-1 代码生成",
+                "dedup_required": True,
+            }],
+        }
+        source = {
+            "phase": "complete",
+            "container_cleaned": 1,
+            "repo_url": "https://example.invalid/demo",
+            "first_prompt_id": "prompt-1",
+        }
+        distinct = {
+            "duplicate": False,
+            "confidence": "low",
+            "match_scope": "none",
+            "reference": "",
+            "overlap_kind": "none",
+            "reason": "没有高置信度重复",
+        }
+        with mock.patch.object(app, "run_row", return_value=source), mock.patch.object(
+            app, "iteration_project_context", return_value=context
+        ), mock.patch.object(
+            app, "run_codex_iteration_generation", return_value=candidate
+        ) as generate, mock.patch.object(
+            app, "global_prompt_dedup_history", return_value=[]
+        ), mock.patch.object(
+            app, "run_codex_iteration_validation", return_value=self.review_result()
+        ), mock.patch.object(
+            app,
+            "run_codex_prompt_dedup_validation",
+            side_effect=[app.WorkflowError("504 Gateway Time-out"), distinct],
+        ) as dedup:
+            result = app.generate_iteration_candidate("source111111")
+
+        self.assertEqual(result["prompt"], candidate["prompt"])
+        self.assertEqual(generate.call_count, 2)
+        self.assertEqual(dedup.call_count, 2)
+        self.assertIn("规则 C 语义查重异常", generate.call_args_list[1].args[1])
+        self.assertNotIn("prompt_dedup_warning", result)
+
+    def test_cross_repository_semantic_dedup_failure_remains_non_blocking(self):
+        candidate = self.candidate()
+        context = {
+            "repo_path": "/tmp/existing-project",
+            "repo_name": "demo",
+            "repo_key": "example/demo",
+            "repository_prompt_history": [],
+        }
+        source = {
+            "phase": "complete",
+            "container_cleaned": 1,
+            "repo_url": "https://example.invalid/demo",
+            "first_prompt_id": "prompt-1",
+        }
+        global_history = [{
+            "reference": "SOLO-QA #88",
+            "prompt": candidate["prompt"],
+            "task_type": "Feature 迭代",
+            "lexical_similarity": 0.91,
+            "bigram_containment": 0.86,
+            "dedup_required": True,
+        }]
+        with mock.patch.object(app, "run_row", return_value=source), mock.patch.object(
+            app, "iteration_project_context", return_value=context
+        ), mock.patch.object(
+            app, "run_codex_iteration_generation", return_value=candidate
+        ) as generate, mock.patch.object(
+            app, "global_prompt_dedup_history", return_value=global_history
+        ), mock.patch.object(
+            app, "run_codex_iteration_validation", return_value=self.review_result()
+        ), mock.patch.object(
+            app,
+            "run_codex_prompt_dedup_validation",
+            side_effect=app.WorkflowError("504 Gateway Time-out"),
+        ):
+            result = app.generate_iteration_candidate("source111111")
+
+        generate.assert_called_once()
+        self.assertIn("504 Gateway Time-out", result["prompt_dedup_warning"])
+
     def test_iteration_format_failure_is_repaired_without_full_regeneration(self):
         invalid = self.candidate()
         invalid["prompt"] += "继续补充重复说明。" * 80
@@ -9973,6 +10137,56 @@ class IterationGenerationTests(unittest.TestCase):
             with app.ITERATION_JOB_LOCK:
                 app.ITERATION_JOBS.pop("source111111", None)
 
+    def test_service_recovery_requeues_excess_auto_generation(self):
+        jobs = [
+            {
+                "status": "generating",
+                "source_run_id": f"source{index:06d}",
+                "baseline_run_id": f"source{index:06d}",
+                "lineage_origin_run_id": f"source{index:06d}",
+                "task_type": "Feature 迭代",
+                "auto_refill": True,
+                "started_at": f"2026-09-16 08:0{index}:00 +0800",
+                "last_error": "旧候选未完成",
+            }
+            for index in range(app.TASK_GENERATION_MAX_PARALLEL + 2)
+        ]
+        database = mock.MagicMock()
+
+        def execute(query, *_args):
+            cursor = mock.MagicMock()
+            cursor.fetchone.return_value = (
+                (0,) if "SELECT COUNT(*) FROM runs" in query else None
+            )
+            return cursor
+
+        database.execute.side_effect = execute
+        connection = mock.MagicMock()
+        connection.__enter__.return_value = database
+        saved = []
+        with mock.patch.object(
+            app, "iteration_job_values", return_value=jobs
+        ), mock.patch.object(
+            app, "db_connection", return_value=connection
+        ), mock.patch.object(
+            app, "run_row", return_value={"id": "source"}
+        ), mock.patch.object(
+            app, "put_iteration_job", side_effect=lambda job: saved.append(dict(job))
+        ), mock.patch.object(app, "clear_job_cancellation"), mock.patch.object(
+            app, "add_event"
+        ), mock.patch.object(app.threading, "Thread") as thread:
+            app.recover_iteration_jobs()
+
+        self.assertEqual(thread.call_count, app.TASK_GENERATION_MAX_PARALLEL)
+        self.assertEqual(thread.return_value.start.call_count, app.TASK_GENERATION_MAX_PARALLEL)
+        deferred = [
+            job for job in saved
+            if job.get("stage") == "服务恢复后等待生成槽"
+        ]
+        self.assertEqual(len(deferred), 2)
+        self.assertTrue(all(job["status"] == "failed" for job in deferred))
+        self.assertTrue(all(job["cooldown_until_epoch"] is None for job in deferred))
+
     def test_background_worker_exposes_success_and_failure_status(self):
         with app.ITERATION_JOB_LOCK:
             app.ITERATION_JOBS["source111111"] = {"status": "generating"}
@@ -10002,7 +10216,7 @@ class IterationGenerationTests(unittest.TestCase):
             "source111111", "自动生成迭代需求失败：模型复核未通过", "error"
         )
 
-    def test_auto_refill_cools_down_source_after_internal_rewrite_is_exhausted(self):
+    def test_auto_refill_cools_down_non_semantic_feature_review_failure(self):
         detail = (
             f"连续 {app.ITERATION_GENERATION_ATTEMPTS} 次未生成合规迭代需求："
             "迭代题面应为 260 至 800 字，当前共 845 字"
@@ -10031,6 +10245,7 @@ class IterationGenerationTests(unittest.TestCase):
             with app.ITERATION_JOB_LOCK:
                 job = dict(app.ITERATION_JOBS["source111111"])
             self.assertEqual(job["status"], "failed")
+            self.assertEqual(job["stage"], "生成失败")
             self.assertGreater(job["cooldown_until_epoch"], int(time.time()))
             event.assert_called_once_with(
                 "source111111", f"自动生成迭代需求失败：{detail}", "error"
@@ -10042,6 +10257,75 @@ class IterationGenerationTests(unittest.TestCase):
         finally:
             with app.ITERATION_JOB_LOCK:
                 app.ITERATION_JOBS.pop("source111111", None)
+
+    def test_auto_refill_permanently_skips_source_after_rule_c_exhaustion(self):
+        detail = (
+            f"连续 {app.ITERATION_GENERATION_ATTEMPTS} 次未生成合规迭代需求："
+            "提交前语义查重命中同仓库历史 SOLO-QA #88：同一页面流程继续扩展"
+        )
+        with app.ITERATION_JOB_LOCK:
+            app.ITERATION_JOBS["source111111"] = {"status": "generating"}
+        try:
+            with mock.patch.object(
+                app,
+                "generate_and_start_iteration",
+                side_effect=app.WorkflowError(detail),
+            ), mock.patch.object(app, "add_event"), mock.patch.object(
+                app, "record_auto_refill_candidate_skip"
+            ) as record_skip, mock.patch.object(
+                app, "request_auto_refill_new_project"
+            ) as request_new_project:
+                app.automatic_iteration_worker(
+                    "source111111",
+                    "Feature 迭代",
+                    False,
+                    True,
+                )
+
+            with app.ITERATION_JOB_LOCK:
+                job = dict(app.ITERATION_JOBS["source111111"])
+            self.assertEqual(job["status"], "blocked")
+            self.assertEqual(
+                job["stage"],
+                "同仓库规则 C 命中，当前来源已永久跳过",
+            )
+            self.assertIsNone(job["cooldown_until_epoch"])
+            record_skip.assert_called_once()
+            request_new_project.assert_called_once()
+        finally:
+            with app.ITERATION_JOB_LOCK:
+                app.ITERATION_JOBS.pop("source111111", None)
+
+    def test_recovery_blocks_exhausted_rule_c_source_instead_of_resuming_it(self):
+        detail = (
+            f"连续 {app.ITERATION_GENERATION_ATTEMPTS} 次未生成合规迭代需求："
+            "提交前语义查重命中同仓库历史 SOLO-QA #88：同一页面流程继续扩展"
+        )
+        job = {
+            "status": "generating",
+            "source_run_id": "source111111",
+            "lineage_origin_run_id": "source111111",
+            "task_type": "Feature 迭代",
+            "auto_refill": True,
+            "last_error": detail,
+        }
+        saved = []
+        with mock.patch.object(
+            app, "iteration_job_values", return_value=[job]
+        ), mock.patch.object(
+            app, "db_connection", return_value=mock.MagicMock()
+        ), mock.patch.object(
+            app, "put_iteration_job", side_effect=lambda item: saved.append(dict(item))
+        ), mock.patch.object(app.threading, "Thread") as thread:
+            app.recover_iteration_jobs()
+
+        self.assertEqual(saved[0]["status"], "blocked")
+        self.assertEqual(
+            saved[0]["stage"],
+            "同仓库规则 C 命中，当前来源已永久跳过",
+        )
+        self.assertIsNone(saved[0]["cooldown_until_epoch"])
+        thread.assert_not_called()
 
     def test_auto_refill_still_counts_generation_timeout_as_platform_failure(self):
         detail = (
