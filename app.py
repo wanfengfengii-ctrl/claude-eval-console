@@ -139,7 +139,7 @@ SOLO_QA_PROJECT_REJECTION_MARKERS = (
     "题材不合格",
 )
 SUBMITTER_NAME = os.environ.get("CLAUDE_EVAL_SUBMITTER", "牛宇航").strip() or "牛宇航"
-APP_VERSION = "20260916.7"
+APP_VERSION = "20260916.8"
 COMPLETED_TURN_CACHE_TTL_SECONDS = 24 * 60 * 60
 _COMPLETED_TURN_CACHE_LOCK = threading.RLock()
 _COMPLETED_TURN_RECORD_CACHE: Dict[str, Tuple[str, float, Dict[str, Any]]] = {}
@@ -210,6 +210,11 @@ TASK_GENERATION_MAX_PARALLEL = MAX_PARALLEL_RUNS
 ITERATION_GENERATION_MAX_PARALLEL = min(3, TASK_GENERATION_MAX_PARALLEL)
 ITERATION_GENERATION_MODEL = REVIEW_MODEL
 ITERATION_GENERATION_ATTEMPTS = 2
+# Bug discovery is intentionally a single-shot probe. A failed first review
+# switches the automatic workflow to Feature instead of spending another full
+# generation window searching the same code baseline.
+BUGFIX_GENERATION_ATTEMPTS = 1
+REPOSITORY_RULE_C_SATURATION_MIN_REJECTIONS = 2
 REPOSITORY_PROMPT_HISTORY_LIMIT = 40
 GLOBAL_PROMPT_DEDUP_SCAN_LIMIT = 600
 GLOBAL_PROMPT_DEDUP_SHORTLIST_LIMIT = 24
@@ -6727,6 +6732,14 @@ def update_current_iteration_job_stage(stage: str) -> None:
     put_iteration_job(job)
 
 
+def iteration_generation_attempt_limit(target_task_type: str) -> int:
+    return (
+        BUGFIX_GENERATION_ATTEMPTS
+        if target_task_type == "Bug 修复"
+        else ITERATION_GENERATION_ATTEMPTS
+    )
+
+
 def generate_iteration_candidate(
     run_id: str,
     target_task_type: str = "Feature 迭代",
@@ -6747,11 +6760,12 @@ def generate_iteration_candidate(
     context = iteration_project_context(row)
     feedback = initial_feedback.strip()
     targeted_repair_used = False
+    attempt_limit = iteration_generation_attempt_limit(target_task_type)
     with worker_slot():
-        for attempt in range(1, ITERATION_GENERATION_ATTEMPTS + 1):
+        for attempt in range(1, attempt_limit + 1):
             ensure_job_active()
             update_current_iteration_job_stage(
-                f"生成候选 {attempt}/{ITERATION_GENERATION_ATTEMPTS}"
+                f"生成候选 {attempt}/{attempt_limit}"
             )
             try:
                 candidate = run_codex_iteration_generation(
@@ -6963,7 +6977,7 @@ def generate_iteration_candidate(
                 "并保持项目贴合度、跨模块完整性和可验收性"
             )
     raise WorkflowError(
-        f"连续 {ITERATION_GENERATION_ATTEMPTS} 次未生成合规迭代需求：{feedback}"
+        f"连续 {attempt_limit} 次未生成合规迭代需求：{feedback}"
     )
 
 
@@ -7183,17 +7197,98 @@ def same_repository_rule_c_failure(detail: str) -> bool:
     )
 
 
+def iteration_generation_exhausted(detail: str) -> bool:
+    return bool(re.match(r"^连续 \d+ 次未生成合规迭代需求", str(detail or "")))
+
+
+def strong_same_repository_rule_c_failure(detail: str) -> bool:
+    """Only content rejections, never timeouts or gateway failures, prove saturation."""
+    return bool(
+        same_repository_rule_c_failure(detail)
+        and not iteration_generation_infrastructure_failure(detail)
+    )
+
+
+def same_repository_rule_c_qc_summary(value: Any) -> bool:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    rule_c_hit = bool(
+        "命中查重规则 C" in text
+        or "规则 C 命中" in text
+        or ("规则 C" in text and "语义重复" in text)
+    )
+    return bool(
+        rule_c_hit
+        and "未命中" not in text
+        and any(marker in text for marker in ("同仓库", "同一个仓库"))
+    )
+
+
+def repository_semantic_saturation_reason(candidate: Dict[str, Any]) -> str:
+    """Return a conservative preflight reason backed by durable Rule C evidence."""
+    repository_token = repository_generation_token(
+        candidate.get("repo_url"), candidate.get("repo_name")
+    )
+    if not repository_token:
+        return ""
+
+    for job in iteration_job_values():
+        detail = str(job.get("error") or job.get("last_error") or "").strip()
+        if not strong_same_repository_rule_c_failure(detail):
+            continue
+        job_token = run_repository_generation_token(
+            job.get("baseline_run_id") or job.get("source_run_id")
+        )
+        if job_token == repository_token:
+            return "同仓库已有题面被规则 C 明确判定语义重复"
+
+    try:
+        with db_connection() as database:
+            rows = database.execute(
+                """SELECT submissions.remote_submission_id,
+                          submissions.run_id, submissions.turn_number,
+                          submissions.state, submissions.remote_status,
+                          submissions.qc_summary,
+                          runs.repo_url, runs.repo_name
+                     FROM solo_qa_submissions AS submissions
+                     JOIN runs ON runs.id = submissions.run_id
+                    WHERE submissions.qc_summary != ''
+                    ORDER BY COALESCE(submissions.remote_updated_at,
+                                      submissions.submitted_at,
+                                      submissions.updated_at) DESC"""
+            ).fetchall()
+    except sqlite3.Error:
+        rows = []
+    evidence_keys = set()
+    for row in rows:
+        if repository_generation_token(row["repo_url"], row["repo_name"]) != repository_token:
+            continue
+        if str(row["state"] or "") not in {"needs_fix", "discarded"} and str(
+            row["remote_status"] or ""
+        ) not in {"PENDING_FIX", "DISCARDED"}:
+            continue
+        if not same_repository_rule_c_qc_summary(row["qc_summary"]):
+            continue
+        evidence_keys.add(
+            str(row["remote_submission_id"] or "").strip()
+            or f"{row['run_id']}:{int(row['turn_number'])}"
+        )
+        if len(evidence_keys) >= REPOSITORY_RULE_C_SATURATION_MIN_REJECTIONS:
+            return (
+                "同仓库已有至少 "
+                f"{REPOSITORY_RULE_C_SATURATION_MIN_REJECTIONS} 条 SOLO-QA 规则 C 退回记录"
+            )
+    return ""
+
+
 def exhausted_auto_iteration_source_should_be_blocked(job: Dict[str, Any]) -> bool:
     """Keep deterministic review failures out of the automatic refill pool."""
     if not bool(job.get("auto_refill")):
         return False
     detail = str(job.get("error") or job.get("last_error") or "").strip()
-    exhausted = detail.startswith(
-        f"连续 {ITERATION_GENERATION_ATTEMPTS} 次未生成合规迭代需求"
-    )
+    exhausted = iteration_generation_exhausted(detail)
     if not exhausted:
         return False
-    if same_repository_rule_c_failure(detail):
+    if strong_same_repository_rule_c_failure(detail):
         return True
     return bool(
         str(job.get("task_type") or "") == "Bug 修复"
@@ -7203,7 +7298,7 @@ def exhausted_auto_iteration_source_should_be_blocked(job: Dict[str, Any]) -> bo
 
 def exhausted_auto_iteration_block_stage(job: Dict[str, Any]) -> str:
     detail = str(job.get("error") or job.get("last_error") or "")
-    if same_repository_rule_c_failure(detail):
+    if strong_same_repository_rule_c_failure(detail):
         return "同仓库规则 C 命中，当前来源已永久跳过"
     if str(job.get("task_type") or "") == "Bug 修复":
         return "当前代码基线无合规 Bug，已禁止自动重试"
@@ -7219,6 +7314,8 @@ def automatic_iteration_worker(
     recovery_count: int = 0,
     generation_feedback: str = "",
 ) -> None:
+    rule_c_failure = False
+    failure_detail = ""
     try:
         ensure_job_active()
         created = generate_and_start_iteration(
@@ -7261,14 +7358,12 @@ def automatic_iteration_worker(
             current_job.get("lineage_origin_run_id") or source_run_id
         )
         target_sequence = current_job.get("target_sequence")
-        generation_exhausted = (
+        generation_exhausted = bool(
             isinstance(exc, WorkflowError)
-            and detail.startswith(
-                f"连续 {ITERATION_GENERATION_ATTEMPTS} 次未生成合规迭代需求"
-            )
+            and iteration_generation_exhausted(detail)
         )
         rule_c_failure = bool(
-            generation_exhausted and same_repository_rule_c_failure(detail)
+            generation_exhausted and strong_same_repository_rule_c_failure(detail)
         )
         candidate_quality_failure = bool(
             generation_exhausted
@@ -7277,13 +7372,14 @@ def automatic_iteration_worker(
         deterministic_candidate_failure = bool(
             rule_c_failure or candidate_quality_failure
         )
-        no_hard_bugfix = bool(
+        rejected_bugfix_candidate = bool(
             auto_refill
             and generation_exhausted
             and target_task_type == "Bug 修复"
-            and "Bug 修复难度未达到困难" in detail
+            and candidate_quality_failure
+            and not rule_c_failure
         )
-        if no_hard_bugfix:
+        if rejected_bugfix_candidate:
             fallback_job = {
                 "status": "generating",
                 "source_run_id": source_run_id,
@@ -7294,26 +7390,25 @@ def automatic_iteration_worker(
                 "recovery_count": 0,
                 "target_sequence": target_sequence,
                 "last_error": detail,
-                "stage": "没有困难 Bug，已跳过并改为 Feature",
+                "stage": "Bug 首次复核未通过，已改为 Feature",
                 "updated_at": now_text(),
             }
             put_iteration_job(fallback_job)
             try:
                 add_event(
                     source_run_id,
-                    "当前代码基线没有困难及以上的 Bug 修复候选，"
-                    "已跳过本次 Bug 修复并改为生成 Feature 迭代",
+                    "Bug 候选首次复核未通过，已停止继续查找并改为生成 Feature 迭代",
                     "warning",
                 )
                 record_auto_refill_candidate_skip(
-                    f"{source_run_id} 没有困难及以上的 Bug 修复候选，已改为 Feature 迭代"
+                    f"{source_run_id} 的 Bug 候选首次复核未通过，已改为 Feature 迭代"
                 )
             except Exception as event_exc:
                 log_workflow_exception(source_run_id, "bugfix-difficulty-skip", event_exc)
             clear_job_cancellation(f"iteration:{source_run_id}")
             threading.Thread(
                 target=automatic_iteration_worker,
-                args=(source_run_id, "Feature 迭代", False, True, 0, detail),
+                args=(source_run_id, "Feature 迭代", False, True, 0, ""),
                 daemon=True,
             ).start()
             return
@@ -7545,7 +7640,7 @@ def queue_automatic_iteration_locked(
         "lineage_origin_run_id": lineage_origin_run_id,
         "task_type": target_task_type,
         "target_sequence": int(lineage_state.get("iteration_count") or 0) + 1,
-        "stage": "生成候选 1/2",
+        "stage": f"生成候选 1/{iteration_generation_attempt_limit(target_task_type)}",
         "started_at": now_text(),
         "last_error": generation_feedback,
     }
@@ -7927,7 +8022,7 @@ def queue_refill_iteration_locked(source_run_id: str) -> Dict[str, Any]:
         "task_type": target_task_type,
         "auto_refill": True,
         "target_sequence": int(candidate["iteration_count"]) + 1,
-        "stage": "生成候选 1/2",
+        "stage": f"生成候选 1/{iteration_generation_attempt_limit(target_task_type)}",
         "started_at": now_text(),
         "last_error": generation_feedback,
     }
@@ -7979,9 +8074,11 @@ def automatic_refill_once() -> Dict[str, Any]:
             iteration_generation_count >= ITERATION_GENERATION_MAX_PARALLEL
         )
 
-        replace_saturated_source = bool(
+        backlog_replacement_requested = bool(
             configuration["enabled"] and auto_refill_new_project_backlog() > 0
         )
+        replace_saturated_source = backlog_replacement_requested
+        saturation_precheck_reason = ""
         source = (
             None
             if replace_saturated_source or iteration_generation_saturated
@@ -7989,6 +8086,37 @@ def automatic_refill_once() -> Dict[str, Any]:
                 difficulty_recovery_only=not configuration["enabled"]
             )
         )
+        if source and configuration["enabled"]:
+            saturation_precheck_reason = repository_semantic_saturation_reason(source)
+            if saturation_precheck_reason:
+                source_run_id = str(source["id"])
+                target_task_type = str(
+                    source.get("next_iteration_task_type") or "Feature 迭代"
+                )
+                put_iteration_job(
+                    {
+                        "status": "blocked",
+                        "source_run_id": source_run_id,
+                        "lineage_origin_run_id": source_run_id,
+                        "task_type": target_task_type,
+                        "auto_refill": True,
+                        "target_sequence": int(source["iteration_count"]) + 1,
+                        "stage": "仓库语义预检饱和，已永久跳过",
+                        "last_error": saturation_precheck_reason,
+                        "updated_at": now_text(),
+                    }
+                )
+                add_event(
+                    source_run_id,
+                    f"自动补题在生成前跳过当前仓库：{saturation_precheck_reason}",
+                    "warning",
+                )
+                record_auto_refill_candidate_skip(
+                    f"{source.get('repo_name') or source_run_id} 生成前语义预检已跳过："
+                    f"{saturation_precheck_reason}"
+                )
+                source = None
+                replace_saturated_source = True
         if source:
             source_run_id = str(source["id"])
             target_task_type = str(
@@ -8072,9 +8200,13 @@ def automatic_refill_once() -> Dict[str, Any]:
             allow_parallel_generation=True,
         )
         if replace_saturated_source:
-            consume_auto_refill_new_project_request()
+            if backlog_replacement_requested:
+                consume_auto_refill_new_project_request()
             detail = (
-                "自动补题：迭代来源语义已饱和，已直接创建新的 "
+                f"自动补题：生成前确认仓库语义已饱和（{saturation_precheck_reason}），"
+                f"已直接创建新的 {created['project_number']} 0-1 任务"
+                if saturation_precheck_reason
+                else "自动补题：迭代来源语义已饱和，已直接创建新的 "
                 f"{created['project_number']} 0-1 任务"
             )
         elif iteration_generation_saturated:

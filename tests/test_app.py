@@ -8346,6 +8346,59 @@ class AutoRefillTests(unittest.TestCase):
                 )
                 self.assertEqual(app.auto_refill_new_project_backlog(), 0)
 
+    def test_refill_prechecks_repository_saturation_before_generation(self):
+        source = {
+            "id": "root11111111",
+            "repo_name": "root-one",
+            "repo_url": "https://github.com/example/root-one",
+            "iteration_count": 2,
+            "next_iteration_task_type": "Bug 修复",
+        }
+        created = {"id": "new01111111", "project_number": "0009"}
+        database = mock.MagicMock()
+        database.execute.return_value.fetchall.return_value = []
+        connection = mock.MagicMock()
+        connection.__enter__.return_value = database
+        with mock.patch.object(
+            app,
+            "auto_refill_configuration",
+            return_value={"enabled": True, "project_directory": "team-a"},
+        ), mock.patch.object(
+            app, "automatic_refill_occupancy", return_value=1
+        ), mock.patch.object(
+            app, "active_task_generation_count", return_value=0
+        ), mock.patch.object(
+            app, "active_iteration_generation_count", return_value=0
+        ), mock.patch.object(
+            app, "auto_refill_new_project_backlog", return_value=0
+        ), mock.patch.object(
+            app, "auto_refill_iteration_candidate", return_value=source
+        ), mock.patch.object(
+            app,
+            "repository_semantic_saturation_reason",
+            return_value="同仓库已有题面被规则 C 明确判定语义重复",
+        ), mock.patch.object(
+            app, "put_iteration_job"
+        ) as put, mock.patch.object(
+            app, "queue_refill_iteration"
+        ) as queue, mock.patch.object(
+            app, "create_automatic_run", return_value=created
+        ), mock.patch.object(
+            app, "add_event"
+        ), mock.patch.object(
+            app, "record_auto_refill_candidate_skip"
+        ), mock.patch.object(
+            app, "record_auto_refill_detail"
+        ), mock.patch.object(
+            app, "db_connection", return_value=connection
+        ):
+            result = app.automatic_refill_once()
+
+        self.assertEqual(result["action"], "0-1")
+        self.assertIn("生成前确认仓库语义已饱和", result["detail"])
+        self.assertEqual(put.call_args.args[0]["status"], "blocked")
+        queue.assert_not_called()
+
     def test_reenabling_auto_refill_starts_a_fresh_failure_window(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory).resolve()
@@ -9440,6 +9493,28 @@ class IterationGenerationTests(unittest.TestCase):
             "bugfix-generation 超时，已停止",
         )
 
+    def test_bugfix_generation_stops_after_the_first_rejected_candidate(self):
+        context = {"repo_path": "/tmp/existing-project", "repo_name": "demo"}
+        source = {
+            "phase": "complete",
+            "container_cleaned": 1,
+            "repo_url": "https://example.invalid/demo",
+            "first_prompt_id": "prompt-1",
+            "imported_baseline": 0,
+        }
+        with mock.patch.object(app, "run_row", return_value=source), mock.patch.object(
+            app, "iteration_project_context", return_value=context
+        ), mock.patch.object(
+            app,
+            "run_codex_iteration_generation",
+            side_effect=app.WorkflowError("真实 Bug 复核不合格"),
+        ) as generate, self.assertRaisesRegex(
+            app.WorkflowError, "连续 1 次未生成合规迭代需求"
+        ):
+            app.generate_iteration_candidate("source111111", "Bug 修复")
+
+        generate.assert_called_once()
+
     def test_iteration_timeout_does_not_erase_previous_quality_feedback(self):
         candidate = self.candidate()
         context = {"repo_path": "/tmp/existing-project", "repo_name": "demo"}
@@ -10284,6 +10359,29 @@ class IterationGenerationTests(unittest.TestCase):
         event.assert_called_once_with(
             "source111111", "自动生成迭代需求失败：模型复核未通过", "error"
         )
+
+    def test_successful_auto_refill_iteration_does_not_enter_rule_c_cleanup(self):
+        with app.ITERATION_JOB_LOCK:
+            app.ITERATION_JOBS["source111111"] = {"status": "generating"}
+        try:
+            with mock.patch.object(
+                app,
+                "generate_and_start_iteration",
+                return_value={"id": "created11111", "task_type": "Feature 迭代"},
+            ), mock.patch.object(
+                app, "request_auto_refill_new_project"
+            ) as request_new_project:
+                app.automatic_iteration_worker(
+                    "source111111", "Feature 迭代", False, True
+                )
+
+            with app.ITERATION_JOB_LOCK:
+                job = dict(app.ITERATION_JOBS["source111111"])
+            self.assertEqual(job["status"], "complete")
+            request_new_project.assert_not_called()
+        finally:
+            with app.ITERATION_JOB_LOCK:
+                app.ITERATION_JOBS.pop("source111111", None)
 
     def test_auto_refill_cools_down_non_semantic_feature_review_failure(self):
         detail = (
@@ -14174,7 +14272,7 @@ class NiuBugWorkflowMergeTests(unittest.TestCase):
         self.assertEqual(score.call_args.args[5], trajectory)
         self.assertEqual(result, scored)
 
-    def test_candidate_quality_blocks_only_bugfix_auto_refill(self):
+    def test_candidate_quality_switches_bugfix_auto_refill_to_feature(self):
         detail = (
             f"连续 {app.ITERATION_GENERATION_ATTEMPTS} 次未生成合规迭代需求："
             "代码基线中没有三个可以稳定复现的真实问题"
@@ -14205,17 +14303,21 @@ class NiuBugWorkflowMergeTests(unittest.TestCase):
             app, "record_auto_refill_candidate_skip"
         ) as skipped, mock.patch.object(
             app, "record_auto_refill_failure"
-        ) as failed:
+        ) as failed, mock.patch.object(
+            app.threading, "Thread"
+        ) as thread:
             app.automatic_iteration_worker(
                 "source111111", "Bug 修复", False, True
             )
 
-        self.assertEqual(saved["status"], "blocked")
+        self.assertEqual(saved["status"], "generating")
+        self.assertEqual(saved["task_type"], "Feature 迭代")
         self.assertEqual(saved["baseline_run_id"], "base11111111")
         self.assertEqual(saved["target_sequence"], 2)
-        self.assertIsNone(saved["cooldown_until_epoch"])
         skipped.assert_called_once()
         failed.assert_not_called()
+        self.assertEqual(thread.call_args.kwargs["args"][1], "Feature 迭代")
+        self.assertEqual(thread.call_args.kwargs["args"][5], "")
 
     def test_bugfix_below_hard_is_skipped_and_replaced_with_feature(self):
         detail = (
@@ -14255,7 +14357,7 @@ class NiuBugWorkflowMergeTests(unittest.TestCase):
 
         self.assertEqual(saved["status"], "generating")
         self.assertEqual(saved["task_type"], "Feature 迭代")
-        self.assertIn("没有困难 Bug", saved["stage"])
+        self.assertIn("Bug 首次复核未通过", saved["stage"])
         self.assertEqual(thread.call_args.kwargs["target"], app.automatic_iteration_worker)
         self.assertEqual(thread.call_args.kwargs["args"][1], "Feature 迭代")
         event.assert_called_once()
@@ -14272,6 +14374,15 @@ class NiuBugWorkflowMergeTests(unittest.TestCase):
                 self.assertTrue(
                     app.iteration_generation_infrastructure_failure(detail)
                 )
+
+    def test_rule_c_timeout_mix_is_not_treated_as_semantic_saturation(self):
+        detail = (
+            "连续 1 次未生成合规迭代需求："
+            "提交前语义查重命中同仓库历史；504 Gateway Time-out"
+        )
+
+        self.assertTrue(app.same_repository_rule_c_failure(detail))
+        self.assertFalse(app.strong_same_repository_rule_c_failure(detail))
 
     def test_blocked_bugfix_is_scoped_to_the_current_lineage_sequence(self):
         with tempfile.TemporaryDirectory() as directory:
