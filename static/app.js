@@ -1,4 +1,4 @@
-const UI_VERSION = "20260916.6";
+const UI_VERSION = "20260916.7";
 const EXPORT_REFRESH_INTERVAL_MS = 60 * 1000;
 const TABLE_PAGE_SIZE = 20;
 const SOLO_QA_AUTO_REPAIR_POLL_MS = 3000;
@@ -45,6 +45,14 @@ const state = {
   analyticsChartType: "bar",
   analyticsBusy: false,
   analyticsLastLoadedAt: 0,
+  difficultyReassessmentDate: "",
+  difficultyReassessmentPreview: null,
+  difficultyReassessmentJob: null,
+  difficultyReassessmentItems: [],
+  difficultyReassessmentBusy: false,
+  difficultyReassessmentPoller: null,
+  difficultyReassessmentSelected: new Set(),
+  difficultyReassessmentSelectionJobId: "",
   soloQaBridgeReady: false,
   soloQaBridgeVersion: "",
   soloQaBusy: false,
@@ -1990,6 +1998,218 @@ async function loadHourlyAnalytics(dateValue = state.analyticsDate || localDateV
   }
 }
 
+function yesterdayDateValue() {
+  const date = new Date();
+  date.setDate(date.getDate() - 1);
+  return localDateValue(date);
+}
+
+function difficultyReassessmentStatusLabel(status) {
+  return ({
+    pending: "等待判断",
+    proposed: "待确认",
+    unchanged: "无需调整",
+    applied: "已写回",
+    stale: "资料已变化",
+    failed: "失败",
+  })[status] || status || "未开始";
+}
+
+function updateDifficultyReassessmentSelection() {
+  const proposedKeys = new Set(
+    state.difficultyReassessmentItems
+      .filter((item) => item.status === "proposed")
+      .map((item) => item.key),
+  );
+  state.difficultyReassessmentSelected = new Set(
+    [...state.difficultyReassessmentSelected].filter((key) => proposedKeys.has(key)),
+  );
+  const count = state.difficultyReassessmentSelected.size;
+  $("#difficulty-reassessment-selection").textContent = count
+    ? `已选择 ${count} 条难度调整建议`
+    : "没有选中待写回结果";
+  const jobStatus = state.difficultyReassessmentJob?.status || "";
+  $("#difficulty-reassessment-apply").disabled =
+    state.difficultyReassessmentBusy || jobStatus !== "ready_to_apply" || !count;
+}
+
+function renderDifficultyReassessment() {
+  const preview = state.difficultyReassessmentPreview;
+  const job = state.difficultyReassessmentJob;
+  const summary = $("#difficulty-reassessment-summary");
+  const start = $("#difficulty-reassessment-start");
+  const dateInput = $("#difficulty-reassessment-date");
+  const lowOnlyInput = $("#difficulty-reassessment-low-only");
+  if (dateInput && state.difficultyReassessmentDate) {
+    dateInput.value = state.difficultyReassessmentDate;
+  }
+  if (preview) {
+    const distribution = preview.distribution || {};
+    summary.className = "difficulty-reassessment-summary";
+    summary.textContent = `${preview.date} 共 ${preview.total || 0} 条：简单 ${distribution["简单"] || 0}、中等 ${distribution["中等"] || 0}、困难 ${distribution["困难"] || 0}、地狱 ${distribution["地狱"] || 0}；可安全重判 ${preview.eligible || 0} 条，远端已锁定 ${preview.locked || 0} 条。`;
+  }
+  if (job) {
+    if (job.status === "running") {
+      summary.className = "difficulty-reassessment-summary running";
+      summary.textContent = `正在重新判断 ${job.scope_date}：已完成 ${job.processed || 0}/${job.total || 0}，发现 ${job.changed || 0} 条可能需要调整。分析阶段不会改写原评分。`;
+    } else if (job.status === "failed") {
+      summary.className = "difficulty-reassessment-summary failed";
+      summary.textContent = `难度重判停止：${job.error || "未知错误"}；已处理 ${job.processed || 0}/${job.total || 0}。`;
+    } else if (["ready_to_apply", "applied"].includes(job.status)) {
+      summary.className = "difficulty-reassessment-summary";
+      summary.textContent = `${job.scope_date} 重判完成：建议调整 ${job.changed || 0} 条、保持 ${job.unchanged || 0} 条、失败或资料变化 ${job.failed || 0} 条。${job.status === "applied" ? "选中的建议已经写回。" : "请核对下表后再确认写回。"}`;
+    }
+  }
+  start.disabled = state.difficultyReassessmentBusy
+    || job?.status === "running"
+    || !preview?.eligible;
+  dateInput.disabled = state.difficultyReassessmentBusy || job?.status === "running";
+  lowOnlyInput.disabled = state.difficultyReassessmentBusy || job?.status === "running";
+
+  const items = state.difficultyReassessmentItems || [];
+  if (!items.length) {
+    $("#difficulty-reassessment-list").innerHTML = '<tr><td colspan="7" class="table-empty">尚未生成难度重判结果</td></tr>';
+    updateDifficultyReassessmentSelection();
+    return;
+  }
+  $("#difficulty-reassessment-list").innerHTML = items.map((item) => {
+    const selectable = item.status === "proposed";
+    const checked = selectable && state.difficultyReassessmentSelected.has(item.key);
+    const evidence = Array.isArray(item.evidence) ? item.evidence : [];
+    const changed = item.proposed_difficulty && item.proposed_difficulty !== item.old_difficulty;
+    return `<tr>
+      <td data-label="选择"><input type="checkbox" data-difficulty-turn="${escapeHtml(item.key)}" ${checked ? "checked" : ""} ${selectable ? "" : "disabled"} /></td>
+      <td data-label="项目／轮次"><b>${escapeHtml(item.repo_name || item.run_id)}</b><small>第 ${Number(item.turn_number || 0)} 轮</small></td>
+      <td data-label="原难度">${escapeHtml(item.old_difficulty || "未记录")}</td>
+      <td data-label="建议难度" class="${changed ? "difficulty-change" : ""}">${escapeHtml(item.proposed_difficulty || "判断中")}</td>
+      <td data-label="可信度">${escapeHtml(item.confidence || "—")}</td>
+      <td data-label="判断依据">${escapeHtml(item.rationale || item.error || "等待处理")}<div class="difficulty-evidence">${evidence.map((value) => escapeHtml(value)).join("；")}</div></td>
+      <td data-label="状态">${escapeHtml(difficultyReassessmentStatusLabel(item.status))}</td>
+    </tr>`;
+  }).join("");
+  updateDifficultyReassessmentSelection();
+}
+
+function stopDifficultyReassessmentPolling() {
+  if (state.difficultyReassessmentPoller) {
+    window.clearInterval(state.difficultyReassessmentPoller);
+    state.difficultyReassessmentPoller = null;
+  }
+}
+
+async function loadDifficultyReassessmentJob(jobId) {
+  const result = await api(`/api/analytics/difficulty-reassessment?job_id=${encodeURIComponent(jobId)}`);
+  state.difficultyReassessmentJob = result.job;
+  state.difficultyReassessmentItems = result.items || [];
+  if (
+    result.job?.status === "ready_to_apply"
+    && state.difficultyReassessmentSelectionJobId !== result.job.id
+  ) {
+    state.difficultyReassessmentSelectionJobId = result.job.id;
+    state.difficultyReassessmentSelected = new Set(
+      state.difficultyReassessmentItems
+        .filter((item) => item.status === "proposed")
+        .map((item) => item.key),
+    );
+  }
+  renderDifficultyReassessment();
+  if (result.job?.status !== "running") stopDifficultyReassessmentPolling();
+}
+
+function watchDifficultyReassessment(jobId) {
+  stopDifficultyReassessmentPolling();
+  state.difficultyReassessmentPoller = window.setInterval(async () => {
+    try {
+      await loadDifficultyReassessmentJob(jobId);
+    } catch (error) {
+      stopDifficultyReassessmentPolling();
+      showNotice(error.message);
+    }
+  }, 3000);
+}
+
+async function loadDifficultyReassessment(dateValue = state.difficultyReassessmentDate || yesterdayDateValue()) {
+  state.difficultyReassessmentDate = dateValue;
+  const lowOnly = $("#difficulty-reassessment-low-only").checked;
+  try {
+    const [preview, current] = await Promise.all([
+      api(`/api/analytics/difficulty-reassessment/preview?date=${encodeURIComponent(dateValue)}&low_only=${lowOnly ? "1" : "0"}`),
+      api(`/api/analytics/difficulty-reassessment?date=${encodeURIComponent(dateValue)}`),
+    ]);
+    state.difficultyReassessmentPreview = preview;
+    state.difficultyReassessmentJob = current.job;
+    state.difficultyReassessmentItems = current.items || [];
+    if (
+      current.job?.status === "ready_to_apply"
+      && state.difficultyReassessmentSelectionJobId !== current.job.id
+    ) {
+      state.difficultyReassessmentSelectionJobId = current.job.id;
+      state.difficultyReassessmentSelected = new Set(
+        state.difficultyReassessmentItems
+          .filter((item) => item.status === "proposed")
+          .map((item) => item.key),
+      );
+    }
+    renderDifficultyReassessment();
+    if (current.job?.status === "running") watchDifficultyReassessment(current.job.id);
+  } catch (error) {
+    showNotice(error.message);
+  }
+}
+
+async function startDifficultyReassessment() {
+  if (state.difficultyReassessmentBusy) return;
+  const preview = state.difficultyReassessmentPreview;
+  if (!preview?.eligible) return;
+  if (!window.confirm(`将分析 ${preview.date} 的 ${preview.eligible} 条可修改记录。分析完成前不会改写难度，是否继续？`)) return;
+  state.difficultyReassessmentBusy = true;
+  renderDifficultyReassessment();
+  try {
+    const result = await api("/api/analytics/difficulty-reassessment", {
+      method: "POST",
+      body: JSON.stringify({
+        date: state.difficultyReassessmentDate,
+        low_only: $("#difficulty-reassessment-low-only").checked,
+      }),
+    });
+    state.difficultyReassessmentJob = result.job;
+    state.difficultyReassessmentItems = result.items || [];
+    renderDifficultyReassessment();
+    watchDifficultyReassessment(result.job.id);
+  } catch (error) {
+    showNotice(error.message);
+  } finally {
+    state.difficultyReassessmentBusy = false;
+    renderDifficultyReassessment();
+  }
+}
+
+async function applySelectedDifficultyReassessment() {
+  const job = state.difficultyReassessmentJob;
+  const keys = [...state.difficultyReassessmentSelected];
+  if (!job || !keys.length || state.difficultyReassessmentBusy) return;
+  if (!window.confirm(`将把 ${keys.length} 条已核对的难度调整写回评分；五维分数和点评保持不变。是否继续？`)) return;
+  state.difficultyReassessmentBusy = true;
+  renderDifficultyReassessment();
+  try {
+    const result = await api("/api/analytics/difficulty-reassessment/apply", {
+      method: "POST",
+      body: JSON.stringify({ job_id: job.id, turn_keys: keys }),
+    });
+    showNotice(`已写回 ${result.applied || 0} 条；跳过 ${result.skipped || 0} 条资料已变化记录`);
+    await Promise.all([
+      loadDifficultyReassessmentJob(job.id),
+      loadCompletedTurns({ autoRepair: false }),
+      loadRuns(),
+    ]);
+  } catch (error) {
+    showNotice(error.message);
+  } finally {
+    state.difficultyReassessmentBusy = false;
+    renderDifficultyReassessment();
+  }
+}
+
 function setPageHeader(title, description, showNewButton = true) {
   pageTitle.textContent = title;
   pageDescription.textContent = description;
@@ -2054,7 +2274,12 @@ async function showAnalyticsPage() {
   analyticsView.classList.remove("hidden");
   setActiveModuleTab("analytics");
   setPageHeader("数据分析", "按自然小时查看已完成轮次的产出节奏和任务类型分布。", true);
-  await loadHourlyAnalytics(state.analyticsDate || localDateValue());
+  await Promise.all([
+    loadHourlyAnalytics(state.analyticsDate || localDateValue()),
+    loadDifficultyReassessment(
+      state.difficultyReassessmentDate || yesterdayDateValue(),
+    ),
+  ]);
   window.scrollTo({ top: 0, behavior: "smooth" });
 }
 
@@ -2648,6 +2873,28 @@ $("#analytics-date").addEventListener("change", (event) => {
 $("#analytics-today").addEventListener("click", () => {
   loadHourlyAnalytics(localDateValue());
 });
+$("#difficulty-reassessment-date").addEventListener("change", (event) => {
+  if (event.target.value) loadDifficultyReassessment(event.target.value);
+});
+$("#difficulty-reassessment-low-only").addEventListener("change", () => {
+  loadDifficultyReassessment(
+    $("#difficulty-reassessment-date").value || yesterdayDateValue(),
+  );
+});
+$("#difficulty-reassessment-preview").addEventListener("click", () => {
+  loadDifficultyReassessment(
+    $("#difficulty-reassessment-date").value || yesterdayDateValue(),
+  );
+});
+$("#difficulty-reassessment-start").addEventListener("click", startDifficultyReassessment);
+$("#difficulty-reassessment-apply").addEventListener("click", applySelectedDifficultyReassessment);
+$("#difficulty-reassessment-list").addEventListener("change", (event) => {
+  const input = event.target.closest("[data-difficulty-turn]");
+  if (!input) return;
+  if (input.checked) state.difficultyReassessmentSelected.add(input.dataset.difficultyTurn);
+  else state.difficultyReassessmentSelected.delete(input.dataset.difficultyTurn);
+  updateDifficultyReassessmentSelection();
+});
 $("#analytics-chart-bar").addEventListener("click", () => setAnalyticsChartType("bar"));
 $("#analytics-chart-line").addEventListener("click", () => setAnalyticsChartType("line"));
 $("#hourly-output-chart").addEventListener("pointermove", (event) => {
@@ -2881,7 +3128,9 @@ async function refresh() {
 
 async function boot() {
   state.analyticsDate = localDateValue();
+  state.difficultyReassessmentDate = yesterdayDateValue();
   $("#analytics-date").value = state.analyticsDate;
+  $("#difficulty-reassessment-date").value = state.difficultyReassessmentDate;
   await Promise.all([loadHealth(), loadRuns()]);
   await applyRoute();
   pingSoloQaBridge();

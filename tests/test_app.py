@@ -1768,6 +1768,11 @@ class ValidationTests(unittest.TestCase):
             'id="hourly-output-chart"',
             'id="hourly-chart-tooltip"',
             'id="hourly-output-list"',
+            'id="difficulty-reassessment-date"',
+            'id="difficulty-reassessment-low-only"',
+            'id="difficulty-reassessment-start"',
+            'id="difficulty-reassessment-list"',
+            'id="difficulty-reassessment-apply"',
         ):
             self.assertIn(control, html)
         self.assertIn("#analytics", javascript)
@@ -1776,10 +1781,14 @@ class ValidationTests(unittest.TestCase):
         self.assertIn("analyticsTaskTypes.forEach", javascript)
         self.assertIn("renderHourlyChart", javascript)
         self.assertIn("showHourlyChartTooltip", javascript)
+        self.assertIn("/api/analytics/difficulty-reassessment", javascript)
+        self.assertIn("startDifficultyReassessment", javascript)
+        self.assertIn("applySelectedDifficultyReassessment", javascript)
         self.assertIn(".module-tab.active", styles)
         self.assertIn(".hourly-chart", styles)
         self.assertIn(".analytics-line-chart", styles)
         self.assertIn(".analytics-tooltip", styles)
+        self.assertIn(".difficulty-reassessment-card", styles)
 
     def test_run_list_exposes_imported_baseline_dialog(self):
         html = (app.STATIC_DIR / "index.html").read_text(encoding="utf-8")
@@ -10598,6 +10607,166 @@ class ExportTests(unittest.TestCase):
                 ),
             )
         return repo
+
+    def set_turn_difficulty_and_date(
+        self,
+        run_id,
+        difficulty="中等",
+        completed_at="2026-09-15 12:00:00 +0800",
+    ):
+        with app.db_connection() as database:
+            row = database.execute(
+                """SELECT review_result FROM run_turns
+                    WHERE run_id = ? AND turn_number = 1""",
+                (run_id,),
+            ).fetchone()
+            review = json.loads(row["review_result"])
+            review["evaluation"]["task_difficulty"] = difficulty
+            database.execute(
+                """UPDATE run_turns SET review_result = ?, updated_at = ?
+                    WHERE run_id = ? AND turn_number = 1""",
+                (
+                    json.dumps(review, ensure_ascii=False),
+                    completed_at,
+                    run_id,
+                ),
+            )
+            database.execute(
+                "UPDATE runs SET task_difficulty = ? WHERE id = ?",
+                (difficulty, run_id),
+            )
+
+    def test_difficulty_reassessment_preview_excludes_remote_locked_turns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.object(app, "DB_PATH", root / "test.db"), mock.patch.object(
+                app, "DATA_DIR", root
+            ):
+                app.initialize_database()
+                self.insert_completed_turn(root, "e11111111111")
+                self.insert_completed_turn(root / "second", "d11111111111")
+                self.set_turn_difficulty_and_date("e11111111111")
+                self.set_turn_difficulty_and_date("d11111111111")
+                timestamp = app.now_text()
+                with app.db_connection() as database:
+                    database.execute(
+                        """INSERT INTO solo_qa_submissions(
+                             run_id, turn_number, remote_submission_id,
+                             remote_status, state, created_at, updated_at
+                           ) VALUES (?, 1, 'remote-locked', 'QC_PASSED',
+                                     'qc_passed', ?, ?)""",
+                        ("d11111111111", timestamp, timestamp),
+                    )
+
+                preview = app.difficulty_reassessment_preview(
+                    "2026-09-15", low_only=True
+                )
+
+        self.assertEqual(preview["total"], 2)
+        self.assertEqual(preview["eligible"], 1)
+        self.assertEqual(preview["locked"], 1)
+        self.assertEqual(preview["distribution"]["中等"], 2)
+
+    def test_difficulty_reassessment_stages_then_applies_only_difficulty(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.object(app, "DB_PATH", root / "test.db"), mock.patch.object(
+                app, "DATA_DIR", root
+            ), mock.patch.object(app.threading, "Thread") as thread:
+                app.initialize_database()
+                self.insert_completed_turn(root)
+                self.set_turn_difficulty_and_date("abc123abc123")
+                before = app.turn_evaluation(app.completed_turn_rows()[0])
+                started = app.start_difficulty_reassessment(
+                    {"date": "2026-09-15", "low_only": True}
+                )
+                job_id = started["job"]["id"]
+                thread.assert_called_once()
+                with mock.patch.object(
+                    app,
+                    "run_codex_difficulty_reassessment_batch",
+                    return_value={
+                        "abc123abc123:1": {
+                            "key": "abc123abc123:1",
+                            "task_difficulty": "困难",
+                            "confidence": "高",
+                            "rationale": "实现包含不可删除的恢复状态不变量。",
+                            "evidence": ["状态恢复验收通过"],
+                        }
+                    },
+                ):
+                    app.difficulty_reassessment_worker(job_id)
+
+                staged = app.difficulty_reassessment_job(job_id)
+                unchanged_before_apply = app.turn_evaluation(
+                    app.completed_turn_rows()[0]
+                )
+                applied = app.apply_difficulty_reassessment(
+                    job_id, ["abc123abc123:1"]
+                )
+                after = app.turn_evaluation(app.completed_turn_rows()[0])
+                run = dict(app.run_row("abc123abc123"))
+
+        self.assertEqual(staged["job"]["status"], "ready_to_apply")
+        self.assertEqual(staged["items"][0]["status"], "proposed")
+        self.assertEqual(unchanged_before_apply["task_difficulty"], "中等")
+        self.assertEqual(applied["applied"], 1)
+        self.assertEqual(after["task_difficulty"], "困难")
+        self.assertEqual(after["delivery"], before["delivery"])
+        self.assertEqual(run["task_difficulty"], "困难")
+
+    def test_difficulty_reassessment_apply_skips_newly_locked_turn(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.object(app, "DB_PATH", root / "test.db"), mock.patch.object(
+                app, "DATA_DIR", root
+            ), mock.patch.object(app.threading, "Thread"):
+                app.initialize_database()
+                self.insert_completed_turn(root)
+                self.set_turn_difficulty_and_date("abc123abc123")
+                started = app.start_difficulty_reassessment(
+                    {"date": "2026-09-15", "low_only": True}
+                )
+                job_id = started["job"]["id"]
+                with mock.patch.object(
+                    app,
+                    "run_codex_difficulty_reassessment_batch",
+                    return_value={
+                        "abc123abc123:1": {
+                            "key": "abc123abc123:1",
+                            "task_difficulty": "困难",
+                            "confidence": "中",
+                            "rationale": "跨模块状态约束达到困难。",
+                            "evidence": ["验收材料"],
+                        }
+                    },
+                ):
+                    app.difficulty_reassessment_worker(job_id)
+                timestamp = app.now_text()
+                with app.db_connection() as database:
+                    database.execute(
+                        """INSERT INTO solo_qa_submissions(
+                             run_id, turn_number, remote_submission_id,
+                             remote_status, state, created_at, updated_at
+                           ) VALUES ('abc123abc123', 1, 'remote-pending',
+                                     'SUBMITTED', 'qc_pending', ?, ?)""",
+                        (timestamp, timestamp),
+                    )
+
+                result = app.apply_difficulty_reassessment(
+                    job_id, ["abc123abc123:1"]
+                )
+                current = app.turn_evaluation(app.completed_turn_rows()[0])
+                item = app.difficulty_reassessment_job(job_id)["items"][0]
+
+        self.assertEqual(result, {
+            "job_id": job_id,
+            "applied": 0,
+            "skipped": 1,
+            "remaining": 0,
+        })
+        self.assertEqual(current["task_difficulty"], "中等")
+        self.assertEqual(item["status"], "stale")
 
     def test_new_score_policy_blocks_over_21_and_offers_automatic_repair(self):
         with tempfile.TemporaryDirectory() as directory:

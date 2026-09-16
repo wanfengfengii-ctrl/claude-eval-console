@@ -330,6 +330,32 @@
               <article><span class="analytics-type-label"><i class="other"></i>其他类型</span><b id="analytics-type-other-count">—</b><small>当天完成条数</small></article>
             </div>
 
+            <div class="difficulty-reassessment-card">
+              <div class="analytics-section-heading">
+                <div>
+                  <h3>实际难度重新判断</h3>
+                  <p>按已保存的题面、轨迹、验收和代码复核证据重新定档；先生成候选，确认后才写回。</p>
+                </div>
+                <div class="difficulty-reassessment-controls">
+                  <label><span>完成日期</span><input id="difficulty-reassessment-date" type="date" /></label>
+                  <label class="difficulty-low-only"><input id="difficulty-reassessment-low-only" type="checkbox" checked />只复核简单／中等</label>
+                  <button class="secondary-button" id="difficulty-reassessment-preview" type="button">刷新范围</button>
+                  <button class="primary-button" id="difficulty-reassessment-start" type="button">开始重判</button>
+                </div>
+              </div>
+              <div class="difficulty-reassessment-summary" id="difficulty-reassessment-summary">正在读取可重判范围…</div>
+              <div class="records-table-wrap difficulty-reassessment-results">
+                <table class="analytics-table">
+                  <thead><tr><th>选择</th><th>项目／轮次</th><th>原难度</th><th>建议难度</th><th>可信度</th><th>判断依据</th><th>状态</th></tr></thead>
+                  <tbody id="difficulty-reassessment-list"><tr><td colspan="7" class="table-empty">尚未开始重判</td></tr></tbody>
+                </table>
+              </div>
+              <div class="difficulty-reassessment-actions">
+                <span id="difficulty-reassessment-selection">没有待写回结果</span>
+                <button class="primary-button" id="difficulty-reassessment-apply" type="button" disabled>写回选中结果</button>
+              </div>
+            </div>
+
             <div class="analytics-chart-card">
               <div class="analytics-section-heading">
                 <div><h3>小时趋势</h3><p id="analytics-chart-caption">正在读取统计数据…</p></div>
@@ -393,6 +419,6 @@
         </div>
       </form>
     </dialog>
-    <script src="/app.js?v=73" defer></script>
+    <script src="/app.js?v=74" defer></script>
   </body>
 </html>
