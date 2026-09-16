@@ -14505,7 +14505,7 @@ class NiuBugWorkflowMergeTests(unittest.TestCase):
                 ["docker-compose.yml"],
             )
 
-    def test_no_code_watchdog_stops_an_inactive_first_turn(self):
+    def test_no_code_watchdog_stops_at_25_minutes_despite_trace_activity(self):
         row = {
             "phase": "first_running",
             "container_name": "container-demo",
@@ -14515,25 +14515,25 @@ class NiuBugWorkflowMergeTests(unittest.TestCase):
         with mock.patch.object(app, "run_row", return_value=row), mock.patch.object(
             app, "turn_row", return_value={"created_at": app.now_text()}
         ), mock.patch.object(
-            app, "refresh_trace_snapshot", return_value=(None, None)
+            app, "refresh_trace_snapshot", return_value=(Path("/tmp/snapshot"), None)
         ), mock.patch.object(
             app, "docker_container_running", return_value=True
         ), mock.patch.object(
             app, "terminal_screen_text", return_value=""
         ), mock.patch.object(
-            app, "trace_activity_signature", return_value=None
+            app, "trace_activity_signature", return_value=(1, 100)
         ), mock.patch.object(
             app, "completion_recovery_sent_epoch", return_value=None
         ), mock.patch.object(
             app, "final_summary_recovery_sent_epoch", return_value=None
         ), mock.patch.object(
-            app, "seconds_between", return_value=2000
+            app, "seconds_between", return_value=1501
         ), mock.patch.object(
             app, "workspace_business_code_output_paths", return_value=[]
         ), mock.patch.object(
             app, "add_event"
         ), mock.patch.object(
-            app.time, "monotonic", side_effect=[0, 2000]
+            app.time, "monotonic", side_effect=[0, 1501]
         ), mock.patch.object(
             app, "NO_CODE_OUTPUT_PROBE_INTERVAL_SECONDS", 0
         ), mock.patch.object(
@@ -14542,7 +14542,101 @@ class NiuBugWorkflowMergeTests(unittest.TestCase):
             app.monitor_docker_turn("watch1111111", 1)
 
         stop.assert_called_once()
-        self.assertIn("30 分钟", stop.call_args.args[1])
+        self.assertIn("25 分钟", stop.call_args.args[1])
+        self.assertIn("未改变文件的命令不计为代码产出", stop.call_args.args[1])
+
+    def test_no_code_watchdog_warns_at_15_minutes_without_stopping(self):
+        active = {
+            "phase": "first_running",
+            "container_name": "container-demo",
+            "screen_name": "screen-demo",
+            "retry_not_before_epoch": 0,
+        }
+        with mock.patch.object(
+            app, "run_row", side_effect=[active, {"phase": "stopped"}]
+        ), mock.patch.object(
+            app, "turn_row", return_value={"created_at": app.now_text()}
+        ), mock.patch.object(
+            app, "refresh_trace_snapshot", return_value=(Path("/tmp/snapshot"), None)
+        ), mock.patch.object(
+            app, "docker_container_running", return_value=True
+        ), mock.patch.object(
+            app, "terminal_screen_text", return_value=""
+        ), mock.patch.object(
+            app, "trace_activity_signature", return_value=(1, 100)
+        ), mock.patch.object(
+            app, "completion_recovery_sent_epoch", return_value=None
+        ), mock.patch.object(
+            app, "final_summary_recovery_sent_epoch", return_value=None
+        ), mock.patch.object(
+            app, "seconds_between", return_value=901
+        ), mock.patch.object(
+            app, "workspace_business_code_output_paths", return_value=[]
+        ), mock.patch.object(
+            app, "add_event"
+        ) as event, mock.patch.object(
+            app, "update_run"
+        ) as update, mock.patch.object(
+            app.time, "monotonic", side_effect=[0, 901]
+        ), mock.patch.object(
+            app.time, "sleep"
+        ), mock.patch.object(
+            app, "NO_CODE_OUTPUT_PROBE_INTERVAL_SECONDS", 0
+        ), mock.patch.object(
+            app, "stop_run_for_no_code_output"
+        ) as stop:
+            app.monitor_docker_turn("watch1111111", 1)
+
+        event.assert_called_once()
+        self.assertIn("15 分钟", event.call_args.args[1])
+        self.assertIn("25 分钟", event.call_args.args[1])
+        self.assertIn("尚无源码产出", update.call_args.kwargs["status_detail"])
+        stop.assert_not_called()
+
+    def test_no_code_watchdog_keeps_running_after_real_code_output(self):
+        active = {
+            "phase": "first_running",
+            "container_name": "container-demo",
+            "screen_name": "screen-demo",
+            "retry_not_before_epoch": 0,
+        }
+        with mock.patch.object(
+            app, "run_row", side_effect=[active, {"phase": "stopped"}]
+        ), mock.patch.object(
+            app, "turn_row", return_value={"created_at": app.now_text()}
+        ), mock.patch.object(
+            app, "refresh_trace_snapshot", return_value=(Path("/tmp/snapshot"), None)
+        ), mock.patch.object(
+            app, "docker_container_running", return_value=True
+        ), mock.patch.object(
+            app, "terminal_screen_text", return_value=""
+        ), mock.patch.object(
+            app, "trace_activity_signature", return_value=(1, 100)
+        ), mock.patch.object(
+            app, "completion_recovery_sent_epoch", return_value=None
+        ), mock.patch.object(
+            app, "final_summary_recovery_sent_epoch", return_value=None
+        ), mock.patch.object(
+            app, "seconds_between", return_value=1501
+        ), mock.patch.object(
+            app, "workspace_business_code_output_paths", return_value=["app/main.py"]
+        ), mock.patch.object(
+            app, "add_event"
+        ) as event, mock.patch.object(
+            app, "update_run"
+        ), mock.patch.object(
+            app.time, "monotonic", side_effect=[0, 1501]
+        ), mock.patch.object(
+            app.time, "sleep"
+        ), mock.patch.object(
+            app, "NO_CODE_OUTPUT_PROBE_INTERVAL_SECONDS", 0
+        ), mock.patch.object(
+            app, "stop_run_for_no_code_output"
+        ) as stop:
+            app.monitor_docker_turn("watch1111111", 1)
+
+        event.assert_not_called()
+        stop.assert_not_called()
 
 
 if __name__ == "__main__":

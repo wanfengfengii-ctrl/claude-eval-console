@@ -89,10 +89,9 @@ MAX_BODY_BYTES = 1_000_000
 POLL_SECONDS = 3
 RUN_TIMEOUT_SECONDS = 6 * 60 * 60
 INACTIVITY_WARNING_SECONDS = 30 * 60
-NO_CODE_OUTPUT_GRACE_SECONDS = 30 * 60
-NO_CODE_OUTPUT_INACTIVITY_SECONDS = 15 * 60
-NO_CODE_OUTPUT_HARD_TIMEOUT_SECONDS = 2 * 60 * 60
-NO_CODE_OUTPUT_PROBE_INTERVAL_SECONDS = 5 * 60
+NO_CODE_OUTPUT_WARNING_SECONDS = 15 * 60
+NO_CODE_OUTPUT_DEADLINE_SECONDS = 25 * 60
+NO_CODE_OUTPUT_PROBE_INTERVAL_SECONDS = 60
 TERMINAL_ATTENTION_ALERT_INTERVAL_SECONDS = 60
 TERMINAL_IDLE_STABLE_SECONDS = 5 * 60
 TERMINAL_RECOVERY_IDLE_STABLE_SECONDS = 15
@@ -139,7 +138,7 @@ SOLO_QA_PROJECT_REJECTION_MARKERS = (
     "题材不合格",
 )
 SUBMITTER_NAME = os.environ.get("CLAUDE_EVAL_SUBMITTER", "牛宇航").strip() or "牛宇航"
-APP_VERSION = "20260916.8"
+APP_VERSION = "20260916.9"
 COMPLETED_TURN_CACHE_TTL_SECONDS = 24 * 60 * 60
 _COMPLETED_TURN_CACHE_LOCK = threading.RLock()
 _COMPLETED_TURN_RECORD_CACHE: Dict[str, Tuple[str, float, Dict[str, Any]]] = {}
@@ -15637,6 +15636,7 @@ def monitor_docker_turn(run_id: str, turn_number: int) -> None:
     last_activity_signature: Optional[Tuple[int, int]] = None
     inactivity_reported = False
     business_code_seen = False
+    no_code_warning_reported = False
     last_no_code_probe_at = 0.0
     idle_visible_since: Optional[float] = None
     completion_recovery_epoch = completion_recovery_sent_epoch(run_id, turn_number)
@@ -15985,19 +15985,12 @@ def monitor_docker_turn(run_id: str, turn_number: int) -> None:
 
         persisted_runtime = seconds_between(turn_started_at, now_text())
         running_seconds = max(now - started, persisted_runtime)
-        no_code_deadline_reached = (
-            running_seconds >= NO_CODE_OUTPUT_HARD_TIMEOUT_SECONDS
-            or (
-                running_seconds >= NO_CODE_OUTPUT_GRACE_SECONDS
-                and inactive_seconds >= NO_CODE_OUTPUT_INACTIVITY_SECONDS
-            )
-        )
         retry_waiting = int(row["retry_not_before_epoch"] or 0) > int(time.time())
         if (
             turn_number == 1
             and not business_code_seen
             and not retry_waiting
-            and no_code_deadline_reached
+            and running_seconds >= NO_CODE_OUTPUT_WARNING_SECONDS
             and now - last_no_code_probe_at >= NO_CODE_OUTPUT_PROBE_INTERVAL_SECONDS
         ):
             last_no_code_probe_at = now
@@ -16005,15 +15998,25 @@ def monitor_docker_turn(run_id: str, turn_number: int) -> None:
             if code_paths:
                 business_code_seen = True
             elif code_paths == []:
-                if running_seconds >= NO_CODE_OUTPUT_HARD_TIMEOUT_SECONDS:
-                    reason = "首轮已运行至少 2 小时，工作区相对基线仍没有源码或必要配置变化"
-                else:
-                    reason = (
-                        "首轮已运行至少 30 分钟且连续 15 分钟没有轨迹活动，"
-                        "工作区相对基线仍没有源码或必要配置变化"
+                if not no_code_warning_reported:
+                    add_event(
+                        run_id,
+                        "首轮已运行至少 15 分钟，工作区相对基线仍没有源码或必要配置变化；"
+                        "若 25 分钟时仍无代码将自动终止",
+                        "warning",
                     )
-                stop_run_for_no_code_output(run_id, reason)
-                return
+                    no_code_warning_reported = True
+                if running_seconds >= NO_CODE_OUTPUT_DEADLINE_SECONDS:
+                    reason = (
+                        "首轮已运行至少 25 分钟，工作区相对基线仍没有源码或必要配置变化；"
+                        "读取、思考及未改变文件的命令不计为代码产出"
+                    )
+                    stop_run_for_no_code_output(run_id, reason)
+                    return
+        if no_code_warning_reported and not business_code_seen:
+            detail = (
+                f"第 {turn_number} 轮仍在运行，已超过 15 分钟且尚无源码产出"
+            )
         if (
             running_seconds >= RUN_TIMEOUT_SECONDS
             and inactive_seconds >= INACTIVITY_WARNING_SECONDS
