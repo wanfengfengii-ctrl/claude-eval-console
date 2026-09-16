@@ -1,5 +1,5 @@
-const UI_VERSION = "20260916.4";
-const EXPORT_REFRESH_INTERVAL_MS = 5 * 60 * 1000;
+const UI_VERSION = "20260916.5";
+const EXPORT_REFRESH_INTERVAL_MS = 60 * 1000;
 const TABLE_PAGE_SIZE = 20;
 const SOLO_QA_AUTO_REPAIR_POLL_MS = 3000;
 const SOLO_QA_AUTO_REPAIR_TIMEOUT_MS = 20 * 60 * 1000;
@@ -1477,7 +1477,14 @@ async function queueAutomaticEvaluationRepairs() {
   return request;
 }
 
-async function loadCompletedTurns({ autoRepair = true } = {}) {
+async function loadCompletedTurns({ autoRepair = true, force = true } = {}) {
+  const cacheFresh = state.exportLastLoadedAt
+    && Date.now() - state.exportLastLoadedAt < EXPORT_REFRESH_INTERVAL_MS;
+  if (!force && cacheFresh) {
+    renderExportPage();
+    if (autoRepair) queueAutomaticEvaluationRepairs();
+    return;
+  }
   try {
     state.completedTurns = await api("/api/exports/turns");
     state.exportLastLoadedAt = Date.now();
@@ -2029,8 +2036,9 @@ async function showExportPage() {
   exportView.classList.remove("hidden");
   setActiveModuleTab("exports");
   setPageHeader("导出与提交", "选择一个或多个已完成轮次，导出 Excel 或提交到 SOLO-QA。", true);
-  $("#export-turn-list").innerHTML = '<tr><td colspan="11" class="table-empty">正在读取已完成轮次…</td></tr>';
-  await loadCompletedTurns();
+  if (state.completedTurns.length) renderExportPage();
+  else $("#export-turn-list").innerHTML = '<tr><td colspan="11" class="table-empty">正在读取已完成轮次…</td></tr>';
+  await loadCompletedTurns({ force: false });
   pingSoloQaBridge();
   window.scrollTo({ top: 0, behavior: "smooth" });
 }

@@ -1827,7 +1827,12 @@ class ValidationTests(unittest.TestCase):
         self.assertIn(".export-prompt-toggle", styles)
         self.assertIn(".export-prompt-content", styles)
         self.assertIn(".export-evaluation-editor", styles)
-        self.assertIn("const EXPORT_REFRESH_INTERVAL_MS = 5 * 60 * 1000", javascript)
+        self.assertIn("const EXPORT_REFRESH_INTERVAL_MS = 60 * 1000", javascript)
+        self.assertIn(
+            "async function loadCompletedTurns({ autoRepair = true, force = true } = {})",
+            javascript,
+        )
+        self.assertIn("await loadCompletedTurns({ force: false })", javascript)
         self.assertIn(
             "Date.now() - state.exportLastLoadedAt >= EXPORT_REFRESH_INTERVAL_MS",
             javascript,
@@ -11980,6 +11985,62 @@ class ExportTests(unittest.TestCase):
         self.assertEqual(result["summary"], {"total": 1, "passed": 1, "warning": 0, "failed": 0})
         self.assertEqual(result["eligible_keys"], ["abc123abc123:1"])
         self.assertTrue(all(result["results"][0]["checks"].values()))
+
+    def test_completed_turn_list_reuses_cache_and_invalidates_on_row_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.object(app, "DB_PATH", root / "test.db"), mock.patch.object(
+                app, "DATA_DIR", root
+            ):
+                app.initialize_database()
+                self.insert_completed_turn(root)
+                with mock.patch.object(
+                    app, "_completed_turn_record", wraps=app._completed_turn_record
+                ) as build_record:
+                    first = app.completed_turns()
+                    second = app.completed_turns()
+                    self.assertEqual(build_record.call_count, 1)
+                    self.assertEqual(first, second)
+
+                    with app.db_connection() as database:
+                        database.execute(
+                            """UPDATE run_turns SET model = 'gpt-5.6-sol-cache-test'
+                               WHERE run_id = 'abc123abc123' AND turn_number = 1"""
+                        )
+                    changed = app.completed_turns()
+
+                self.assertEqual(build_record.call_count, 2)
+                self.assertEqual(changed[0]["model"], "gpt-5.6-sol-cache-test")
+
+    def test_preflight_hashes_trajectory_fresh_even_when_list_cache_is_fresh(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.object(app, "DB_PATH", root / "test.db"), mock.patch.object(
+                app, "DATA_DIR", root
+            ):
+                app.initialize_database()
+                self.insert_completed_turn(root)
+                self.assertEqual(len(app.completed_turns()), 1)
+                row = app.completed_turn_rows()[0]
+                trajectory_path = Path(str(row["turn_trajectory_path"]))
+                original_stat = trajectory_path.stat()
+                changed_content = trajectory_path.read_text(encoding="utf-8").replace(
+                    "已经完成。", "已经失效。"
+                )
+                trajectory_path.write_text(changed_content, encoding="utf-8")
+                os.utime(
+                    trajectory_path,
+                    ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+                )
+                changed_stat = trajectory_path.stat()
+                self.assertEqual(changed_stat.st_size, original_stat.st_size)
+                self.assertEqual(changed_stat.st_mtime_ns, original_stat.st_mtime_ns)
+
+                result = app.preflight_completed_turns(["abc123abc123:1"])
+
+        blockers = result["results"][0]["blockers"]
+        self.assertIn("轨迹文件摘要不匹配", blockers)
+        self.assertIn("轨迹文件 SHA-256 与数据库记录不一致", blockers)
 
     def test_preflight_completed_turn_remains_eligible_while_next_turn_runs(self):
         with tempfile.TemporaryDirectory() as directory:
